@@ -1142,6 +1142,754 @@ static void test_threshold_configuration(void)
     g_free(copy);
 }
 
+static uint32_t add_field_candidate(OspreyContext *ctx, OspreyChunk chunk,
+                                    OspreyAddress base, double belief)
+{
+    OspreyVarPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    payload.attached.chunk = chunk;
+    payload.attached.base = base;
+    uint32_t id = add_payload(ctx, OSPREY_PRED_FIELD_OF, &payload);
+    set_belief(ctx, id, belief);
+    return id;
+}
+
+static uint32_t add_pointer_candidate(OspreyContext *ctx, OspreyChunk chunk,
+                                      OspreyAddress target, double belief)
+{
+    OspreyVarPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    payload.attached.chunk = chunk;
+    payload.attached.base = target;
+    uint32_t id = add_payload(ctx, OSPREY_PRED_POINTER, &payload);
+    set_belief(ctx, id, belief);
+    return id;
+}
+
+static char *dump_plan(const OspreyDecodePlan *plan)
+{
+    char *data = NULL;
+    size_t length = 0;
+    FILE *out = open_memstream(&data, &length);
+    if (out == NULL) return NULL;
+    if (!osprey_decode_plan_dump_file(plan, out) || fclose(out) != 0) {
+        free(data);
+        return NULL;
+    }
+    return data;
+}
+
+static bool plan_has_role_loss(const OspreyDecodePlan *plan,
+                               const OspreyKey *key)
+{
+    if (plan == NULL || key == NULL) return false;
+    for (uint32_t i = 0; i < plan->role_loss_count; i++) {
+        if (memcmp(&plan->role_loss_keys[i], key,
+                   sizeof(plan->role_loss_keys[i])) == 0) return true;
+    }
+    return false;
+}
+
+static const OspreyChunkDecision *plan_find_decision(
+    const OspreyDecodePlan *plan, const OspreyChunk *chunk)
+{
+    if (plan == NULL || chunk == NULL) return NULL;
+    for (uint32_t i = 0; i < plan->decision_count; i++) {
+        if (memcmp(&plan->decisions[i].chunk, chunk,
+                   sizeof(*chunk)) == 0) {
+            return &plan->decisions[i];
+        }
+    }
+    return NULL;
+}
+
+static void test_stage62_orthogonal_roles(void)
+{
+    OspreyContext *ctx = new_decode_context();
+    OspreyRegionId global = make_region(OSPREY_REGION_GLOBAL, 1, 2);
+    OspreyRegionId heap = make_region(OSPREY_REGION_HEAP_SITE, 3, 4);
+    OspreyChunk cell = make_chunk(global, 8, sizeof(target_ulong));
+    OspreyAddress target0 = make_address(heap, 0);
+    OspreyAddress target8 = make_address(heap, 8);
+    uint32_t primitive = add_chunk_var(ctx, OSPREY_PRED_PRIMITIVE_VAR, cell);
+    uint32_t scalar = add_chunk_var(ctx, OSPREY_PRED_SCALAR, cell);
+    uint32_t pointer0 = add_pointer_candidate(ctx, cell, target0, 0.95);
+    add_pointer_candidate(ctx, cell, target8, 0.95);
+    add_pointer_candidate(ctx, cell, make_address(heap, 100), 0.8);
+    add_extent(ctx, global, 0, 32);
+    add_extent(ctx, heap, 0, 32);
+    set_belief(ctx, primitive, 0.7);
+    set_belief(ctx, scalar, 0.8);
+    OspreyVar *scalar_var = &g_array_index(ctx->graph->vars, OspreyVar,
+                                           scalar);
+    OspreyVar *pointer_var = &g_array_index(ctx->graph->vars, OspreyVar,
+                                            pointer0);
+    scalar_var->direct_support = 11;
+    scalar_var->source_rule_bits = UINT64_C(0x12);
+    pointer_var->direct_support = 13;
+    pointer_var->source_rule_bits = UINT64_C(0x34);
+    OspreyDecodeInput *input = NULL;
+    OspreyDecodePlan *plan = NULL;
+    CHECK(osprey_decode_input_build(ctx, &input) == OSPREY_OK && input != NULL,
+          "Stage 6.2 orthogonal fixture builds input");
+    if (input != NULL) {
+        CHECK(osprey_decode_roles(ctx, input, &plan) == OSPREY_OK &&
+                  plan != NULL && plan->decision_count == 1,
+              "Stage 6.2 orthogonal fixture builds plan");
+        if (plan != NULL) {
+            const OspreyChunkDecision *decision =
+                plan_find_decision(plan, &cell);
+            OspreyKey primitive_key = osprey_var_key(
+                OSPREY_PRED_PRIMITIVE_VAR,
+                &(OspreyVarPayload){ .chunk = cell });
+            OspreyKey pointer_bad_key = osprey_var_key(
+                OSPREY_PRED_POINTER,
+                &(OspreyVarPayload){ .attached = {
+                    .chunk = cell, .base = make_address(heap, 100) }});
+            CHECK(decision != NULL &&
+                      decision->provisional_role == OSPREY_STORAGE_SCALAR &&
+                      decision->final_role == OSPREY_STORAGE_SCALAR &&
+                      decision->role_has_predicate &&
+                      decision->role_posterior == 0.8 &&
+                      decision->role_support == 11 &&
+                      decision->role_source_rule_bits == UINT64_C(0x12) &&
+                      decision->has_pointer_target &&
+                      decision->pointer_target.offset == 0 &&
+                      decision->pointer_posterior == 0.95 &&
+                      decision->pointer_support == 13 &&
+                      decision->pointer_source_rule_bits == UINT64_C(0x34),
+                  "scalar storage and pointer target retain exact evidence");
+            OspreyKey pointer_key = osprey_var_key(
+                OSPREY_PRED_POINTER,
+                &(OspreyVarPayload){ .attached = {
+                    .chunk = cell, .base = target0 }});
+            CHECK(decision != NULL &&
+                      memcmp(&decision->pointer_key, &pointer_key,
+                             sizeof(pointer_key)) == 0,
+                  "pointer decision retains a selected target record");
+            CHECK(plan_has_role_loss(plan, &primitive_key) &&
+                      plan_has_role_loss(plan, &pointer_bad_key) &&
+                      plan->role_loss_count == 3,
+                  "unused primitive and losing pointer targets are counted once");
+        }
+    }
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+}
+
+static void test_stage62_baseline_role_matrix(void)
+{
+    OspreyContext *ctx = new_decode_context();
+    OspreyRegionId global = make_region(OSPREY_REGION_GLOBAL, 1, 2);
+    OspreyRegionId heap = make_region(OSPREY_REGION_HEAP_SITE, 3, 4);
+    OspreyChunk primitive_chunk = make_chunk(global, 0, 4);
+    OspreyChunk scalar_chunk = make_chunk(global, 8, 4);
+    OspreyChunk field_pointer_chunk = make_chunk(heap, 8, 8);
+    OspreyChunk tied_chunk = make_chunk(heap, 16, 8);
+    OspreyChunk pointer_only_chunk = make_chunk(global, 24,
+                                                sizeof(target_ulong));
+    uint32_t primitive = add_chunk_var(ctx, OSPREY_PRED_PRIMITIVE_VAR,
+                                       primitive_chunk);
+    uint32_t scalar = add_chunk_var(ctx, OSPREY_PRED_SCALAR, scalar_chunk);
+    add_field_candidate(ctx, field_pointer_chunk, make_address(heap, 0), 0.9);
+    add_pointer_candidate(ctx, field_pointer_chunk, make_address(heap, 0), 0.8);
+    add_field_candidate(ctx, tied_chunk, make_address(heap, 0), 0.8);
+    uint32_t tied_scalar = add_chunk_var(ctx, OSPREY_PRED_SCALAR, tied_chunk);
+    add_pointer_candidate(ctx, pointer_only_chunk, make_address(heap, 0), 0.9);
+    set_belief(ctx, primitive, 0.7);
+    set_belief(ctx, scalar, 0.8);
+    set_belief(ctx, tied_scalar, 0.8);
+    add_extent(ctx, global, 0, 64);
+    add_extent(ctx, heap, 0, 32);
+    OspreyDecodeInput *input = NULL;
+    OspreyDecodePlan *plan = NULL;
+    CHECK(osprey_decode_input_build(ctx, &input) == OSPREY_OK &&
+              osprey_decode_roles(ctx, input, &plan) == OSPREY_OK &&
+              plan != NULL,
+          "baseline role matrix builds");
+    if (plan != NULL) {
+        const OspreyChunkDecision *primitive_decision =
+            plan_find_decision(plan, &primitive_chunk);
+        const OspreyChunkDecision *scalar_decision =
+            plan_find_decision(plan, &scalar_chunk);
+        const OspreyChunkDecision *field_pointer_decision =
+            plan_find_decision(plan, &field_pointer_chunk);
+        const OspreyChunkDecision *tied_decision =
+            plan_find_decision(plan, &tied_chunk);
+        const OspreyChunkDecision *pointer_only_decision =
+            plan_find_decision(plan, &pointer_only_chunk);
+        CHECK(primitive_decision != NULL &&
+                  primitive_decision->provisional_role == OSPREY_STORAGE_PRIMITIVE &&
+                  primitive_decision->role_has_predicate,
+              "P01 provides an explicit primitive fallback");
+        CHECK(scalar_decision != NULL &&
+                  scalar_decision->provisional_role == OSPREY_STORAGE_SCALAR,
+              "P07 provides scalar storage without P01");
+        CHECK(field_pointer_decision != NULL &&
+                  field_pointer_decision->provisional_role == OSPREY_STORAGE_FIELD &&
+                  field_pointer_decision->has_pointer_target,
+              "pointer-valued field retains field storage ownership");
+        CHECK(tied_decision != NULL &&
+                  tied_decision->provisional_role == OSPREY_STORAGE_SCALAR,
+              "equal scalar and field posteriors use canonical predicate order");
+        CHECK(pointer_only_decision != NULL &&
+                  pointer_only_decision->provisional_role == OSPREY_STORAGE_PRIMITIVE &&
+                  !pointer_only_decision->role_has_predicate &&
+                  pointer_only_decision->has_pointer_target &&
+                  pointer_only_decision->role_posterior == 0.0 &&
+                  pointer_only_decision->role_support == 0 &&
+                  pointer_only_decision->role_source_rule_bits == 0,
+              "P10-only cell receives an evidence-free implicit primitive role");
+        CHECK(plan->field_group_count == 1 &&
+                  plan->field_groups[0].field_count == 1,
+              "scalar displacement rebuilds the field group from role winners");
+    }
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+}
+
+static void test_stage62_field_selection(void)
+{
+    OspreyContext *ctx = new_decode_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 1, 2);
+    OspreyAddress base0 = make_address(region, 0);
+    OspreyAddress base4 = make_address(region, 4);
+    OspreyChunk chunk = make_chunk(region, 8, 8);
+    uint32_t low_base = add_field_candidate(ctx, chunk, base0, 0.8);
+    uint32_t high_base = add_field_candidate(ctx, chunk, base4, 0.9);
+    add_extent(ctx, region, 0, 32);
+    OspreyDecodeInput *input = NULL;
+    OspreyDecodePlan *plan = NULL;
+    CHECK(osprey_decode_input_build(ctx, &input) == OSPREY_OK &&
+              osprey_decode_roles(ctx, input, &plan) == OSPREY_OK &&
+              plan != NULL,
+          "one-base field fixture builds");
+    if (plan != NULL) {
+        OspreyKey low_key = osprey_var_key(
+            OSPREY_PRED_FIELD_OF,
+            &(OspreyVarPayload){ .attached = {
+                .chunk = chunk, .base = base0 }});
+        const OspreyChunkDecision *decision =
+            plan_find_decision(plan, &chunk);
+        CHECK(decision != NULL && decision->provisional_role ==
+                  OSPREY_STORAGE_FIELD && decision->owner_base.offset == 4 &&
+                  plan->field_group_count == 1 &&
+                  plan->field_groups[0].base.offset == 4 &&
+                  plan->field_groups[0].field_count == 1,
+              "higher-posterior field base wins deterministically");
+        CHECK(plan_has_role_loss(plan, &low_key) && plan->role_loss_count == 1,
+              "losing field base enters role-loss diagnostics");
+    }
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+    (void)low_base;
+    (void)high_base;
+
+    ctx = new_decode_context();
+    ctx->config.report_threshold = 0.0;
+    region = make_region(OSPREY_REGION_GLOBAL, 5, 6);
+    base0 = make_address(region, 0);
+    OspreyChunk wide = make_chunk(region, 0, 16);
+    OspreyChunk narrow = make_chunk(region, 0, 8);
+    OspreyChunk adjacent = make_chunk(region, 8, 8);
+    uint32_t wide_id = add_field_candidate(ctx, wide, base0, 1.0);
+    add_field_candidate(ctx, narrow, base0, 0.5);
+    add_field_candidate(ctx, adjacent, base0, 0.5);
+    add_extent(ctx, region, 0, 32);
+    input = NULL;
+    plan = NULL;
+    CHECK(osprey_decode_input_build(ctx, &input) == OSPREY_OK &&
+              osprey_decode_roles(ctx, input, &plan) == OSPREY_OK &&
+              plan != NULL,
+          "weighted field schedule fixture builds");
+    if (plan != NULL) {
+        OspreyKey wide_key = osprey_var_key(
+            OSPREY_PRED_FIELD_OF,
+            &(OspreyVarPayload){ .attached = {
+                .chunk = wide, .base = base0 }});
+        CHECK(plan->field_group_count == 1 &&
+                  plan->field_groups[0].field_count == 2 &&
+                  plan_has_role_loss(plan, &wide_key),
+              "compatible adjacent fields beat an equal-score wide field");
+    }
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+    (void)wide_id;
+
+    ctx = new_decode_context();
+    region = make_region(OSPREY_REGION_GLOBAL, 7, 8);
+    base0 = make_address(region, 0);
+    OspreyChunk first = make_chunk(region, 0, 8);
+    adjacent = make_chunk(region, 8, 8);
+    uint32_t first_field = add_field_candidate(ctx, first, base0, 0.8);
+    uint32_t second_field = add_field_candidate(ctx, adjacent, base0, 0.8);
+    uint32_t second_scalar = add_chunk_var(ctx, OSPREY_PRED_SCALAR, adjacent);
+    set_belief(ctx, second_scalar, 0.9);
+    add_extent(ctx, region, 0, 32);
+    input = NULL;
+    plan = NULL;
+    CHECK(osprey_decode_input_build(ctx, &input) == OSPREY_OK &&
+              osprey_decode_roles(ctx, input, &plan) == OSPREY_OK &&
+              plan != NULL,
+          "field rebuild fixture builds");
+    if (plan != NULL) {
+        OspreyKey second_key = osprey_var_key(
+            OSPREY_PRED_FIELD_OF,
+            &(OspreyVarPayload){ .attached = {
+                .chunk = adjacent, .base = base0 }});
+        const OspreyChunkDecision *second_decision =
+            plan_find_decision(plan, &adjacent);
+        CHECK(second_decision != NULL &&
+                  second_decision->provisional_role == OSPREY_STORAGE_SCALAR &&
+                  plan->field_group_count == 1 &&
+                  plan->field_groups[0].field_count == 1 &&
+                  plan_has_role_loss(plan, &second_key),
+              "scalar displacement rebuilds surviving field groups");
+    }
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+    (void)first_field;
+    (void)second_field;
+
+    ctx = new_decode_context();
+    ctx->config.report_threshold = 0.0;
+    region = make_region(OSPREY_REGION_GLOBAL, 9, 10);
+    base0 = make_address(region, 0);
+    OspreyChunk zero_field = make_chunk(region, 0, 1);
+    OspreyChunk positive_field = make_chunk(region, 1, 8);
+    add_field_candidate(ctx, zero_field, base0, 0.0);
+    add_field_candidate(ctx, positive_field, base0, 1.0);
+    add_extent(ctx, region, 0, 16);
+    input = NULL;
+    plan = NULL;
+    CHECK(osprey_decode_input_build(ctx, &input) == OSPREY_OK &&
+              osprey_decode_roles(ctx, input, &plan) == OSPREY_OK &&
+              plan != NULL && plan->field_group_count == 1 &&
+              plan->field_groups[0].field_count == 2,
+          "zero-score prefix fields retain canonical maximum schedule");
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+
+    ctx = new_decode_context();
+    ctx->config.report_threshold = 0.0;
+    region = make_region(OSPREY_REGION_GLOBAL, 11, 12);
+    base0 = make_address(region, 0);
+    wide = make_chunk(region, 0, 16);
+    narrow = make_chunk(region, 0, 8);
+    adjacent = make_chunk(region, 8, 8);
+    zero_field = make_chunk(region, 24, 8);
+    add_field_candidate(ctx, wide, base0, 0.9);
+    add_field_candidate(ctx, narrow, base0, 0.4);
+    add_field_candidate(ctx, adjacent, base0, 0.4);
+    add_field_candidate(ctx, zero_field, make_address(region, 24), 0.0);
+    add_extent(ctx, region, 0, 32);
+    input = NULL;
+    plan = NULL;
+    CHECK(osprey_decode_input_build(ctx, &input) == OSPREY_OK &&
+              osprey_decode_roles(ctx, input, &plan) == OSPREY_OK &&
+              plan != NULL,
+          "wide-field and empty-schedule fixture builds");
+    if (plan != NULL) {
+        const OspreyChunkDecision *wide_decision =
+            plan_find_decision(plan, &wide);
+        const OspreyChunkDecision *zero_decision =
+            plan_find_decision(plan, &zero_field);
+        CHECK(wide_decision != NULL &&
+                  wide_decision->provisional_role == OSPREY_STORAGE_FIELD,
+              "one wide field beats a lower-score compatible pair");
+        CHECK(zero_decision != NULL &&
+                  zero_decision->provisional_role == OSPREY_STORAGE_PRIMITIVE &&
+                  !zero_decision->role_has_predicate,
+              "empty schedule beats an isolated exact-zero field");
+    }
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+}
+
+static void test_stage62_signed_canonical_order(void)
+{
+    OspreyContext *ctx = new_decode_context();
+    ctx->config.report_threshold = 0.0;
+    OspreyRegionId region = make_region(OSPREY_REGION_STACK_FUNCTION, 7, 8);
+    OspreyAddress schedule_base = make_address(region, -16);
+    OspreyChunk tied_chunk = make_chunk(region, 8, 8);
+    OspreyChunk negative_wide = make_chunk(region, -8, 16);
+    OspreyChunk positive_narrow = make_chunk(region, 0, 8);
+    OspreyChunk pointer_cell = make_chunk(region, 16, sizeof(target_ulong));
+    add_field_candidate(ctx, tied_chunk, make_address(region, 0), 0.9);
+    add_field_candidate(ctx, tied_chunk, make_address(region, -8), 0.9);
+    add_field_candidate(ctx, positive_narrow, schedule_base, 0.5);
+    add_field_candidate(ctx, negative_wide, schedule_base, 0.5);
+    add_pointer_candidate(ctx, pointer_cell, make_address(region, 0), 0.8);
+    add_pointer_candidate(ctx, pointer_cell, make_address(region, -8), 0.8);
+    add_extent(ctx, region, -32, 32);
+
+    OspreyDecodeInput *input = NULL;
+    OspreyDecodePlan *plan = NULL;
+    CHECK(osprey_decode_input_build(ctx, &input) == OSPREY_OK && input != NULL,
+          "signed-order fixture builds decoder input");
+    if (input != NULL) {
+        CHECK(input->field_count == 4 &&
+                  input->field_candidates[0].payload.attached.chunk.address.offset == -8 &&
+                  input->array_count == 0,
+              "primary candidates retain signed canonical payload order");
+        CHECK(osprey_decode_roles(ctx, input, &plan) == OSPREY_OK &&
+                  plan != NULL,
+              "signed-order fixture builds role plan");
+    }
+    if (plan != NULL) {
+        const OspreyChunkDecision *field =
+            plan_find_decision(plan, &tied_chunk);
+        const OspreyChunkDecision *negative =
+            plan_find_decision(plan, &negative_wide);
+        const OspreyChunkDecision *positive =
+            plan_find_decision(plan, &positive_narrow);
+        const OspreyChunkDecision *pointer =
+            plan_find_decision(plan, &pointer_cell);
+        CHECK(field != NULL && field->provisional_role == OSPREY_STORAGE_FIELD &&
+                  field->owner_base.offset == -8,
+              "equal field-base posterior uses signed canonical target order");
+        CHECK(negative != NULL &&
+                  negative->provisional_role == OSPREY_STORAGE_FIELD &&
+                  positive != NULL &&
+                  positive->provisional_role == OSPREY_STORAGE_PRIMITIVE,
+              "equal field schedules use signed canonical chunk order");
+        CHECK(pointer != NULL && pointer->has_pointer_target &&
+                  pointer->pointer_target.offset == -8,
+              "equal pointer posterior uses signed canonical target order");
+    }
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+
+    ctx = new_decode_context();
+    OspreyVarPayload negative_array;
+    OspreyVarPayload positive_array;
+    memset(&negative_array, 0, sizeof(negative_array));
+    memset(&positive_array, 0, sizeof(positive_array));
+    negative_array.segment.a1 = make_address(region, -16);
+    negative_array.segment.a2 = make_address(region, -8);
+    negative_array.segment.size = 8;
+    positive_array.segment.a1 = make_address(region, 0);
+    positive_array.segment.a2 = make_address(region, 8);
+    positive_array.segment.size = 8;
+    uint32_t positive_id = add_payload(ctx, OSPREY_PRED_ARRAY,
+                                       &positive_array);
+    uint32_t negative_id = add_payload(ctx, OSPREY_PRED_ARRAY,
+                                       &negative_array);
+    set_belief(ctx, positive_id, 0.9);
+    set_belief(ctx, negative_id, 0.9);
+    add_extent(ctx, region, -32, 32);
+    input = NULL;
+    CHECK(osprey_decode_input_build(ctx, &input) == OSPREY_OK && input != NULL &&
+              input->array_count == 2 && input->array_by_region[0] == 0 &&
+              input->array_by_region[1] == 1 &&
+              input->array_by_region_stride[0] == 0 &&
+              input->array_by_region_stride[1] == 1,
+          "array indexes use signed canonical candidate order");
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+}
+
+static void test_stage62_checked_field_end(void)
+{
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 1, 2);
+    OspreyContext *ctx = new_decode_context();
+    OspreyChunk overflowing = make_chunk(region, -1, 1);
+    add_field_candidate(ctx, overflowing, make_address(region, INT64_MIN), 1.0);
+    add_extent(ctx, region, INT64_MIN, 1);
+    OspreyDecodeInput *input = NULL;
+    OspreyDecodePlan *plan = (OspreyDecodePlan *)(uintptr_t)1;
+    CHECK(osprey_decode_input_build(ctx, &input) == OSPREY_OK && input != NULL &&
+              osprey_decode_roles(ctx, input, &plan) == OSPREY_INVALID_MODEL &&
+              plan == NULL,
+          "selected field rejects relative-end signed overflow");
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+
+    ctx = new_decode_context();
+    OspreyChunk boundary = make_chunk(region, INT64_MAX - 1, 1);
+    add_field_candidate(ctx, boundary,
+                        make_address(region, INT64_MAX - 1), 1.0);
+    add_extent(ctx, region, INT64_MAX - 1, INT64_MAX);
+    input = NULL;
+    plan = NULL;
+    CHECK(osprey_decode_input_build(ctx, &input) == OSPREY_OK &&
+              osprey_decode_roles(ctx, input, &plan) == OSPREY_OK &&
+              plan != NULL && plan->field_group_count == 1,
+          "selected field accepts exact INT64_MAX exclusive end");
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+}
+
+static void test_stage62_rejects_selected_geometry(void)
+{
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 1, 2);
+    OspreyContext *ctx = new_decode_context();
+    OspreyChunk cell = make_chunk(region, 0, 8);
+    add_field_candidate(ctx, cell, make_address(region, -8), 0.9);
+    add_extent(ctx, region, 0, 16);
+    OspreyDecodeInput *input = NULL;
+    OspreyDecodePlan *plan = (OspreyDecodePlan *)(uintptr_t)1;
+    CHECK(osprey_decode_input_build(ctx, &input) == OSPREY_OK &&
+              osprey_decode_roles(ctx, input, &plan) == OSPREY_INVALID_MODEL &&
+              plan == NULL,
+          "selected field outside its extent rejects without a plan");
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+
+    ctx = new_decode_context();
+    OspreyChunk wrong_width = make_chunk(region, 0, 4);
+    add_pointer_candidate(ctx, wrong_width, make_address(region, 0), 1.0);
+    add_extent(ctx, region, 0, 16);
+    input = NULL;
+    plan = (OspreyDecodePlan *)(uintptr_t)1;
+    CHECK(osprey_decode_input_build(ctx, &input) == OSPREY_OK &&
+              osprey_decode_roles(ctx, input, &plan) == OSPREY_INVALID_MODEL &&
+              plan == NULL,
+          "selected pointer cell with wrong width rejects atomically");
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+
+    ctx = new_decode_context();
+    OspreyChunk pointer_cell = make_chunk(region, 0, sizeof(target_ulong));
+    add_pointer_candidate(ctx, pointer_cell, make_address(region, 16), 1.0);
+    add_extent(ctx, region, 0, 16);
+    input = NULL;
+    plan = (OspreyDecodePlan *)(uintptr_t)1;
+    CHECK(osprey_decode_input_build(ctx, &input) == OSPREY_OK &&
+              osprey_decode_roles(ctx, input, &plan) == OSPREY_INVALID_MODEL &&
+              plan == NULL,
+          "selected pointer target at the exclusive extent end rejects");
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+
+    ctx = new_decode_context();
+    add_field_candidate(ctx, cell, make_address(region, 0), 0.9);
+    add_field_candidate(ctx, cell, make_address(region, -8), 0.8);
+    add_extent(ctx, region, 0, 16);
+    input = NULL;
+    plan = NULL;
+    CHECK(osprey_decode_input_build(ctx, &input) == OSPREY_OK &&
+              osprey_decode_roles(ctx, input, &plan) == OSPREY_OK &&
+              plan != NULL,
+          "invalid losing field geometry does not reject a valid winner");
+    if (plan != NULL) {
+        OspreyKey losing_key = osprey_var_key(
+            OSPREY_PRED_FIELD_OF,
+            &(OspreyVarPayload){ .attached = {
+                .chunk = cell, .base = make_address(region, -8) }});
+        CHECK(plan_has_role_loss(plan, &losing_key),
+              "invalid losing field remains a discarded-role candidate");
+    }
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+
+    ctx = new_decode_context();
+    OspreyRegionId target_a = make_region(OSPREY_REGION_HEAP_SITE, 2, 4);
+    OspreyRegionId target_b = make_region(OSPREY_REGION_HEAP_SITE, 2, 5);
+    add_pointer_candidate(ctx, pointer_cell, make_address(target_b, 0), 0.9);
+    add_pointer_candidate(ctx, pointer_cell, make_address(target_a, 0), 0.9);
+    add_extent(ctx, region, 0, 16);
+    add_extent(ctx, target_a, 0, 8);
+    add_extent(ctx, target_b, 0, 8);
+    input = NULL;
+    plan = NULL;
+    CHECK(osprey_decode_input_build(ctx, &input) == OSPREY_OK &&
+              osprey_decode_roles(ctx, input, &plan) == OSPREY_OK &&
+              plan != NULL,
+          "pointer region-identity tie fixture builds");
+    if (plan != NULL) {
+        const OspreyChunkDecision *decision =
+            plan_find_decision(plan, &pointer_cell);
+        CHECK(decision != NULL && decision->has_pointer_target &&
+                  decision->pointer_target.region.site_offset == 4,
+              "pointer target tie compares complete region identity");
+    }
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+}
+
+static void test_stage62_rejects_noncanonical_slices(void)
+{
+    OspreyContext *ctx = new_decode_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 1, 2);
+    uint32_t first = add_chunk_var(ctx, OSPREY_PRED_PRIMITIVE_VAR,
+                                   make_chunk(region, 0, 8));
+    uint32_t second = add_chunk_var(ctx, OSPREY_PRED_PRIMITIVE_VAR,
+                                    make_chunk(region, 8, 8));
+    set_belief(ctx, first, 0.9);
+    set_belief(ctx, second, 0.9);
+    add_extent(ctx, region, 0, 16);
+    OspreyDecodeInput *input = NULL;
+    CHECK(osprey_decode_input_build(ctx, &input) == OSPREY_OK && input != NULL &&
+              input->chunk_candidate_count == 2 &&
+              input->chunk_range_count == 2,
+          "noncanonical-slice fixture builds input");
+    if (input != NULL && input->chunk_candidate_count == 2 &&
+        input->chunk_range_count == 2) {
+        OspreyDecodeCandidateRef ref = input->chunk_candidates[0];
+        input->chunk_candidates[0] = input->chunk_candidates[1];
+        input->chunk_candidates[1] = ref;
+        input->chunk_ranges[0].begin = 1;
+        input->chunk_ranges[1].begin = 0;
+        OspreyDecodePlan *plan = (OspreyDecodePlan *)(uintptr_t)1;
+        CHECK(osprey_decode_roles(ctx, input, &plan) == OSPREY_INVALID_MODEL &&
+                  plan == NULL,
+              "semantically matching but noncanonical range slices reject");
+        osprey_decode_plan_free(plan);
+    }
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+}
+
+static void test_stage62_rejects_array_candidate_alias(void)
+{
+    OspreyContext *ctx = new_decode_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 1, 2);
+    uint32_t primitive_id = add_chunk_var(
+        ctx, OSPREY_PRED_PRIMITIVE_VAR, make_chunk(region, 0, 8));
+    OspreyVarPayload array_payload;
+    memset(&array_payload, 0, sizeof(array_payload));
+    array_payload.segment.a1 = make_address(region, 0);
+    array_payload.segment.a2 = make_address(region, 8);
+    array_payload.segment.size = 8;
+    uint32_t array_id = add_payload(ctx, OSPREY_PRED_ARRAY, &array_payload);
+    set_belief(ctx, primitive_id, 0.9);
+    set_belief(ctx, array_id, 0.9);
+    add_extent(ctx, region, 0, 8);
+    OspreyDecodeInput *input = NULL;
+    CHECK(osprey_decode_input_build(ctx, &input) == OSPREY_OK && input != NULL &&
+              input->primitive_count == 1 && input->array_count == 1,
+          "array-alias fixture builds input");
+    if (input != NULL && input->primitive_count == 1 && input->array_count == 1) {
+        const size_t candidate_size = sizeof(OspreyDecodeCandidate);
+        const size_t overlap = sizeof(uint64_t);
+        uint8_t *storage = g_malloc0(candidate_size * 2);
+        OspreyDecodeCandidate primitive = input->primitive_candidates[0];
+        OspreyDecodeCandidate array = input->array_candidates[0];
+        OspreyDecodeCandidate *saved_primitive = input->primitive_candidates;
+        OspreyDecodeCandidate *saved_array = input->array_candidates;
+        primitive.source_rule_bits = array.key.tag;
+        memcpy(storage, &primitive, candidate_size);
+        memcpy(storage + candidate_size - overlap, &array, candidate_size);
+        input->primitive_candidates = (OspreyDecodeCandidate *)storage;
+        input->array_candidates = (OspreyDecodeCandidate *)(
+            storage + candidate_size - overlap);
+        OspreyDecodePlan *plan = (OspreyDecodePlan *)(uintptr_t)1;
+        CHECK(osprey_decode_roles(ctx, input, &plan) == OSPREY_INVALID_MODEL &&
+                  plan == NULL,
+              "overlapping array candidate ownership rejects atomically");
+        osprey_decode_plan_free(plan);
+        input->primitive_candidates = saved_primitive;
+        input->array_candidates = saved_array;
+        g_free(storage);
+    }
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+}
+
+static void test_stage62_plan_permutation_and_failures(void)
+{
+    OspreyContext *left = make_projection_context(0);
+    OspreyContext *right = make_projection_context(1);
+    OspreyContext *shuffled = make_projection_context(2);
+    OspreyDecodeInput *left_input = NULL;
+    OspreyDecodeInput *right_input = NULL;
+    OspreyDecodeInput *shuffled_input = NULL;
+    OspreyDecodePlan *left_plan = NULL;
+    OspreyDecodePlan *right_plan = NULL;
+    OspreyDecodePlan *shuffled_plan = NULL;
+    CHECK(osprey_decode_input_build(left, &left_input) == OSPREY_OK &&
+              osprey_decode_input_build(right, &right_input) == OSPREY_OK &&
+              osprey_decode_input_build(shuffled, &shuffled_input) == OSPREY_OK &&
+              osprey_decode_roles(left, left_input, &left_plan) == OSPREY_OK &&
+              osprey_decode_roles(right, right_input, &right_plan) == OSPREY_OK &&
+              osprey_decode_roles(shuffled, shuffled_input,
+                                  &shuffled_plan) == OSPREY_OK,
+          "permutation role plans build");
+    char *left_dump = left_plan == NULL ? NULL : dump_plan(left_plan);
+    char *right_dump = right_plan == NULL ? NULL : dump_plan(right_plan);
+    char *shuffled_dump = shuffled_plan == NULL ? NULL :
+        dump_plan(shuffled_plan);
+    CHECK(left_dump != NULL && right_dump != NULL && shuffled_dump != NULL &&
+              strcmp(left_dump, right_dump) == 0 &&
+              strcmp(left_dump, shuffled_dump) == 0,
+          "role decisions and diagnostics ignore graph insertion order");
+    free(left_dump);
+    free(right_dump);
+    free(shuffled_dump);
+    osprey_decode_plan_free(left_plan);
+    osprey_decode_plan_free(right_plan);
+    osprey_decode_plan_free(shuffled_plan);
+    osprey_decode_input_free(left_input);
+    osprey_decode_input_free(right_input);
+    osprey_decode_input_free(shuffled_input);
+    osprey_free(left);
+    osprey_free(right);
+    osprey_free(shuffled);
+
+    OspreyContext *ctx = make_projection_context(0);
+    OspreyDecodeInput *input = NULL;
+    CHECK(osprey_decode_input_build(ctx, &input) == OSPREY_OK && input != NULL,
+          "allocation sweep input builds");
+    char *input_before = input == NULL ? NULL : dump_input(input);
+    OspreyGraph *saved_graph = ctx->graph;
+    OspreyModel *saved_model = ctx->model;
+    OspreyModel *saved_staged_model = ctx->staged_model;
+    OspreyStatus saved_tx_status = ctx->tx_status;
+    OspreyStatus saved_last_status = ctx->last_status;
+    const char *saved_tx_stage = ctx->tx_stage;
+    const char *saved_tx_reason = ctx->tx_reason;
+    bool saved_tx_model_ready = ctx->tx_model_ready;
+    bool saw_success = false;
+    for (int64_t failure = 0; failure < 256; failure++) {
+        OspreyDecodePlan *plan = (OspreyDecodePlan *)(uintptr_t)1;
+        osprey_decode_test_set_alloc_fail_after(failure);
+        OspreyStatus status = osprey_decode_roles(ctx, input, &plan);
+        if (status == OSPREY_OK) {
+            CHECK(plan != NULL, "role allocation hook success returns plan");
+            osprey_decode_plan_free(plan);
+            saw_success = true;
+            break;
+        }
+        CHECK(status == OSPREY_INVALID_MODEL && plan == NULL,
+              "role allocation failure returns no partial plan");
+    }
+    osprey_decode_test_set_alloc_fail_after(-1);
+    CHECK(saw_success, "role allocation sweep reaches normal allocation");
+    char *input_after = input == NULL ? NULL : dump_input(input);
+    CHECK(input_before != NULL && input_after != NULL &&
+              strcmp(input_before, input_after) == 0,
+          "role success and allocation failures leave decoder input unchanged");
+    CHECK(ctx->graph == saved_graph && ctx->model == saved_model &&
+              ctx->staged_model == saved_staged_model &&
+              ctx->tx_status == saved_tx_status &&
+              ctx->last_status == saved_last_status &&
+              ctx->tx_stage == saved_tx_stage &&
+              ctx->tx_reason == saved_tx_reason &&
+              ctx->tx_model_ready == saved_tx_model_ready,
+          "role success and allocation failures leave transaction state unchanged");
+    free(input_before);
+    free(input_after);
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+}
+
 int main(void)
 {
     RUN(test_valid_projection_and_indexes);
@@ -1169,7 +1917,16 @@ int main(void)
     RUN(test_count_and_limit_boundaries);
     RUN(test_allocation_failures);
     RUN(test_threshold_configuration);
-    fprintf(stderr, "stage6.1: %u/%u tests passed\n", executed - failures,
+    RUN(test_stage62_orthogonal_roles);
+    RUN(test_stage62_baseline_role_matrix);
+    RUN(test_stage62_field_selection);
+    RUN(test_stage62_signed_canonical_order);
+    RUN(test_stage62_checked_field_end);
+    RUN(test_stage62_rejects_selected_geometry);
+    RUN(test_stage62_rejects_noncanonical_slices);
+    RUN(test_stage62_rejects_array_candidate_alias);
+    RUN(test_stage62_plan_permutation_and_failures);
+    fprintf(stderr, "stage6.2: %u/%u tests passed\n", executed - failures,
             registered);
     return failures == 0 ? 0 : 1;
 }

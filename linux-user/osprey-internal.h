@@ -1049,6 +1049,62 @@ typedef struct OspreyDecodeInput {
     uint64_t discarded_threshold;
 } OspreyDecodeInput;
 
+/* Stage 6.2 selected storage roles.  Package 6.3 may replace only the
+ * final role with OSPREY_STORAGE_ARRAY_ELEMENT after complete local
+ * validation; zero is never a valid role. */
+typedef enum OspreyStorageRole {
+    OSPREY_STORAGE_PRIMITIVE = 1,
+    OSPREY_STORAGE_SCALAR = 2,
+    OSPREY_STORAGE_FIELD = 3,
+    OSPREY_STORAGE_ARRAY_ELEMENT = 4,
+} OspreyStorageRole;
+
+typedef struct OspreyChunkDecision {
+    OspreyChunk chunk;
+    uint8_t provisional_role;
+    uint8_t final_role;
+    uint8_t has_pointer_target;
+    uint8_t role_has_predicate;
+    OspreyAddress owner_base;
+    OspreyAddress pointer_target;
+    double role_posterior;
+    double pointer_posterior;
+    uint64_t role_support;
+    uint64_t role_source_rule_bits;
+    uint64_t pointer_support;
+    uint64_t pointer_source_rule_bits;
+    OspreyKey role_key;
+    OspreyKey pointer_key;
+} OspreyChunkDecision;
+
+typedef struct OspreyDecodeFieldGroup {
+    OspreyAddress base;
+    uint32_t *decision_ordinals; /* canonical ordinals into plan decisions */
+    uint32_t field_count;
+} OspreyDecodeFieldGroup;
+
+typedef struct OspreyDecodePlanChunkIndex {
+    OspreyChunk chunk;
+    uint32_t decision_ordinal;
+} OspreyDecodePlanChunkIndex;
+
+typedef struct OspreyDecodePlan {
+    /* Complete-chunk order; decisions own no graph/input storage. */
+    OspreyChunkDecision *decisions;
+    uint32_t decision_count;
+    OspreyDecodePlanChunkIndex *chunk_index;
+    uint32_t chunk_index_count;
+
+    /* Complete-base order; empty field groups are omitted. */
+    OspreyDecodeFieldGroup *field_groups;
+    uint32_t field_group_count;
+
+    /* Complete predicate-key order; every eligible unused P01/P07/P09/P10
+     * candidate appears exactly once. */
+    OspreyKey *role_loss_keys;
+    uint32_t role_loss_count;
+} OspreyDecodePlan;
+
 /* R10-R12 hint instances: parallel-copy / unified-access / points-to
  * evidence for homomorphic segments.  a1 and a2 are region-anchor
  * addresses; size is the common offset delta s. */
@@ -1492,6 +1548,14 @@ OspreyStatus osprey_decode_input_build(const OspreyContext *ctx,
 void osprey_decode_input_free(OspreyDecodeInput *input);
 bool osprey_decode_input_dump_file(const OspreyDecodeInput *input, FILE *out);
 void osprey_decode_test_set_alloc_fail_after(int64_t allocations);
+
+/* Stage 6.2: deterministic scalar/field/pointer decisions over an owned
+ * Stage 6.1 input.  The plan remains private until later model packages. */
+OspreyStatus osprey_decode_roles(const OspreyContext *ctx,
+                                 const OspreyDecodeInput *input,
+                                 OspreyDecodePlan **out);
+void osprey_decode_plan_free(OspreyDecodePlan *plan);
+bool osprey_decode_plan_dump_file(const OspreyDecodePlan *plan, FILE *out);
 
 /* Stage 6 entry (osprey-decode.c): consistent decoding of posterior
  * predicates (§10 of the reference): hard-false/threshold discard,
