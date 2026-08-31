@@ -2,18 +2,19 @@
  * OSPREY posterior decoder.
  *
  * Stage 6.1 adds the canonical owned belief projection below without changing
- * the legacy production selection path; Stage 6.4 owns that clean cutover.
+ * the legacy production selection path.  Stage 6.2 selects provisional
+ * scalar/field/pointer roles; Stage 6.3 validates and schedules arrays before
+ * finalizing storage ownership.  Stage 6.4 owns the production clean cutover.
  * The complete decoder design is reference §10:
  *
  * Plan §10 (design choice):
  *  1. Discard hard-false candidates and posterior < report_threshold.
- *  2. Per chunk, choose among scalar, field, pointer, and array-element
- *     interpretations by maximum posterior subject to exclusivity.
+ *  2. Per chunk, choose scalar or field storage subject to exclusivity and
+ *     retain pointer targets independently; arrays finalize eligible members.
  *  3. Group FieldOf(v,a) by base a, sort by offset, retain
  *     non-overlapping field layouts.
- *  4. Select arrays by weighted interval scheduling per (region,
- *     stride) using logit(P(Array)) as score, avoiding scalar-covered
- *     spans.
+ *  4. Validate arrays per (region,stride), then run one region-wide weighted
+ *     interval schedule across all strides using adjusted logit scores.
  *  5. At most one target base per pointer chunk.
  *  6. Deterministic names: struct_H_<site>, array_H_<site>, etc.
  *  7. Emit width-preserving placeholders (uint64_t/byte[8]/void *)
@@ -147,6 +148,49 @@ static int decode_candidate_compare(const void *ap, const void *bp)
                                    &b->payload);
     if (c != 0) return c;
     return decode_key_compare(&a->key, &b->key);
+}
+
+static bool decode_score_valid(const OspreyDecodeScore *score)
+{
+    return score != NULL && score->negative_infinite <= 1 &&
+           isfinite(score->finite);
+}
+
+bool osprey_decode_score_add(OspreyDecodeScore *score,
+                             const OspreyDecodeScore *term)
+{
+    int64_t balance;
+
+    if (!decode_score_valid(score) || !decode_score_valid(term)) return false;
+    if (term->negative_infinite) {
+        score->negative_infinite = 1;
+        return true;
+    }
+    if (score->negative_infinite) return true;
+    if (!osprey_check_add(score->infinity_balance,
+                          term->infinity_balance, &balance)) {
+        return false;
+    }
+    double finite = score->finite + term->finite;
+    if (!isfinite(finite)) return false;
+    score->infinity_balance = balance;
+    score->finite = finite == 0.0 ? 0.0 : finite;
+    return true;
+}
+
+int osprey_decode_score_compare(const OspreyDecodeScore *left,
+                                const OspreyDecodeScore *right)
+{
+    if (left == NULL || right == NULL) return 0;
+    if (left->negative_infinite != right->negative_infinite) {
+        return left->negative_infinite ? -1 : 1;
+    }
+    if (left->negative_infinite) return 0;
+    if (left->infinity_balance != right->infinity_balance) {
+        return left->infinity_balance < right->infinity_balance ? -1 : 1;
+    }
+    return left->finite < right->finite ? -1 :
+        (left->finite != right->finite ? 1 : 0);
 }
 
 typedef struct DecodeVarRef {
@@ -1520,7 +1564,7 @@ static bool decode_input_for_roles_valid(const OspreyContext *ctx,
                                          const OspreyDecodeInput *input,
                                          OspreyDecodeAllocator *allocator)
 {
-    bool count_ok;
+    bool count_ok = false;
     uint32_t projected_count;
 
     if (ctx == NULL || input == NULL || allocator == NULL ||
@@ -1623,6 +1667,759 @@ static bool decode_candidate_better(const OspreyDecodeCandidate *candidate,
     return candidate->posterior > current->posterior ||
            (candidate->posterior == current->posterior &&
             decode_candidate_compare(candidate, current) < 0);
+}
+
+static bool decode_score_add_probability(OspreyDecodeScore *score,
+                                         double probability,
+                                         bool subtract)
+{
+    OspreyDecodeScore term;
+
+    if (score == NULL || !isfinite(probability) || probability < 0.0 ||
+        probability > 1.0) return false;
+    memset(&term, 0, sizeof(term));
+    if (probability == 0.0) {
+        /* max(0, logit(0)) is zero for a displacement penalty. */
+        if (subtract) return true;
+        term.negative_infinite = 1;
+    } else if (probability == 1.0) {
+        term.infinity_balance = subtract ? -1 : 1;
+    } else {
+        term.finite = log(probability) - log1p(-probability);
+        if (!isfinite(term.finite)) return false;
+        if (subtract) term.finite = -term.finite;
+    }
+    return osprey_decode_score_add(score, &term);
+}
+
+typedef enum DecodeArrayGeometryResult {
+    DECODE_ARRAY_GEOMETRY_INVALID = 0,
+    DECODE_ARRAY_GEOMETRY_NON_DIVISIBLE = 1,
+    DECODE_ARRAY_GEOMETRY_VALID = 2,
+} DecodeArrayGeometryResult;
+
+typedef struct DecodeArrayWork {
+    OspreyDecodeArray array;
+    uint32_t input_ordinal;
+} DecodeArrayWork;
+
+typedef struct DecodeArrayDisplacement {
+    OspreyChunk chunk;
+    OspreyKey role_key;
+    double posterior;
+    uint32_t decision_ordinal;
+} DecodeArrayDisplacement;
+
+typedef struct DecodeArrayOrderRef {
+    OspreyRegionId region;
+    int64_t lo;
+    int64_t hi;
+    uint64_t stride;
+    OspreyKey key;
+    uint32_t work_ordinal;
+} DecodeArrayOrderRef;
+
+static void decode_array_free_contents(OspreyDecodeArray *array)
+{
+    if (array == NULL) return;
+    g_free(array->member_decision_ordinals);
+    g_free(array->displacement_keys);
+    array->member_decision_ordinals = NULL;
+    array->displacement_keys = NULL;
+    array->member_count = 0;
+    array->displacement_count = 0;
+}
+
+static void decode_array_work_free(DecodeArrayWork *work, uint32_t count)
+{
+    if (work == NULL) return;
+    for (uint32_t i = 0; i < count; i++) {
+        decode_array_free_contents(&work[i].array);
+    }
+    g_free(work);
+}
+
+static DecodeArrayGeometryResult decode_array_geometry(
+    const OspreyDecodeInput *input, const OspreyDecodeCandidate *candidate,
+    OspreyDecodeArray *array)
+{
+    const OspreyAddress *lo;
+    const OspreyAddress *hi;
+    const OspreyRegionExtent *extent;
+    int64_t span;
+    uint64_t stride;
+    uint64_t count;
+
+    if (input == NULL || candidate == NULL || array == NULL ||
+        candidate->predicate_kind != OSPREY_PRED_ARRAY) {
+        return DECODE_ARRAY_GEOMETRY_INVALID;
+    }
+    lo = &candidate->payload.segment.a1;
+    hi = &candidate->payload.segment.a2;
+    if (!decode_region_valid(&lo->region) ||
+        decode_region_compare(&lo->region, &hi->region) != 0 ||
+        lo->offset >= hi->offset || candidate->payload.segment.size <= 0) {
+        return DECODE_ARRAY_GEOMETRY_INVALID;
+    }
+    stride = (uint64_t)candidate->payload.segment.size;
+    if (stride > (uint64_t)INT64_MAX ||
+        !osprey_check_sub(hi->offset, lo->offset, &span) || span <= 0) {
+        return DECODE_ARRAY_GEOMETRY_INVALID;
+    }
+    if (span < (int64_t)stride) return DECODE_ARRAY_GEOMETRY_INVALID;
+    extent = decode_input_find_extent(input, &lo->region);
+    if (extent == NULL || lo->offset < extent->lo ||
+        hi->offset > extent->hi) {
+        return DECODE_ARRAY_GEOMETRY_INVALID;
+    }
+    if (span % (int64_t)stride != 0) {
+        return DECODE_ARRAY_GEOMETRY_NON_DIVISIBLE;
+    }
+    count = (uint64_t)(span / (int64_t)stride);
+    if (count == 0) return DECODE_ARRAY_GEOMETRY_INVALID;
+
+    memset(array, 0, sizeof(*array));
+    array->key = candidate->key;
+    array->region = lo->region;
+    array->lo = lo->offset;
+    array->hi = hi->offset;
+    array->stride = stride;
+    array->count = count;
+    array->posterior = candidate->posterior;
+    array->posterior_bits = candidate->posterior_bits;
+    array->direct_support = candidate->direct_support;
+    array->source_rule_bits = candidate->source_rule_bits;
+    return DECODE_ARRAY_GEOMETRY_VALID;
+}
+
+static bool decode_array_member_info(const OspreyDecodeArray *array,
+                                     const OspreyChunk *chunk,
+                                     bool *intersects, bool *legal)
+{
+    int64_t chunk_end;
+    int64_t member_delta;
+
+    if (array == NULL || chunk == NULL || intersects == NULL ||
+        legal == NULL) return false;
+    *intersects = false;
+    *legal = false;
+    if (decode_region_compare(&chunk->address.region, &array->region) != 0) {
+        return true;
+    }
+    if (!decode_chunk_end(chunk, &chunk_end)) return false;
+    *intersects = chunk->address.offset < array->hi &&
+                  array->lo < chunk_end;
+    if (!*intersects) return true;
+    if (!osprey_check_sub(chunk->address.offset, array->lo,
+                          &member_delta)) return false;
+    *legal = chunk->address.offset >= array->lo &&
+             chunk_end <= array->hi && member_delta >= 0 &&
+             member_delta % (int64_t)array->stride == 0 &&
+             chunk->size <= array->stride;
+    return true;
+}
+
+static int decode_array_displacement_compare(const void *ap,
+                                             const void *bp)
+{
+    const DecodeArrayDisplacement *a = ap;
+    const DecodeArrayDisplacement *b = bp;
+    int c = decode_chunk_compare(&a->chunk, &b->chunk);
+    if (c != 0) return c;
+    c = decode_key_compare(&a->role_key, &b->role_key);
+    return c != 0 ? c : decode_cmp_u64(a->decision_ordinal,
+                                       b->decision_ordinal);
+}
+
+static bool decode_array_build_members(const OspreyDecodeInput *input,
+                                       const OspreyDecodePlan *plan,
+                                       OspreyDecodeArray *array,
+                                       OspreyDecodeAllocator *allocator)
+{
+    uint32_t member_count = 0;
+    uint32_t displacement_count = 0;
+    bool hard_conflict = false;
+    DecodeArrayDisplacement *displacements = NULL;
+
+    if (input == NULL || plan == NULL || array == NULL || allocator == NULL) {
+        return false;
+    }
+    for (uint32_t i = 0; i < plan->decision_count; i++) {
+        const OspreyChunkDecision *decision = &plan->decisions[i];
+        bool intersects;
+        bool legal;
+        if (!decode_array_member_info(array, &decision->chunk, &intersects,
+                                      &legal)) return false;
+        if (!intersects) continue;
+        if (!legal) {
+            hard_conflict = true;
+            continue;
+        }
+        if (member_count == UINT32_MAX) return false;
+        member_count++;
+        if (decision->role_has_predicate &&
+            (decision->provisional_role == OSPREY_STORAGE_SCALAR ||
+             decision->provisional_role == OSPREY_STORAGE_FIELD)) {
+            if (displacement_count == UINT32_MAX) return false;
+            displacement_count++;
+        }
+    }
+    if (hard_conflict) return false;
+
+    array->member_decision_ordinals = decode_alloc(
+        allocator, member_count, sizeof(*array->member_decision_ordinals));
+    array->displacement_keys = decode_alloc(
+        allocator, displacement_count, sizeof(*array->displacement_keys));
+    if ((member_count != 0 && array->member_decision_ordinals == NULL) ||
+        (displacement_count != 0 && array->displacement_keys == NULL)) {
+        return false;
+    }
+    if (displacement_count != 0) {
+        displacements = decode_alloc(allocator, displacement_count,
+                                     sizeof(*displacements));
+        if (displacements == NULL) return false;
+    }
+
+    uint32_t member_position = 0;
+    uint32_t displacement_position = 0;
+    for (uint32_t i = 0; i < plan->decision_count; i++) {
+        const OspreyChunkDecision *decision = &plan->decisions[i];
+        bool intersects;
+        bool legal;
+        if (!decode_array_member_info(array, &decision->chunk, &intersects,
+                                      &legal)) {
+            g_free(displacements);
+            return false;
+        }
+        if (!intersects) continue;
+        if (!legal || member_position == member_count) {
+            g_free(displacements);
+            return false;
+        }
+        array->member_decision_ordinals[member_position++] = i;
+        if (decision->role_has_predicate &&
+            (decision->provisional_role == OSPREY_STORAGE_SCALAR ||
+             decision->provisional_role == OSPREY_STORAGE_FIELD)) {
+            if (displacement_position == displacement_count) {
+                g_free(displacements);
+                return false;
+            }
+            displacements[displacement_position].chunk = decision->chunk;
+            displacements[displacement_position].role_key = decision->role_key;
+            displacements[displacement_position].posterior =
+                decision->role_posterior;
+            displacements[displacement_position].decision_ordinal = i;
+            displacement_position++;
+        }
+    }
+    if (member_position != member_count ||
+        displacement_position != displacement_count) {
+        g_free(displacements);
+        return false;
+    }
+    if (displacement_count > 1) {
+        qsort(displacements, displacement_count, sizeof(*displacements),
+              decode_array_displacement_compare);
+    }
+    OspreyDecodeScore score = { 0 };
+    if (!decode_score_add_probability(&score, array->posterior, false)) {
+        g_free(displacements);
+        return false;
+    }
+    for (uint32_t i = 0; i < displacement_count; i++) {
+        array->displacement_keys[i] = displacements[i].role_key;
+        if (displacements[i].posterior > 0.5 &&
+            !decode_score_add_probability(&score,
+                                          displacements[i].posterior, true)) {
+            g_free(displacements);
+            return false;
+        }
+    }
+    array->member_count = member_count;
+    array->displacement_count = displacement_count;
+    array->adjusted_score = score;
+    g_free(displacements);
+    return true;
+}
+
+static bool decode_array_work_build(const OspreyContext *ctx,
+                                    const OspreyDecodeInput *input,
+                                    const OspreyDecodePlan *plan,
+                                    OspreyDecodeAllocator *allocator,
+                                    DecodeArrayWork **work_out,
+                                    uint32_t *work_count_out,
+                                    uint64_t *discarded_layout)
+{
+    DecodeArrayWork *work = NULL;
+    uint32_t work_count = 0;
+
+    if (ctx == NULL || input == NULL || plan == NULL || allocator == NULL ||
+        work_out == NULL || work_count_out == NULL ||
+        discarded_layout == NULL) return false;
+    *work_out = NULL;
+    *work_count_out = 0;
+    *discarded_layout = 0;
+    work = decode_alloc(allocator, input->array_count, sizeof(*work));
+    if (input->array_count != 0 && work == NULL) return false;
+
+    for (uint32_t i = 0; i < input->array_count; i++) {
+        OspreyDecodeArray array;
+        DecodeArrayGeometryResult geometry = decode_array_geometry(
+            input, &input->array_candidates[i], &array);
+        if (geometry == DECODE_ARRAY_GEOMETRY_INVALID) {
+            decode_array_work_free(work, work_count);
+            return false;
+        }
+        if (geometry == DECODE_ARRAY_GEOMETRY_NON_DIVISIBLE) {
+            if (*discarded_layout == UINT64_MAX) {
+                decode_array_work_free(work, work_count);
+                return false;
+            }
+            (*discarded_layout)++;
+            continue;
+        }
+        if (!decode_array_build_members(input, plan, &array, allocator)) {
+            /* A false result is either a hard overlap conflict or an
+             * allocation/arithmetic failure.  Recheck the conflict without
+             * allocating so the caller can count it as layout loss. */
+            bool hard_conflict = false;
+            for (uint32_t d = 0; d < plan->decision_count; d++) {
+                bool intersects;
+                bool legal;
+                if (!decode_array_member_info(&array, &plan->decisions[d].chunk,
+                                              &intersects, &legal)) {
+                    decode_array_free_contents(&array);
+                    decode_array_work_free(work, work_count);
+                    return false;
+                }
+                if (intersects && !legal) hard_conflict = true;
+            }
+            decode_array_free_contents(&array);
+            if (!hard_conflict) {
+                decode_array_work_free(work, work_count);
+                return false;
+            }
+            if (*discarded_layout == UINT64_MAX) {
+                decode_array_work_free(work, work_count);
+                return false;
+            }
+            (*discarded_layout)++;
+            continue;
+        }
+        if (work_count == UINT32_MAX) {
+            decode_array_free_contents(&array);
+            decode_array_work_free(work, work_count);
+            return false;
+        }
+        work[work_count].array = array;
+        work[work_count].input_ordinal = i;
+        work_count++;
+    }
+    *work_out = work;
+    *work_count_out = work_count;
+    return true;
+}
+
+static int decode_array_order_compare(const void *ap, const void *bp,
+                                      void *opaque)
+{
+    const DecodeArrayOrderRef *a = ap;
+    const DecodeArrayOrderRef *b = bp;
+    (void)opaque;
+    int c = decode_region_compare(&a->region, &b->region);
+    if (c != 0) return c;
+    c = decode_cmp_i64(a->hi, b->hi);
+    if (c != 0) return c;
+    c = decode_cmp_i64(a->lo, b->lo);
+    if (c != 0) return c;
+    c = decode_cmp_u64(a->stride, b->stride);
+    return c != 0 ? c : decode_key_compare(&a->key, &b->key);
+}
+
+static int decode_array_order_compare_qsort(const void *ap, const void *bp)
+{
+    return decode_array_order_compare(ap, bp, NULL);
+}
+
+static bool decode_path_bit_array(const uint64_t *bits, uint32_t ordinal)
+{
+    return (bits[ordinal / 64u] & (UINT64_C(1) << (ordinal % 64u))) != 0;
+}
+
+static bool decode_array_schedule_score(
+    const uint64_t *bits, const DecodeArrayOrderRef *items, uint32_t count,
+    const uint32_t *key_positions, const DecodeArrayWork *work,
+    OspreyDecodeScore *out)
+{
+    OspreyDecodeScore score = { 0 };
+    if (bits == NULL || items == NULL || key_positions == NULL ||
+        work == NULL || out == NULL) return false;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t position = key_positions[i];
+        if (position >= count) return false;
+        if (decode_path_bit_array(bits, position) &&
+            !osprey_decode_score_add(&score,
+                &work[items[position].work_ordinal].array.adjusted_score)) {
+            return false;
+        }
+    }
+    *out = score;
+    return true;
+}
+
+static bool decode_array_schedule_key_less(
+    const uint64_t *left, const uint64_t *right,
+    const DecodeArrayOrderRef *items, uint32_t count,
+    const uint32_t *key_positions, const DecodeArrayWork *work)
+{
+    uint32_t left_position = 0;
+    uint32_t right_position = 0;
+
+    if (left == NULL || right == NULL || items == NULL || key_positions == NULL ||
+        work == NULL) return false;
+    for (;;) {
+        while (left_position < count &&
+               !decode_path_bit_array(left, key_positions[left_position])) {
+            left_position++;
+        }
+        while (right_position < count &&
+               !decode_path_bit_array(right, key_positions[right_position])) {
+            right_position++;
+        }
+        if (left_position == count || right_position == count) {
+            return left_position == count && right_position != count;
+        }
+        uint32_t left_work = items[key_positions[left_position]].work_ordinal;
+        uint32_t right_work = items[key_positions[right_position]].work_ordinal;
+        int c = decode_cmp_u64(work[left_work].input_ordinal,
+                               work[right_work].input_ordinal);
+        if (c != 0) return c < 0;
+        left_position++;
+        right_position++;
+    }
+}
+
+static bool decode_array_order_intersects(const DecodeArrayOrderRef *left,
+                                          const DecodeArrayOrderRef *right)
+{
+    return left->lo < right->hi && right->lo < left->hi;
+}
+
+static bool decode_array_state_score(
+    const uint8_t *state, const DecodeArrayOrderRef *items, uint32_t count,
+    const uint32_t *key_positions, const DecodeArrayWork *work,
+    OspreyDecodeScore *out)
+{
+    OspreyDecodeScore score = { 0 };
+
+    if (state == NULL || items == NULL || key_positions == NULL ||
+        work == NULL || out == NULL) return false;
+    for (uint32_t key_position = 0; key_position < count; key_position++) {
+        uint32_t item = key_positions[key_position];
+        if (item >= count) return false;
+        if (state[item] == 1 &&
+            !osprey_decode_score_add(
+                &score,
+                &work[items[item].work_ordinal].array.adjusted_score)) {
+            return false;
+        }
+    }
+    *out = score;
+    return true;
+}
+
+/* Return the maximum schedule score under canonical-key prefix constraints.
+ * `extra` is one temporarily forced item; all previously forced items are
+ * marked in state.  Recomputing every path in complete P08-key order keeps
+ * the binary64 result independent of interval-DP traversal order. */
+static bool decode_array_constrained_score(
+    const DecodeArrayWork *work, const DecodeArrayOrderRef *items,
+    uint32_t count, const uint32_t *predecessors,
+    const uint32_t *key_positions, const uint8_t *state,
+    const uint8_t *blocked, uint32_t extra, uint64_t *path_bits,
+    uint64_t *scratch_bits, size_t nwords, size_t row_bytes,
+    size_t path_word_count, OspreyDecodeScore *out)
+{
+    if (work == NULL || items == NULL || predecessors == NULL ||
+        key_positions == NULL || state == NULL || blocked == NULL ||
+        path_bits == NULL || scratch_bits == NULL || out == NULL ||
+        extra >= count || state[extra] != 0 || blocked[extra]) {
+        return false;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        if (state[i] == 1 && i != extra &&
+            decode_array_order_intersects(&items[i], &items[extra])) {
+            return false;
+        }
+    }
+
+    memset(path_bits, 0, path_word_count * sizeof(*path_bits));
+    for (uint32_t i = 0; i < count; i++) {
+        size_t source_row = predecessors[i] == UINT32_MAX
+            ? 0 : (size_t)predecessors[i] + 1u;
+        size_t exclude_row = i;
+        size_t destination_row = (size_t)i + 1u;
+        bool extra_conflict = i != extra &&
+            decode_array_order_intersects(&items[i], &items[extra]);
+        bool can_include = state[i] != 2 && !blocked[i] && !extra_conflict;
+        uint64_t *destination = path_bits + destination_row * nwords;
+        const uint64_t *exclude = path_bits + exclude_row * nwords;
+
+        memcpy(destination, exclude, row_bytes);
+        if (!can_include) continue;
+        memcpy(scratch_bits, path_bits + source_row * nwords, row_bytes);
+        scratch_bits[i / 64u] |= UINT64_C(1) << (i % 64u);
+        OspreyDecodeScore include_score;
+        OspreyDecodeScore exclude_score;
+        if (!decode_array_schedule_score(scratch_bits, items, count,
+                                         key_positions, work,
+                                         &include_score) ||
+            !decode_array_schedule_score(exclude, items, count,
+                                         key_positions, work,
+                                         &exclude_score)) {
+            return false;
+        }
+        int comparison = osprey_decode_score_compare(&include_score,
+                                                      &exclude_score);
+        bool choose_include = state[i] == 1 || i == extra ||
+            comparison > 0 ||
+            (comparison == 0 && decode_array_schedule_key_less(
+                scratch_bits, exclude, items, count, key_positions, work));
+        if (choose_include) memcpy(destination, scratch_bits, row_bytes);
+    }
+    return decode_array_schedule_score(
+        path_bits + (size_t)count * nwords, items, count, key_positions, work,
+        out);
+}
+
+static bool decode_force_array_item(const DecodeArrayOrderRef *items,
+                                    uint32_t count, uint8_t *state,
+                                    uint8_t *blocked, uint32_t item)
+{
+    if (items == NULL || state == NULL || blocked == NULL || item >= count ||
+        state[item] != 0 || blocked[item]) return false;
+    for (uint32_t i = 0; i < count; i++) {
+        if (state[i] == 1 && i != item &&
+            decode_array_order_intersects(&items[i], &items[item])) {
+            return false;
+        }
+    }
+    state[item] = 1;
+    for (uint32_t i = 0; i < count; i++) {
+        if (i != item &&
+            decode_array_order_intersects(&items[i], &items[item])) {
+            blocked[i] = 1;
+        }
+    }
+    return true;
+}
+
+static bool decode_array_schedule_region(
+    const DecodeArrayWork *work, const DecodeArrayOrderRef *items,
+    uint32_t count, uint8_t *selected, OspreyDecodeAllocator *allocator)
+{
+    uint32_t *predecessors = NULL;
+    uint32_t *key_positions = NULL;
+    uint64_t *path_bits = NULL;
+    uint64_t *scratch_bits = NULL;
+    OspreyDecodeScore *scores = NULL;
+    uint8_t *state = NULL;
+    uint8_t *blocked = NULL;
+    size_t padded_count;
+    size_t nwords;
+    size_t rows;
+    size_t path_word_count;
+    size_t row_bytes;
+    bool ok = false;
+
+    if (work == NULL || items == NULL || selected == NULL || allocator == NULL) {
+        return false;
+    }
+    if (count == 0) return true;
+    predecessors = decode_alloc(allocator, count, sizeof(*predecessors));
+    key_positions = decode_alloc(allocator, count, sizeof(*key_positions));
+    if (predecessors == NULL || key_positions == NULL) goto done;
+    for (uint32_t i = 0; i < count; i++) {
+        key_positions[i] = i;
+        uint32_t j = i;
+        while (j != 0) {
+            uint32_t previous = key_positions[j - 1];
+            uint32_t current = key_positions[j];
+            if (work[items[previous].work_ordinal].input_ordinal <=
+                work[items[current].work_ordinal].input_ordinal) break;
+            key_positions[j] = previous;
+            key_positions[j - 1] = current;
+            j--;
+        }
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t low = 0;
+        uint32_t high = i;
+        while (low < high) {
+            uint32_t middle = low + (high - low) / 2;
+            if (items[middle].hi <= items[i].lo) low = middle + 1;
+            else high = middle;
+        }
+        predecessors[i] = low == 0 ? UINT32_MAX : low - 1;
+    }
+    if (!decode_size_add((size_t)count, 63u, &padded_count) ||
+        !decode_size_add((size_t)count, 1u, &rows)) goto done;
+    nwords = padded_count / 64u;
+    if (nwords == 0 || !decode_size_mul(rows, nwords, &path_word_count) ||
+        !decode_size_mul(nwords, sizeof(*scratch_bits), &row_bytes)) goto done;
+    path_bits = decode_alloc(allocator, path_word_count, sizeof(*path_bits));
+    scratch_bits = decode_alloc(allocator, nwords, sizeof(*scratch_bits));
+    scores = decode_alloc(allocator, rows, sizeof(*scores));
+    if (path_bits == NULL || scratch_bits == NULL || scores == NULL) goto done;
+
+    for (uint32_t i = 0; i < count; i++) {
+        size_t source_row = predecessors[i] == UINT32_MAX
+            ? 0 : (size_t)predecessors[i] + 1u;
+        size_t exclude_row = i;
+        size_t destination_row = (size_t)i + 1u;
+        memcpy(path_bits + destination_row * nwords,
+               path_bits + exclude_row * nwords, row_bytes);
+        memcpy(scratch_bits, path_bits + source_row * nwords, row_bytes);
+        scratch_bits[i / 64u] |= UINT64_C(1) << (i % 64u);
+        OspreyDecodeScore include_score;
+        if (!decode_array_schedule_score(scratch_bits, items, count,
+                                          key_positions, work,
+                                          &include_score)) goto done;
+        OspreyDecodeScore exclude_score = scores[i];
+        int comparison = osprey_decode_score_compare(&include_score,
+                                                      &exclude_score);
+        bool choose_include = comparison > 0 ||
+            (comparison == 0 && decode_array_schedule_key_less(
+                scratch_bits, path_bits + exclude_row * nwords, items, count,
+                key_positions, work));
+        if (choose_include) {
+            memcpy(path_bits + destination_row * nwords, scratch_bits, row_bytes);
+            scores[destination_row] = include_score;
+        } else {
+            scores[destination_row] = exclude_score;
+        }
+    }
+
+    OspreyDecodeScore empty = { 0 };
+    OspreyDecodeScore target_score = scores[count];
+    if (osprey_decode_score_compare(&target_score, &empty) > 0) {
+        state = decode_alloc(allocator, count, sizeof(*state));
+        blocked = decode_alloc(allocator, count, sizeof(*blocked));
+        if (state == NULL || blocked == NULL) goto done;
+
+        /* Local DP tie choices are not globally compositional: adding a
+         * later key can reverse the order of two equal-score prefix vectors.
+         * Recover the globally smallest complete P08-key vector by forcing
+         * the first feasible key at each canonical position. */
+        uint32_t cursor = 0;
+        while (cursor < count) {
+            OspreyDecodeScore selected_score;
+            if (!decode_array_state_score(state, items, count, key_positions,
+                                          work, &selected_score)) goto done;
+            if (osprey_decode_score_compare(&selected_score,
+                                            &target_score) == 0) {
+                break;
+            }
+            bool found = false;
+            for (uint32_t key_position = cursor; key_position < count;
+                 key_position++) {
+                uint32_t item = key_positions[key_position];
+                for (uint32_t prior = cursor; prior < key_position; prior++) {
+                    uint32_t prior_item = key_positions[prior];
+                    if (state[prior_item] == 0) state[prior_item] = 2;
+                }
+                if (item >= count || state[item] != 0 || blocked[item]) {
+                    continue;
+                }
+                OspreyDecodeScore candidate_score;
+                if (!decode_array_constrained_score(
+                        work, items, count, predecessors, key_positions,
+                        state, blocked, item, path_bits, scratch_bits, nwords,
+                        row_bytes, path_word_count, &candidate_score)) {
+                    goto done;
+                }
+                if (osprey_decode_score_compare(&candidate_score,
+                                                &target_score) == 0) {
+                    if (!decode_force_array_item(items, count, state, blocked,
+                                                 item)) {
+                        goto done;
+                    }
+                    cursor = key_position + 1;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) goto done;
+        }
+        OspreyDecodeScore recovered_score;
+        if (!decode_array_state_score(state, items, count, key_positions,
+                                      work, &recovered_score) ||
+            osprey_decode_score_compare(&recovered_score,
+                                        &target_score) != 0) {
+            goto done;
+        }
+        for (uint32_t i = 0; i < count; i++) {
+            if (state[i] == 1) {
+                uint32_t work_ordinal = items[i].work_ordinal;
+                selected[work_ordinal] = 1;
+            }
+        }
+    }
+    ok = true;
+
+done:
+    g_free(predecessors);
+    g_free(key_positions);
+    g_free(path_bits);
+    g_free(scratch_bits);
+    g_free(scores);
+    g_free(state);
+    g_free(blocked);
+    return ok;
+}
+
+static bool decode_array_work_schedule(
+    const DecodeArrayWork *work, uint32_t work_count, uint8_t *selected,
+    OspreyDecodeAllocator *allocator)
+{
+    DecodeArrayOrderRef *order = NULL;
+    uint32_t order_count = work_count;
+
+    if ((work_count != 0 && work == NULL) ||
+        (work_count != 0 && selected == NULL) || allocator == NULL) {
+        return false;
+    }
+    order = decode_alloc(allocator, order_count, sizeof(*order));
+    if (order_count != 0 && order == NULL) return false;
+    for (uint32_t i = 0; i < order_count; i++) {
+        order[i].region = work[i].array.region;
+        order[i].lo = work[i].array.lo;
+        order[i].hi = work[i].array.hi;
+        order[i].stride = work[i].array.stride;
+        order[i].key = work[i].array.key;
+        order[i].work_ordinal = i;
+    }
+    if (order_count > 1) {
+        qsort(order, order_count, sizeof(*order),
+              decode_array_order_compare_qsort);
+    }
+    uint32_t begin = 0;
+    while (begin < order_count) {
+        uint32_t end = begin + 1;
+        while (end < order_count &&
+               decode_region_compare(&order[begin].region,
+                                     &order[end].region) == 0) {
+            end++;
+        }
+        if (!decode_array_schedule_region(work, order + begin, end - begin,
+                                          selected, allocator)) {
+            g_free(order);
+            return false;
+        }
+        begin = end;
+    }
+    g_free(order);
+    return true;
 }
 
 static int decode_field_item_compare(const void *ap, const void *bp)
@@ -1977,6 +2774,9 @@ done:
     return ok;
 }
 
+static void decode_plan_arrays_free(OspreyDecodeArray *arrays,
+                                    uint32_t count);
+
 static bool decode_plan_key_used(const OspreyDecodePlan *plan,
                                  const OspreyKey *key)
 {
@@ -2045,6 +2845,7 @@ void osprey_decode_plan_free(OspreyDecodePlan *plan)
             g_free(plan->field_groups[i].decision_ordinals);
         }
     }
+    decode_plan_arrays_free(plan->arrays, plan->array_count);
     g_free(plan->decisions);
     g_free(plan->chunk_index);
     g_free(plan->field_groups);
@@ -2271,6 +3072,498 @@ failure:
     return OSPREY_INVALID_MODEL;
 }
 
+static const OspreyChunk *decode_candidate_chunk(
+    const OspreyDecodeCandidate *candidate)
+{
+    if (candidate == NULL) return NULL;
+    return candidate->predicate_kind == OSPREY_PRED_FIELD_OF ||
+           candidate->predicate_kind == OSPREY_PRED_POINTER
+        ? &candidate->payload.attached.chunk : &candidate->payload.chunk;
+}
+
+static bool decode_plan_candidate_retained(
+    const OspreyDecodeInput *input, const OspreyChunkDecision *decisions,
+    uint32_t decision_count, const OspreyDecodeCandidate *candidate)
+{
+    const OspreyChunk *chunk = decode_candidate_chunk(candidate);
+
+    if (input == NULL || decisions == NULL || candidate == NULL ||
+        chunk == NULL) return false;
+    for (uint32_t i = 0; i < decision_count; i++) {
+        const OspreyChunkDecision *decision = &decisions[i];
+        if (decode_chunk_compare(&decision->chunk, chunk) != 0) continue;
+        switch (candidate->predicate_kind) {
+        case OSPREY_PRED_PRIMITIVE_VAR:
+            return decision->final_role == OSPREY_STORAGE_PRIMITIVE &&
+                   decision->role_has_predicate &&
+                   decode_key_compare(&decision->role_key,
+                                      &candidate->key) == 0;
+        case OSPREY_PRED_SCALAR:
+            return decision->final_role == OSPREY_STORAGE_SCALAR &&
+                   decision->role_has_predicate &&
+                   decode_key_compare(&decision->role_key,
+                                      &candidate->key) == 0;
+        case OSPREY_PRED_FIELD_OF:
+            return decision->final_role == OSPREY_STORAGE_FIELD &&
+                   decision->role_has_predicate &&
+                   decode_key_compare(&decision->role_key,
+                                      &candidate->key) == 0;
+        case OSPREY_PRED_POINTER:
+            return decision->has_pointer_target &&
+                   decode_key_compare(&decision->pointer_key,
+                                      &candidate->key) == 0;
+        default:
+            return false;
+        }
+    }
+    return false;
+}
+
+static bool decode_plan_for_array_selection_valid(
+    const OspreyContext *ctx, const OspreyDecodeInput *input,
+    const OspreyDecodePlan *plan, OspreyDecodeAllocator *allocator)
+{
+    uint8_t *field_seen = NULL;
+    uint32_t expected_role_keys;
+    bool count_ok;
+
+    if (ctx == NULL || input == NULL || plan == NULL || allocator == NULL ||
+        !decode_input_for_roles_valid(ctx, input, allocator) ||
+        plan->decision_count != input->chunk_range_count ||
+        plan->chunk_index_count != plan->decision_count ||
+        (plan->decision_count != 0 &&
+         (plan->decisions == NULL || plan->chunk_index == NULL)) ||
+        (plan->field_group_count != 0 && plan->field_groups == NULL) ||
+        plan->field_group_count > input->field_base_range_count ||
+        plan->array_count != 0 || plan->arrays != NULL ||
+        plan->discarded_layout != 0) {
+        return false;
+    }
+    expected_role_keys = 0;
+    count_ok = decode_u32_add(input->primitive_count, input->scalar_count,
+                              &expected_role_keys) &&
+               decode_u32_add(expected_role_keys, input->field_count,
+                              &expected_role_keys) &&
+               decode_u32_add(expected_role_keys, input->pointer_count,
+                              &expected_role_keys);
+    if (!count_ok || plan->role_loss_count > expected_role_keys ||
+        (plan->role_loss_count != 0 && plan->role_loss_keys == NULL)) {
+        return false;
+    }
+    for (uint32_t i = 0; i < plan->decision_count; i++) {
+        const OspreyChunkDecision *decision = &plan->decisions[i];
+        const OspreyDecodePlanChunkIndex *index = &plan->chunk_index[i];
+        if (decode_chunk_compare(&decision->chunk,
+                                 &input->chunk_ranges[i].chunk) != 0 ||
+            index->decision_ordinal != i ||
+            decode_chunk_compare(&index->chunk, &decision->chunk) != 0 ||
+            decision->provisional_role < OSPREY_STORAGE_PRIMITIVE ||
+            decision->provisional_role > OSPREY_STORAGE_FIELD ||
+            decision->final_role != decision->provisional_role ||
+            decision->has_pointer_target > 1 ||
+            decision->role_has_predicate > 1 ||
+            decision->has_array_owner != 0) {
+            return false;
+        }
+        if (decision->provisional_role == OSPREY_STORAGE_FIELD &&
+            (!decision->role_has_predicate ||
+             !decode_field_geometry_valid(input, &(OspreyDecodeCandidate){
+                 .key = decision->role_key,
+                 .payload = { .attached = {
+                     .chunk = decision->chunk,
+                     .base = decision->owner_base }},
+                 .predicate_kind = OSPREY_PRED_FIELD_OF,
+                 .posterior = decision->role_posterior }))) {
+            return false;
+        }
+        if (decision->has_pointer_target) {
+            const OspreyRegionExtent *extent = decode_input_find_extent(
+                input, &decision->pointer_target.region);
+            if (decision->chunk.size != sizeof(target_ulong) ||
+                extent == NULL || decision->pointer_target.offset < extent->lo ||
+                decision->pointer_target.offset >= extent->hi) {
+                return false;
+            }
+        }
+    }
+    field_seen = decode_alloc(allocator, plan->decision_count,
+                              sizeof(*field_seen));
+    if (plan->decision_count != 0 && field_seen == NULL) return false;
+    for (uint32_t i = 0; i < plan->field_group_count; i++) {
+        const OspreyDecodeFieldGroup *group = &plan->field_groups[i];
+        if (group->field_count == 0 ||
+            group->field_count > plan->decision_count ||
+            group->decision_ordinals == NULL ||
+            (i != 0 && decode_address_compare(
+                &plan->field_groups[i - 1].base, &group->base) >= 0)) {
+            g_free(field_seen);
+            return false;
+        }
+        for (uint32_t j = 0; j < group->field_count; j++) {
+            uint32_t ordinal = group->decision_ordinals[j];
+            if (ordinal >= plan->decision_count || field_seen[ordinal] ||
+                plan->decisions[ordinal].final_role != OSPREY_STORAGE_FIELD ||
+                decode_address_compare(&plan->decisions[ordinal].owner_base,
+                                       &group->base) != 0) {
+                g_free(field_seen);
+                return false;
+            }
+            field_seen[ordinal] = 1;
+        }
+    }
+    for (uint32_t i = 0; i < plan->decision_count; i++) {
+        if (plan->decisions[i].final_role == OSPREY_STORAGE_FIELD &&
+            !field_seen[i]) {
+            g_free(field_seen);
+            return false;
+        }
+    }
+    g_free(field_seen);
+    for (uint32_t i = 0; i < plan->role_loss_count; i++) {
+        for (uint32_t j = 0; j < i; j++) {
+            if (decode_key_compare(&plan->role_loss_keys[i],
+                                   &plan->role_loss_keys[j]) == 0) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static void decode_field_groups_free(OspreyDecodeFieldGroup *groups,
+                                     uint32_t count)
+{
+    if (groups == NULL) return;
+    for (uint32_t i = 0; i < count; i++) g_free(groups[i].decision_ordinals);
+    g_free(groups);
+}
+
+static void decode_plan_arrays_free(OspreyDecodeArray *arrays, uint32_t count)
+{
+    if (arrays == NULL) return;
+    for (uint32_t i = 0; i < count; i++) {
+        decode_array_free_contents(&arrays[i]);
+    }
+    g_free(arrays);
+}
+
+static bool decode_rebuild_field_groups(
+    const OspreyDecodePlan *plan, const OspreyChunkDecision *decisions,
+    OspreyDecodeFieldGroup **groups_out, uint32_t *count_out,
+    OspreyDecodeAllocator *allocator)
+{
+    OspreyDecodeFieldGroup *groups = NULL;
+    uint32_t group_count = 0;
+
+    if (plan == NULL || (plan->decision_count != 0 && decisions == NULL) ||
+        groups_out == NULL || count_out == NULL || allocator == NULL) {
+        return false;
+    }
+    *groups_out = NULL;
+    *count_out = 0;
+    groups = decode_alloc(allocator, plan->field_group_count,
+                          sizeof(*groups));
+    if (plan->field_group_count != 0 && groups == NULL) return false;
+    for (uint32_t i = 0; i < plan->field_group_count; i++) {
+        const OspreyDecodeFieldGroup *old = &plan->field_groups[i];
+        uint32_t survivors = 0;
+        for (uint32_t j = 0; j < old->field_count; j++) {
+            uint32_t ordinal = old->decision_ordinals[j];
+            if (ordinal >= plan->decision_count) {
+                decode_field_groups_free(groups, group_count);
+                return false;
+            }
+            if (decisions[ordinal].final_role == OSPREY_STORAGE_FIELD) {
+                if (survivors == UINT32_MAX) {
+                    decode_field_groups_free(groups, group_count);
+                    return false;
+                }
+                survivors++;
+            }
+        }
+        if (survivors == 0) continue;
+        if (group_count == UINT32_MAX) {
+            decode_field_groups_free(groups, group_count);
+            return false;
+        }
+        OspreyDecodeFieldGroup *group = &groups[group_count++];
+        group->base = old->base;
+        group->field_count = survivors;
+        group->decision_ordinals = decode_alloc(
+            allocator, survivors, sizeof(*group->decision_ordinals));
+        if (group->decision_ordinals == NULL) {
+            decode_field_groups_free(groups, group_count);
+            return false;
+        }
+        uint32_t position = 0;
+        for (uint32_t j = 0; j < old->field_count; j++) {
+            uint32_t ordinal = old->decision_ordinals[j];
+            if (decisions[ordinal].final_role != OSPREY_STORAGE_FIELD) continue;
+            uint32_t at = position++;
+            while (at != 0) {
+                uint32_t previous = group->decision_ordinals[at - 1];
+                int c = decode_chunk_compare(&decisions[previous].chunk,
+                                             &decisions[ordinal].chunk);
+                if (c < 0 || (c == 0 && previous < ordinal)) break;
+                group->decision_ordinals[at] = previous;
+                at--;
+            }
+            group->decision_ordinals[at] = ordinal;
+        }
+        if (position != survivors) {
+            decode_field_groups_free(groups, group_count);
+            return false;
+        }
+    }
+    *groups_out = groups;
+    *count_out = group_count;
+    return true;
+}
+
+static bool decode_build_final_role_losses(
+    const OspreyDecodeInput *input, const OspreyChunkDecision *decisions,
+    uint32_t decision_count, OspreyKey **keys_out, uint32_t *count_out,
+    OspreyDecodeAllocator *allocator)
+{
+    const OspreyDecodeCandidate *families[4];
+    uint32_t counts[4];
+    bool count_ok;
+    uint32_t capacity;
+    uint32_t count = 0;
+
+    if (input == NULL || (decision_count != 0 && decisions == NULL) ||
+        keys_out == NULL || count_out == NULL || allocator == NULL) {
+        return false;
+    }
+    capacity = decode_input_chunk_count(input, &count_ok);
+    if (!count_ok) return false;
+    *keys_out = decode_alloc(allocator, capacity, sizeof(**keys_out));
+    if (capacity != 0 && *keys_out == NULL) return false;
+    families[0] = input->primitive_candidates;
+    families[1] = input->scalar_candidates;
+    families[2] = input->field_candidates;
+    families[3] = input->pointer_candidates;
+    counts[0] = input->primitive_count;
+    counts[1] = input->scalar_count;
+    counts[2] = input->field_count;
+    counts[3] = input->pointer_count;
+    for (size_t family = 0; family < G_N_ELEMENTS(families); family++) {
+        for (uint32_t i = 0; i < counts[family]; i++) {
+            if (decode_plan_candidate_retained(input, decisions,
+                                               decision_count,
+                                               &families[family][i])) {
+                continue;
+            }
+            if (count == capacity) {
+                g_free(*keys_out);
+                *keys_out = NULL;
+                return false;
+            }
+            (*keys_out)[count++] = families[family][i].key;
+        }
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        for (uint32_t j = 0; j < i; j++) {
+            if (decode_key_compare(&(*keys_out)[i], &(*keys_out)[j]) == 0) {
+                g_free(*keys_out);
+                *keys_out = NULL;
+                return false;
+            }
+        }
+    }
+    *count_out = count;
+    return true;
+}
+
+static bool decode_copy_selected_arrays(
+    const DecodeArrayWork *work, uint32_t work_count, const uint8_t *selected,
+    uint32_t selected_count, OspreyDecodeArray **arrays_out,
+    OspreyDecodeAllocator *allocator)
+{
+    OspreyDecodeArray *arrays;
+    uint32_t position = 0;
+
+    if (arrays_out == NULL || allocator == NULL ||
+        (work_count != 0 && (work == NULL || selected == NULL))) return false;
+    *arrays_out = NULL;
+    arrays = decode_alloc(allocator, selected_count, sizeof(*arrays));
+    if (selected_count != 0 && arrays == NULL) return false;
+    for (uint32_t i = 0; i < work_count; i++) {
+        if (!selected[i]) continue;
+        if (position == selected_count) {
+            decode_plan_arrays_free(arrays, position);
+            return false;
+        }
+        arrays[position] = work[i].array;
+        arrays[position].member_decision_ordinals = NULL;
+        arrays[position].displacement_keys = NULL;
+        if (work[i].array.member_count != 0) {
+            arrays[position].member_decision_ordinals = decode_alloc(
+                allocator, work[i].array.member_count,
+                sizeof(*arrays[position].member_decision_ordinals));
+            if (arrays[position].member_decision_ordinals == NULL) {
+                decode_plan_arrays_free(arrays, position + 1);
+                return false;
+            }
+            memcpy(arrays[position].member_decision_ordinals,
+                   work[i].array.member_decision_ordinals,
+                   (size_t)work[i].array.member_count *
+                   sizeof(*arrays[position].member_decision_ordinals));
+        }
+        if (work[i].array.displacement_count != 0) {
+            arrays[position].displacement_keys = decode_alloc(
+                allocator, work[i].array.displacement_count,
+                sizeof(*arrays[position].displacement_keys));
+            if (arrays[position].displacement_keys == NULL) {
+                decode_plan_arrays_free(arrays, position + 1);
+                return false;
+            }
+            memcpy(arrays[position].displacement_keys,
+                   work[i].array.displacement_keys,
+                   (size_t)work[i].array.displacement_count *
+                   sizeof(*arrays[position].displacement_keys));
+        }
+        position++;
+    }
+    if (position != selected_count) {
+        decode_plan_arrays_free(arrays, position);
+        return false;
+    }
+    *arrays_out = arrays;
+    return true;
+}
+
+OspreyStatus osprey_decode_select_arrays(const OspreyContext *ctx,
+                                         const OspreyDecodeInput *input,
+                                         OspreyDecodePlan *plan)
+{
+    OspreyDecodeAllocator allocator;
+    DecodeArrayWork *work = NULL;
+    uint32_t work_count = 0;
+    uint8_t *selected = NULL;
+    uint64_t layout_discarded = 0;
+    uint32_t selected_count = 0;
+    OspreyChunkDecision *new_decisions = NULL;
+    OspreyDecodeFieldGroup *new_groups = NULL;
+    OspreyDecodeArray *new_arrays = NULL;
+    OspreyKey *new_role_losses = NULL;
+    uint32_t new_group_count = 0;
+    uint32_t new_role_loss_count = 0;
+    uint8_t *owned_members = NULL;
+
+    memset(&allocator, 0, sizeof(allocator));
+    if (!decode_plan_for_array_selection_valid(ctx, input, plan,
+                                               &allocator)) {
+        return OSPREY_INVALID_MODEL;
+    }
+    if (!decode_array_work_build(ctx, input, plan, &allocator, &work,
+                                 &work_count, &layout_discarded)) {
+        decode_array_work_free(work, work_count);
+        return OSPREY_INVALID_MODEL;
+    }
+    selected = decode_alloc(&allocator, work_count, sizeof(*selected));
+    if (work_count != 0 && selected == NULL) goto failure;
+    if (!decode_array_work_schedule(work, work_count, selected, &allocator)) {
+        goto failure;
+    }
+    for (uint32_t i = 0; i < work_count; i++) {
+        if (!selected[i]) continue;
+        if (selected_count == UINT32_MAX) goto failure;
+        selected_count++;
+    }
+    if (work_count > UINT64_MAX - layout_discarded) goto failure;
+    layout_discarded += work_count;
+    if (selected_count > layout_discarded) goto failure;
+    layout_discarded -= selected_count;
+
+    if (selected_count == 0) {
+        plan->discarded_layout = layout_discarded;
+        decode_array_work_free(work, work_count);
+        g_free(selected);
+        return OSPREY_OK;
+    }
+
+    new_decisions = decode_alloc(&allocator, plan->decision_count,
+                                 sizeof(*new_decisions));
+    if (plan->decision_count != 0 && new_decisions == NULL) goto failure;
+    if (plan->decision_count != 0) {
+        memcpy(new_decisions, plan->decisions,
+               (size_t)plan->decision_count * sizeof(*new_decisions));
+    }
+    owned_members = decode_alloc(&allocator, plan->decision_count,
+                                 sizeof(*owned_members));
+    if (plan->decision_count != 0 && owned_members == NULL) goto failure;
+    for (uint32_t i = 0; i < work_count; i++) {
+        if (!selected[i]) continue;
+        const OspreyDecodeArray *array = &work[i].array;
+        for (uint32_t j = 0; j < array->member_count; j++) {
+            uint32_t ordinal = array->member_decision_ordinals[j];
+            if (ordinal >= plan->decision_count || owned_members[ordinal]) {
+                goto failure;
+            }
+            owned_members[ordinal] = 1;
+            new_decisions[ordinal].final_role =
+                OSPREY_STORAGE_ARRAY_ELEMENT;
+            new_decisions[ordinal].has_array_owner = 1;
+            new_decisions[ordinal].array_owner = (OspreyAddress){
+                .region = array->region, .offset = array->lo };
+            new_decisions[ordinal].array_posterior = array->posterior;
+            new_decisions[ordinal].array_support = array->direct_support;
+            new_decisions[ordinal].array_source_rule_bits =
+                array->source_rule_bits;
+            new_decisions[ordinal].array_key = array->key;
+        }
+    }
+    if (!decode_copy_selected_arrays(work, work_count, selected,
+                                     selected_count, &new_arrays,
+                                     &allocator) ||
+        !decode_rebuild_field_groups(plan, new_decisions, &new_groups,
+                                     &new_group_count, &allocator) ||
+        !decode_build_final_role_losses(input, new_decisions,
+                                        plan->decision_count,
+                                        &new_role_losses,
+                                        &new_role_loss_count, &allocator)) {
+        goto failure;
+    }
+
+    OspreyDecodeArray *old_arrays = plan->arrays;
+    OspreyChunkDecision *old_decisions = plan->decisions;
+    OspreyDecodeFieldGroup *old_groups = plan->field_groups;
+    OspreyKey *old_role_losses = plan->role_loss_keys;
+    uint32_t old_array_count = plan->array_count;
+    uint32_t old_group_count = plan->field_group_count;
+    plan->arrays = new_arrays;
+    plan->array_count = selected_count;
+    plan->discarded_layout = layout_discarded;
+    plan->decisions = new_decisions;
+    plan->field_groups = new_groups;
+    plan->field_group_count = new_group_count;
+    plan->role_loss_keys = new_role_losses;
+    plan->role_loss_count = new_role_loss_count;
+    new_arrays = NULL;
+    new_decisions = NULL;
+    new_groups = NULL;
+    new_role_losses = NULL;
+    decode_plan_arrays_free(old_arrays, old_array_count);
+    g_free(old_decisions);
+    decode_field_groups_free(old_groups, old_group_count);
+    g_free(old_role_losses);
+    decode_array_work_free(work, work_count);
+    g_free(selected);
+    g_free(owned_members);
+    return OSPREY_OK;
+
+failure:
+    decode_plan_arrays_free(new_arrays, selected_count);
+    g_free(new_decisions);
+    decode_field_groups_free(new_groups, new_group_count);
+    g_free(new_role_losses);
+    decode_array_work_free(work, work_count);
+    g_free(selected);
+    g_free(owned_members);
+    return OSPREY_INVALID_MODEL;
+}
+
 static const char *decode_storage_role_name(uint8_t role)
 {
     switch (role) {
@@ -2311,10 +3604,13 @@ static bool decode_dump_decision(FILE *out, uint32_t ordinal,
 {
     uint64_t role_bits;
     uint64_t pointer_bits;
+    uint64_t array_bits;
 
+    if (out == NULL || decision == NULL) return false;
     memcpy(&role_bits, &decision->role_posterior, sizeof(role_bits));
     memcpy(&pointer_bits, &decision->pointer_posterior,
            sizeof(pointer_bits));
+    memcpy(&array_bits, &decision->array_posterior, sizeof(array_bits));
     if (fprintf(out, "[decision %u] ", ordinal) < 0 ||
         !decode_dump_chunk(out, "chunk", &decision->chunk) ||
         fprintf(out, " [provisional %s] [final %s]"
@@ -2338,6 +3634,19 @@ static bool decode_dump_decision(FILE *out, uint32_t ordinal,
         !decode_dump_address(out, "owner", &decision->owner_base)) {
         return false;
     }
+    if (decision->has_array_owner) {
+        if (decision->final_role != OSPREY_STORAGE_ARRAY_ELEMENT ||
+            !decode_dump_address(out, "array-owner", &decision->array_owner) ||
+            fprintf(out, " [array-posterior-bits 0x%016" PRIx64 "]"
+                         " [array-support %" PRIu64 "]"
+                         " [array-rules 0x%016" PRIx64 "] [array-key ",
+                    array_bits, decision->array_support,
+                    decision->array_source_rule_bits) < 0 ||
+            !decode_dump_key(out, &decision->array_key) ||
+            fputc(']', out) == EOF) {
+            return false;
+        }
+    }
     if (fprintf(out, " [pointer %u] [pointer-posterior-bits 0x%016" PRIx64 "]"
                      " [pointer-support %" PRIu64 "]"
                      " [pointer-rules 0x%016" PRIx64 "]",
@@ -2356,23 +3665,78 @@ static bool decode_dump_decision(FILE *out, uint32_t ordinal,
     return fputc('\n', out) != EOF;
 }
 
+static bool decode_dump_array(FILE *out, uint32_t ordinal,
+                              const OspreyDecodeArray *array,
+                              const OspreyDecodePlan *plan)
+{
+    uint64_t score_bits;
+
+    if (out == NULL || array == NULL || plan == NULL ||
+        (array->member_count != 0 && array->member_decision_ordinals == NULL) ||
+        (array->displacement_count != 0 && array->displacement_keys == NULL) ||
+        array->adjusted_score.negative_infinite > 1 ||
+        !isfinite(array->adjusted_score.finite)) {
+        return false;
+    }
+    memcpy(&score_bits, &array->adjusted_score.finite, sizeof(score_bits));
+    if (fprintf(out, "[array %u] ", ordinal) < 0 ||
+        !decode_dump_region_id(out, "region", &array->region) ||
+        fprintf(out, " [key ") < 0 || !decode_dump_key(out, &array->key) ||
+        fputc(']', out) == EOF ||
+        fprintf(out, " [lo %" PRId64 "] [hi %" PRId64 "]"
+                     " [stride %" PRIu64 "] [count %" PRIu64 "]"
+                     " [posterior-bits 0x%016" PRIx64 "]"
+                     " [support %" PRIu64 "]"
+                     " [source-rules 0x%016" PRIx64 "]"
+                     " [score-infinity %" PRId64 "]"
+                     " [score-negative-infinite %u]"
+                     " [score-finite-bits 0x%016" PRIx64 "] [members",
+                array->lo, array->hi, array->stride, array->count,
+                array->posterior_bits, array->direct_support,
+                array->source_rule_bits, array->adjusted_score.infinity_balance,
+                (unsigned)array->adjusted_score.negative_infinite,
+                score_bits) < 0) {
+        return false;
+    }
+    for (uint32_t i = 0; i < array->member_count; i++) {
+        uint32_t decision_ordinal = array->member_decision_ordinals[i];
+        OspreyKey chunk_key;
+        if (decision_ordinal >= plan->decision_count ||
+            (i != 0 && fputc(',', out) == EOF)) return false;
+        chunk_key = osprey_chunk_key(&plan->decisions[decision_ordinal].chunk);
+        if (!decode_dump_key(out, &chunk_key)) return false;
+    }
+    if (fprintf(out, "] [displacement") < 0) return false;
+    for (uint32_t i = 0; i < array->displacement_count; i++) {
+        if (fprintf(out, "%s", i == 0 ? " " : ",") < 0 ||
+            !decode_dump_key(out, &array->displacement_keys[i])) {
+            return false;
+        }
+    }
+    return fprintf(out, "]\n") >= 0;
+}
+
 bool osprey_decode_plan_dump_file(const OspreyDecodePlan *plan, FILE *out)
 {
     if (plan == NULL || out == NULL ||
         (plan->decision_count != 0 && plan->decisions == NULL) ||
         (plan->field_group_count != 0 && plan->field_groups == NULL) ||
+        (plan->array_count != 0 && plan->arrays == NULL) ||
         (plan->role_loss_count != 0 && plan->role_loss_keys == NULL)) {
         return false;
     }
-    if (fprintf(out, "[decisions %u] [field-groups %u] [role-loss %u]\n",
+    if (fprintf(out, "[decisions %u] [field-groups %u] [arrays %u]"
+                     " [discarded-layout %" PRIu64 "] [role-loss %u]\n",
                 plan->decision_count, plan->field_group_count,
+                plan->array_count, plan->discarded_layout,
                 plan->role_loss_count) < 0) return false;
     for (uint32_t i = 0; i < plan->decision_count; i++) {
         if (!decode_dump_decision(out, i, &plan->decisions[i])) return false;
     }
     for (uint32_t i = 0; i < plan->field_group_count; i++) {
         const OspreyDecodeFieldGroup *group = &plan->field_groups[i];
-        if (fprintf(out, "[field-group] ") < 0 ||
+        if (group->field_count == 0 || group->decision_ordinals == NULL ||
+            (fprintf(out, "[field-group] ") < 0) ||
             !decode_dump_address(out, "base", &group->base) ||
             fprintf(out, " [members") < 0) return false;
         for (uint32_t j = 0; j < group->field_count; j++) {
@@ -2382,6 +3746,9 @@ bool osprey_decode_plan_dump_file(const OspreyDecodePlan *plan, FILE *out)
                 fprintf(out, "%u", ordinal) < 0) return false;
         }
         if (fprintf(out, "]\n") < 0) return false;
+    }
+    for (uint32_t i = 0; i < plan->array_count; i++) {
+        if (!decode_dump_array(out, i, &plan->arrays[i], plan)) return false;
     }
     if (fprintf(out, "[role-loss-keys") < 0) return false;
     for (uint32_t i = 0; i < plan->role_loss_count; i++) {

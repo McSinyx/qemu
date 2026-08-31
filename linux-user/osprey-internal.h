@@ -1065,16 +1065,23 @@ typedef struct OspreyChunkDecision {
     uint8_t final_role;
     uint8_t has_pointer_target;
     uint8_t role_has_predicate;
+    uint8_t has_array_owner;
+    uint8_t reserved[3];
     OspreyAddress owner_base;
+    OspreyAddress array_owner;
     OspreyAddress pointer_target;
     double role_posterior;
     double pointer_posterior;
+    double array_posterior;
     uint64_t role_support;
     uint64_t role_source_rule_bits;
     uint64_t pointer_support;
     uint64_t pointer_source_rule_bits;
+    uint64_t array_support;
+    uint64_t array_source_rule_bits;
     OspreyKey role_key;
     OspreyKey pointer_key;
+    OspreyKey array_key;
 } OspreyChunkDecision;
 
 typedef struct OspreyDecodeFieldGroup {
@@ -1082,6 +1089,37 @@ typedef struct OspreyDecodeFieldGroup {
     uint32_t *decision_ordinals; /* canonical ordinals into plan decisions */
     uint32_t field_count;
 } OspreyDecodeFieldGroup;
+
+/* Explicit logit score used by Stage 6.3 array scheduling.  A nonzero
+ * infinity_balance represents exact p=1 terms; negative_infinite represents
+ * an exact p=0 array term.  finite is never an infinity or NaN. */
+typedef struct OspreyDecodeScore {
+    int64_t infinity_balance;
+    double finite;
+    uint8_t negative_infinite;
+    uint8_t reserved[7];
+} OspreyDecodeScore;
+
+/* One selected, canonical P08 array definition.  Member ordinals refer to
+ * the owning plan decisions; displacement keys are complete scalar/field
+ * predicate keys used by the adjusted score. */
+typedef struct OspreyDecodeArray {
+    OspreyKey key;
+    OspreyRegionId region;
+    int64_t lo;
+    int64_t hi;
+    uint64_t stride;
+    uint64_t count;
+    double posterior;
+    uint64_t posterior_bits;
+    uint64_t direct_support;
+    uint64_t source_rule_bits;
+    OspreyDecodeScore adjusted_score;
+    uint32_t *member_decision_ordinals;
+    uint32_t member_count;
+    OspreyKey *displacement_keys;
+    uint32_t displacement_count;
+} OspreyDecodeArray;
 
 typedef struct OspreyDecodePlanChunkIndex {
     OspreyChunk chunk;
@@ -1098,6 +1136,11 @@ typedef struct OspreyDecodePlan {
     /* Complete-base order; empty field groups are omitted. */
     OspreyDecodeFieldGroup *field_groups;
     uint32_t field_group_count;
+
+    /* Canonical selected P08 definitions, sorted by complete predicate key. */
+    OspreyDecodeArray *arrays;
+    uint32_t array_count;
+    uint64_t discarded_layout;
 
     /* Complete predicate-key order; every eligible unused P01/P07/P09/P10
      * candidate appears exactly once. */
@@ -1556,6 +1599,18 @@ OspreyStatus osprey_decode_roles(const OspreyContext *ctx,
                                  OspreyDecodePlan **out);
 void osprey_decode_plan_free(OspreyDecodePlan *plan);
 bool osprey_decode_plan_dump_file(const OspreyDecodePlan *plan, FILE *out);
+
+/* Stage 6.3: validate and schedule reportable arrays, then atomically
+ * replace final roles and surviving field groups in the temporary plan. */
+OspreyStatus osprey_decode_select_arrays(const OspreyContext *ctx,
+                                         const OspreyDecodeInput *input,
+                                         OspreyDecodePlan *plan);
+
+/* Pure score operations used by the bounded array scheduler and tests. */
+bool osprey_decode_score_add(OspreyDecodeScore *score,
+                             const OspreyDecodeScore *term);
+int osprey_decode_score_compare(const OspreyDecodeScore *left,
+                                const OspreyDecodeScore *right);
 
 /* Stage 6 entry (osprey-decode.c): consistent decoding of posterior
  * predicates (§10 of the reference): hard-false/threshold discard,
