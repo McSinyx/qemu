@@ -328,14 +328,11 @@ TESTS: list[dict[str, Any]] = [
               "copyout EFAULT returns an error to the guest"),
 ]
 
-# Env vars that must always be set: parse_exclude_region_str strchr()s the
-# getenv result without a NULL check — all three ranges are required.
+# Env vars that must always be set for the tracer runs.
 BASE_ENV = {
     "BINRADAR_TRACE_FILE": "none",
     "BINRADAR_FORKSERVER_ENABLE": "0",
-    "PATCH_RESERVE_RANGE": "0x0-0x0",
-    "E9_TRAMPOLINE_RANGE": "0x0-0x0",
-    "E9_LOADER_RANGE": "0x0-0x0",
+    "E9_EXCLUDE_RANGES": "",
     "BINRADAR_MEMCHECK_ENABLE": "1",
 }
 

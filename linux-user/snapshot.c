@@ -1,5 +1,6 @@
 #include "snapshot.h"
 #include "provenance.h"
+#include "e9-ranges.h"
 #include "../tcg/symbolic/symbolic-struct.h"
 #include "sbsv.h"
 #include "qemu/rcu.h"
@@ -55,17 +56,12 @@ static uint8_t  binradar_query_window_dumped    = 0;
 bool forkserver_installed = false;
 unsigned char afl_fork_child;
 unsigned int  afl_forksrv_pid;
-typedef struct exclude_region {
-    uintptr_t start;
-    uintptr_t end;
-} exclude_region;
-
-exclude_region binradar_exclude_regions[4] = {
-    {0, 0}, // PATCH_RESERVE_RANGE
-    {0, 0}, // E9_TRAMPOLINE_RANGE
-    {0, 0}, // E9_LOADER_RANGE
-    {0, 0}
-};
+/* Exact E9 exclusion intervals (loader + RESERVE + TRAMPOLINE maps of the
+ * executing artifact), parsed from E9_EXCLUDE_RANGES.  Missing or empty
+ * means no E9 regions. */
+static e9_exclude_region *binradar_exclude_regions = NULL;
+static size_t binradar_exclude_regions_len = 0;
+static size_t binradar_exclude_regions_cap = 0;
 
 typedef struct e9_relocated_call {
     target_ulong jump_addr;
@@ -244,9 +240,9 @@ static BinradarResult *binradar_manager_alloc_one_iter(BinradarManager *manager)
 }
 
 static void trace_mem_flush(void);
+static void exit_with_status(int status);
 static int binradar_manager_cur_patch_id(BinradarManager *manager, int new_patch_id);
 static int binradar_manager_cur_iter(BinradarManager *manager, int new_iter);
-void parse_exclude_region_str(const char *name, uintptr_t load_bias, exclude_region *region);
 bool is_e9_relocated_call(target_ulong pc, target_ulong *call_site,
                           target_ulong *ret_addr);
 
@@ -292,21 +288,31 @@ static int write_exact(int fd, const void *buf, size_t len) {
     return 0;
 }
 
-void parse_exclude_region_str(const char *name, uintptr_t load_bias, exclude_region *region) {
-    if (name == NULL || region == NULL) {
+/* Parse E9_EXCLUDE_RANGES: a canonical comma-separated list of half-open
+ * intervals.  Missing or empty initializes an empty collection.  A
+ * malformed non-empty value is a configuration error: emit one structured
+ * diagnostic and terminate before guest execution rather than continue
+ * with a partial list.  The getenv() storage is never modified. */
+void parse_e9_exclude_ranges(uintptr_t load_bias) {
+    const char *value = getenv("E9_EXCLUDE_RANGES");
+    if (value == NULL || value[0] == '\0') {
         return;
     }
-    // Expected format: "0x20e9e9000-0x20e9ea000"
-    char *region_str = getenv(name);
-    char *dash = strchr(region_str, '-');
-    if (dash == NULL) {
-        log_msg("[snapshot] [parse-exclude-region] [name %s] [invalid-format] %s\n", name, region_str ? region_str : "NULL");
-        return;
+    size_t len = 0;
+    size_t cap = 0;
+    if (e9_parse_exclude_ranges(value, load_bias, &binradar_exclude_regions,
+                                &len, &cap) != 0) {
+        log_msg("[snapshot] [parse-e9-exclude-range] [invalid-format] "
+                "[value %s]\n", value);
+        exit_with_status(1);
     }
-    *dash = '\0';
-    region->start = strtoull(region_str, NULL, 16) + load_bias;
-    region->end = strtoull(dash + 1, NULL, 16) + load_bias;
-    log_msg("[snapshot] [parse-exclude-region] [name %s] [start %lx] [end %lx]\n", name, region->start, region->end);
+    binradar_exclude_regions_len = len;
+    binradar_exclude_regions_cap = cap;
+    for (size_t i = 0; i < len; i++) {
+        log_msg("[snapshot] [parse-e9-exclude-range] [start %lx] [end %lx]\n",
+                (unsigned long)binradar_exclude_regions[i].start,
+                (unsigned long)binradar_exclude_regions[i].end);
+    }
 }
 
 static void check_env_var(const char *name) {
@@ -409,9 +415,7 @@ void check_all_env_var(void) {
     check_env_var("BINRADAR_PATCH_CNT");
     check_env_var("BINRADAR_PATCH_FILTER_FILE");
     // e9tool patch region related
-    check_env_var("PATCH_RESERVE_RANGE");
-    check_env_var("E9_TRAMPOLINE_RANGE");
-    check_env_var("E9_LOADER_RANGE");
+    check_env_var("E9_EXCLUDE_RANGES");
     // E9Patch relocated call jumps (jump-addr:call-site:ret-addr, comma separated)
     check_env_var("E9_RELOCATED_CALL_JUMPS");
     // Shared memory
@@ -422,20 +426,12 @@ void check_all_env_var(void) {
 }
 
 void add_exclude_regions(uintptr_t load_bias) {
-    parse_exclude_region_str("PATCH_RESERVE_RANGE", load_bias, &binradar_exclude_regions[0]);
-    parse_exclude_region_str("E9_TRAMPOLINE_RANGE", load_bias, &binradar_exclude_regions[1]);
-    parse_exclude_region_str("E9_LOADER_RANGE", load_bias, &binradar_exclude_regions[2]);
+    parse_e9_exclude_ranges(load_bias);
 }
 
-bool is_in_exclude_region(target_ulong pc) {
-    // Inserted patch should not exceed 1MB
-    for (int i = 0; i < 3; i++) {
-        exclude_region *region = &binradar_exclude_regions[i];
-        if (pc >= region->start && pc < region->end) {
-            return true;
-        }
-    }
-    return false;
+bool is_in_e9_exclude_region(target_ulong pc) {
+    return e9_is_in_exclude_region(binradar_exclude_regions,
+                                   binradar_exclude_regions_len, pc);
 }
 
 void snapshot_protect_mapping(target_ulong addr, target_ulong len) {

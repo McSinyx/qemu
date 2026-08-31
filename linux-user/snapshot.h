@@ -115,7 +115,8 @@ typedef struct ArgumentInfo {
 } ArgumentInfo;
 
 void add_exclude_regions(uintptr_t load_bias);
-bool is_in_exclude_region(target_ulong pc);
+void parse_e9_exclude_ranges(uintptr_t load_bias);
+bool is_in_e9_exclude_region(target_ulong pc);
 void parse_e9_relocated_calls(uintptr_t load_bias);
 void check_all_env_var(void);
 
