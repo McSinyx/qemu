@@ -263,18 +263,20 @@ $(BP_ASAN_BIN): stage5_bp_test.c stage5_bp_reference.c \
 unit-stage6-decode: $(DECODE_UNIT_BIN)
 	@$(DECODE_UNIT_BIN)
 
-$(DECODE_UNIT_BIN): stage6_decode_test.c stage3_test_support.c \
-		$(OSPREY_OBJS) | $(WORK)
+$(DECODE_UNIT_BIN): stage6_decode_test.c stage6_decode_reference.c \
+		stage6_decode_reference.h stage3_test_support.c $(OSPREY_OBJS) | $(WORK)
 	$(CC) $(UNIT_CFLAGS) -o $@ stage6_decode_test.c \
-		stage3_test_support.c $(OSPREY_OBJS) -lglib-2.0 -lpthread -lm
+		stage6_decode_reference.c stage3_test_support.c $(OSPREY_OBJS) \
+		-lglib-2.0 -lpthread -lm
 
 unit-stage6-decode-asan: $(DECODE_ASAN_BIN)
 	@ASAN_OPTIONS=detect_leaks=1 $(DECODE_ASAN_BIN)
 
-$(DECODE_ASAN_BIN): stage6_decode_test.c stage3_test_support.c \
-		$(OSPREY_ASAN_OBJS) | $(WORK)
+$(DECODE_ASAN_BIN): stage6_decode_test.c stage6_decode_reference.c \
+		stage6_decode_reference.h stage3_test_support.c $(OSPREY_ASAN_OBJS) | $(WORK)
 	$(CC) $(ASAN_CFLAGS) -o $@ stage6_decode_test.c \
-		stage3_test_support.c $(OSPREY_ASAN_OBJS) -lglib-2.0 -lpthread -lm
+		stage6_decode_reference.c stage3_test_support.c $(OSPREY_ASAN_OBJS) \
+		-lglib-2.0 -lpthread -lm
 
 $(UNIT_ASAN_BIN): unit_test.c $(OSPREY_OBJS) | $(WORK)
 	$(CC) $(UNIT_CFLAGS) -fsanitize=address -fno-omit-frame-pointer \

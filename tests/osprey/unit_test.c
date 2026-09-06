@@ -600,6 +600,7 @@ static void test_decoder_cap_rejection(void)
 {
     reset_log();
     OspreyConfig c = test_config();
+    c.max_variables = 512;
     OspreyContext *ctx = osprey_new(&c);
     ctx->graph = osprey_graph_new();
     for (uint32_t i = 0; i < 513; i++) {

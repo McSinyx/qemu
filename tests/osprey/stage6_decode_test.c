@@ -1,5 +1,6 @@
 #include "osprey.h"
 #include "osprey-internal.h"
+#include "stage6_decode_reference.h"
 
 #include <float.h>
 #include <math.h>
@@ -2700,6 +2701,19 @@ static char *dump_model(const OspreyModel *model)
     return data;
 }
 
+static char *dump_reference_model(const OspreyReferenceResult *reference)
+{
+    char *data = NULL;
+    size_t length = 0;
+    FILE *out = open_memstream(&data, &length);
+    if (out == NULL) return NULL;
+    if (!osprey_reference_model_dump_file(reference, out) || fclose(out) != 0) {
+        free(data);
+        return NULL;
+    }
+    return data;
+}
+
 static bool build_model_fixture(OspreyContext *ctx, OspreyModel **model_out)
 {
     OspreyDecodeInput *input = NULL;
@@ -2756,6 +2770,20 @@ static bool expect_model_valid(OspreyContext *ctx, OspreyModel *model,
     OspreyStatus status = osprey_model_validate(ctx, model, &error);
     bool passed = status == OSPREY_OK &&
                   error == OSPREY_MODEL_VALIDATION_NONE;
+    CHECK(passed, message);
+    return passed;
+}
+
+static bool expect_model_rejected(OspreyContext *ctx, OspreyModel *model,
+                                  const char *message)
+{
+    OspreyModelValidationError error = OSPREY_MODEL_VALIDATION_NONE;
+    OspreyStatus status = osprey_model_validate(ctx, model, &error);
+    const char *reason = osprey_model_validation_reason(error);
+    bool passed = status == OSPREY_INVALID_MODEL &&
+                  error > OSPREY_MODEL_VALIDATION_NONE &&
+                  error <= OSPREY_MODEL_VALIDATION_RUNTIME_SPAN &&
+                  reason != NULL && strcmp(reason, "none") != 0;
     CHECK(passed, message);
     return passed;
 }
@@ -3558,6 +3586,41 @@ static void test_stage64_by_value_cycle_rejection(void)
     osprey_free(ctx);
 }
 
+static void test_stage64_later_field_by_value_cycle_rejection(void)
+{
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x652, 0x752);
+    OspreyContext *ctx = new_decode_context();
+    OspreyChunk first = make_chunk(region, 0, 8);
+    OspreyChunk second = make_chunk(region, 8, 8);
+    OspreyModel *model = NULL;
+    uint32_t struct_id;
+
+    if (ctx == NULL) {
+        return;
+    }
+    add_field_candidate(ctx, first, make_address(region, 0), 0.9);
+    add_field_candidate(ctx, second, make_address(region, 0), 0.9);
+    add_extent(ctx, region, 0, 16);
+    if (!build_model_fixture(ctx, &model)) {
+        osprey_model_free(model);
+        osprey_free(ctx);
+        return;
+    }
+    struct_id = find_model_type_kind(model, OSPREY_TYPE_STRUCT);
+    CHECK(struct_id != UINT32_MAX && model->field_count == 2 &&
+              model->object_count == 2 &&
+              model->fields[0].value_type_id != struct_id,
+          "later-cycle fixture starts with a primitive field");
+    if (struct_id != UINT32_MAX && model->field_count == 2 &&
+        model->object_count == 2) {
+        model->fields[1].value_type_id = struct_id;
+        CHECK(!osprey_decode_test_by_value_cycles_valid(model),
+              "cycle walk rejects a later aggregate edge after a primitive");
+    }
+    osprey_model_free(model);
+    osprey_free(ctx);
+}
+
 static void test_stage64_recursive_pointer_is_legal(void)
 {
     OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x651, 0x751);
@@ -3843,6 +3906,978 @@ static void test_stage63_allocation_atomicity(void)
     osprey_free(ctx);
 }
 
+static void test_stage65_semantic_field_matrix(void)
+{
+#define REJECT_TYPE(record, mutation, message) do {                         \
+    OspreyDecodedType saved_record = *(record);                              \
+    mutation;                                                                 \
+    expect_model_rejected(ctx, model, (message));                            \
+    *(record) = saved_record;                                                \
+} while (0)
+#define REJECT_OBJECT(record, mutation, message) do {                        \
+    OspreyDecodedObject saved_record = *(record);                            \
+    mutation;                                                                 \
+    expect_model_rejected(ctx, model, (message));                            \
+    *(record) = saved_record;                                                \
+} while (0)
+#define REJECT_FIELD(record, mutation, message) do {                         \
+    OspreyDecodedField saved_record = *(record);                             \
+    mutation;                                                                 \
+    expect_model_rejected(ctx, model, (message));                            \
+    *(record) = saved_record;                                                \
+} while (0)
+
+    OspreyContext *ctx = make_projection_context(0);
+    OspreyModel *model = NULL;
+    OspreyRegionId global = make_region(OSPREY_REGION_GLOBAL, 0x101, 0x500);
+    if (ctx != NULL) append_runtime_instance(ctx, global, UINT64_C(0x1000));
+    if (ctx == NULL || !build_model_fixture(ctx, &model)) {
+        osprey_model_free(model);
+        osprey_free(ctx);
+        return;
+    }
+
+    uint32_t primitive_id = find_model_type_kind(model, OSPREY_TYPE_PRIMITIVE);
+    uint32_t pointer_id = find_model_type_kind(model, OSPREY_TYPE_POINTER);
+    uint32_t struct_id = find_model_type_kind(model, OSPREY_TYPE_STRUCT);
+    CHECK(primitive_id != UINT32_MAX && pointer_id != UINT32_MAX &&
+              struct_id != UINT32_MAX,
+          "semantic-field fixture contains primitive, pointer, and struct types");
+    if (primitive_id != UINT32_MAX) {
+        OspreyDecodedType *type = &model->types[primitive_id];
+        REJECT_TYPE(type, type->id = UINT32_MAX, "type id field rejects");
+        REJECT_TYPE(type, type->kind = 0, "type kind field rejects");
+        REJECT_TYPE(type, type->target_is_void = 1,
+                    "inactive target-void field rejects");
+        REJECT_TYPE(type, type->reserved = 1, "type reserved field rejects");
+        REJECT_TYPE(type, type->size++, "type size field rejects");
+        REJECT_TYPE(type, type->element_count = 1,
+                    "inactive element-count field rejects");
+        REJECT_TYPE(type, type->element_size = 1,
+                    "inactive element-size field rejects");
+        REJECT_TYPE(type, type->element_type_id = 0,
+                    "inactive element-type field rejects");
+        REJECT_TYPE(type, type->target_type_id = 0,
+                    "inactive target-type field rejects");
+        REJECT_TYPE(type, type->canonical_base.region.code_image_id = 1,
+                    "inactive canonical-base field rejects");
+        REJECT_TYPE(type, type->field_begin = 1,
+                    "inactive field-begin field rejects");
+        REJECT_TYPE(type, type->field_count = 1,
+                    "inactive field-count field rejects");
+        REJECT_TYPE(type, type->evidence_valid = 1,
+                    "inactive evidence-valid field rejects");
+        for (size_t i = 0; i < G_N_ELEMENTS(type->reserved2); i++) {
+            REJECT_TYPE(type, type->reserved2[i] = 1,
+                        "each type reserved byte rejects");
+        }
+        REJECT_TYPE(type, type->posterior = 0.5,
+                    "inactive type posterior rejects");
+        REJECT_TYPE(type, type->direct_support = 1,
+                    "inactive type support rejects");
+        REJECT_TYPE(type, type->source_rule_bits = 1,
+                    "inactive type rule bits reject");
+    }
+    if (pointer_id != UINT32_MAX) {
+        OspreyDecodedType *type = &model->types[pointer_id];
+        REJECT_TYPE(type, type->target_is_void ^= 1,
+                    "pointer target-void field rejects");
+        REJECT_TYPE(type, type->target_type_id = 0,
+                    "pointer target-type field rejects");
+        REJECT_TYPE(type, type->canonical_base.offset++,
+                    "pointer canonical target field rejects");
+    }
+    if (struct_id != UINT32_MAX) {
+        OspreyDecodedType *type = &model->types[struct_id];
+        REJECT_TYPE(type, type->field_begin++,
+                    "structure field-begin field rejects");
+        REJECT_TYPE(type, type->field_count++,
+                    "structure field-count field rejects");
+        REJECT_TYPE(type, type->evidence_valid = 0,
+                    "structure evidence-valid field rejects");
+        REJECT_TYPE(type, type->posterior = nextafter(type->posterior, 0.0),
+                    "structure posterior field rejects");
+        REJECT_TYPE(type, type->direct_support++,
+                    "structure support field rejects");
+        REJECT_TYPE(type, type->source_rule_bits ^= 1,
+                    "structure rule bits reject");
+        REJECT_TYPE(type, type->canonical_base.region.site_offset ^= 1,
+                    "structure canonical-base field rejects");
+    }
+
+    if (model->field_count != 0) {
+        OspreyDecodedField *field = &model->fields[0];
+        REJECT_FIELD(field, field->chunk.address.region.kind = 99,
+                     "field chunk region kind rejects");
+        REJECT_FIELD(field, field->chunk.address.region.code_image_id ^= 1,
+                     "field chunk image rejects");
+        REJECT_FIELD(field, field->chunk.address.region.site_offset ^= 1,
+                     "field chunk site rejects");
+        REJECT_FIELD(field, field->chunk.address.offset++,
+                     "field chunk offset rejects");
+        REJECT_FIELD(field, field->chunk.size++, "field chunk size rejects");
+        REJECT_FIELD(field, field->relative_offset++,
+                     "field relative offset rejects");
+        REJECT_FIELD(field, field->value_type_id = UINT32_MAX,
+                     "field value type rejects");
+        REJECT_FIELD(field, field->posterior = NAN,
+                     "field posterior rejects");
+        REJECT_FIELD(field, field->support++, "field support rejects");
+        REJECT_FIELD(field, field->source_rule_bits ^= 1,
+                     "field rule bits reject");
+    }
+
+    uint32_t pointer_object = UINT32_MAX;
+    uint32_t plain_object = UINT32_MAX;
+    for (uint32_t i = 0; i < model->object_count; i++) {
+        if (model->objects[i].has_pointer_target) pointer_object = i;
+        else if (plain_object == UINT32_MAX) plain_object = i;
+    }
+    CHECK(pointer_object != UINT32_MAX && plain_object != UINT32_MAX,
+          "semantic-field fixture contains pointer and plain objects");
+    if (plain_object != UINT32_MAX) {
+        OspreyDecodedObject *object = &model->objects[plain_object];
+        REJECT_OBJECT(object, object->chunk.address.region.kind = 99,
+                      "object chunk region kind rejects");
+        REJECT_OBJECT(object, object->chunk.address.region.code_image_id ^= 1,
+                      "object chunk image rejects");
+        REJECT_OBJECT(object, object->chunk.address.region.site_offset ^= 1,
+                      "object chunk site rejects");
+        REJECT_OBJECT(object, object->chunk.address.offset++,
+                      "object chunk offset rejects");
+        REJECT_OBJECT(object, object->chunk.size++,
+                      "object chunk size rejects");
+        REJECT_OBJECT(object, object->storage_role = 0,
+                      "object storage role rejects");
+        REJECT_OBJECT(object, object->has_pointer_target = 2,
+                      "object pointer presence rejects");
+        REJECT_OBJECT(object, object->reserved = 1,
+                      "object reserved field rejects");
+        REJECT_OBJECT(object, object->value_type_id = UINT32_MAX,
+                      "object value type rejects");
+        REJECT_OBJECT(object, object->owner_base.region.code_image_id ^= 1,
+                      "object owner base rejects");
+        REJECT_OBJECT(object, object->pointer_target.region.code_image_id ^= 1,
+                      "inactive object pointer target rejects");
+        REJECT_OBJECT(object, object->storage_posterior = NAN,
+                      "object storage posterior rejects");
+        REJECT_OBJECT(object, object->pointer_posterior = 0.5,
+                      "inactive object pointer posterior rejects");
+        REJECT_OBJECT(object, object->storage_support++,
+                      "object storage support rejects");
+        REJECT_OBJECT(object, object->storage_source_rule_bits ^= 1,
+                      "object storage rules reject");
+        REJECT_OBJECT(object, object->pointer_support = 1,
+                      "inactive object pointer support rejects");
+        REJECT_OBJECT(object, object->pointer_source_rule_bits = 1,
+                      "inactive object pointer rules reject");
+    }
+    if (pointer_object != UINT32_MAX) {
+        OspreyDecodedObject *object = &model->objects[pointer_object];
+        REJECT_OBJECT(object, object->pointer_target.region.kind = 99,
+                      "pointer target region kind rejects");
+        REJECT_OBJECT(object,
+                      object->pointer_target.region.code_image_id ^= 1,
+                      "pointer target image rejects");
+        REJECT_OBJECT(object,
+                      object->pointer_target.region.site_offset ^= 1,
+                      "pointer target site rejects");
+        REJECT_OBJECT(object, object->pointer_target.offset++,
+                      "pointer target offset rejects");
+        REJECT_OBJECT(object, object->pointer_posterior = NAN,
+                      "pointer posterior rejects");
+        REJECT_OBJECT(object, object->pointer_support++,
+                      "pointer support rejects");
+        REJECT_OBJECT(object, object->pointer_source_rule_bits ^= 1,
+                      "pointer rules reject");
+    }
+
+    OspreyModelIndexEntry *indexes[] = {
+        model->chunk_index, model->aggregate_index, model->type_index,
+    };
+    uint32_t index_counts[] = {
+        model->chunk_index_count, model->aggregate_index_count,
+        model->type_index_count,
+    };
+    for (size_t family = 0; family < G_N_ELEMENTS(indexes); family++) {
+        if (index_counts[family] == 0) continue;
+        OspreyModelIndexEntry saved = indexes[family][0];
+        indexes[family][0].key.tag ^= 1;
+        expect_model_rejected(ctx, model, "index tag field rejects");
+        indexes[family][0] = saved;
+        for (size_t word = 0; word < G_N_ELEMENTS(saved.key.w); word++) {
+            indexes[family][0].key.w[word] ^= 1;
+            expect_model_rejected(ctx, model, "each index key word rejects");
+            indexes[family][0] = saved;
+        }
+        indexes[family][0].ordinal = UINT32_MAX;
+        expect_model_rejected(ctx, model, "index ordinal field rejects");
+        indexes[family][0] = saved;
+    }
+
+    if (model->raw_span_count != 0) {
+        OspRawSpan *span = &model->raw_spans[0];
+        OspRawSpan saved = *span;
+        span->raw_start++;
+        expect_model_rejected(ctx, model, "runtime span start rejects");
+        *span = saved;
+        span->raw_end++;
+        expect_model_rejected(ctx, model, "runtime span end rejects");
+        *span = saved;
+        span->obj_idx = UINT32_MAX;
+        expect_model_rejected(ctx, model, "runtime span object rejects");
+        *span = saved;
+        span->source_instance_idx = UINT32_MAX;
+        expect_model_rejected(ctx, model, "runtime span instance rejects");
+        *span = saved;
+        span->is_chunk = 0;
+        expect_model_rejected(ctx, model, "runtime span kind rejects");
+        *span = saved;
+        for (size_t i = 0; i < G_N_ELEMENTS(span->reserved); i++) {
+            span->reserved[i] = 1;
+            expect_model_rejected(ctx, model,
+                                  "each runtime span reserved byte rejects");
+            *span = saved;
+        }
+    }
+    expect_model_valid(ctx, model,
+                       "complete semantic-field matrix restores base model");
+    osprey_model_free(model);
+    osprey_free(ctx);
+
+    ctx = make_array_permutation_context(0);
+    model = NULL;
+    if (ctx != NULL && build_model_fixture(ctx, &model)) {
+        uint32_t array_id = find_model_type_kind(model, OSPREY_TYPE_ARRAY);
+        CHECK(array_id != UINT32_MAX,
+              "semantic-field fixture contains an array type");
+        if (array_id != UINT32_MAX) {
+            OspreyDecodedType *type = &model->types[array_id];
+            REJECT_TYPE(type, type->size++, "array size field rejects");
+            REJECT_TYPE(type, type->element_count++,
+                        "array element count rejects");
+            REJECT_TYPE(type, type->element_size++,
+                        "array element size rejects");
+            REJECT_TYPE(type, type->element_type_id = UINT32_MAX,
+                        "array element type rejects");
+            REJECT_TYPE(type, type->canonical_base.offset++,
+                        "array canonical base rejects");
+            REJECT_TYPE(type, type->evidence_valid = 0,
+                        "array evidence-valid field rejects");
+            REJECT_TYPE(type, type->posterior = NAN,
+                        "array posterior rejects");
+            REJECT_TYPE(type, type->direct_support++,
+                        "array support rejects");
+            REJECT_TYPE(type, type->source_rule_bits ^= 1,
+                        "array rule bits reject");
+        }
+        for (uint32_t i = 0; i < model->object_count; i++) {
+            if (model->objects[i].storage_role !=
+                    OSPREY_STORAGE_ARRAY_ELEMENT) continue;
+            OspreyDecodedObject *object = &model->objects[i];
+            REJECT_OBJECT(object, object->owner_base.region.kind = 99,
+                          "array owner region kind rejects");
+            REJECT_OBJECT(object, object->owner_base.region.code_image_id ^= 1,
+                          "array owner image rejects");
+            REJECT_OBJECT(object, object->owner_base.region.site_offset ^= 1,
+                          "array owner site rejects");
+            REJECT_OBJECT(object, object->owner_base.offset++,
+                          "array owner offset rejects");
+            break;
+        }
+        expect_model_valid(ctx, model,
+                           "array semantic-field matrix restores base model");
+    }
+    osprey_model_free(model);
+    osprey_free(ctx);
+
+#undef REJECT_FIELD
+#undef REJECT_OBJECT
+#undef REJECT_TYPE
+}
+
+typedef struct Stage65CaseStorage {
+    OspreyReferenceCandidate candidates[512];
+    OspreyRegionExtent extents[4];
+    uint32_t candidate_count;
+    uint32_t extent_count;
+    uint32_t generated_chunk_count;
+    uint32_t generated_array_count;
+    double report_threshold;
+} Stage65CaseStorage;
+
+static uint32_t stage65_rng(uint32_t *state)
+{
+    uint32_t value = *state;
+    value ^= value << 13;
+    value ^= value >> 17;
+    value ^= value << 5;
+    *state = value == 0 ? UINT32_C(0x9e3779b9) : value;
+    return *state;
+}
+
+static bool stage65_add_candidate(Stage65CaseStorage *storage, uint8_t kind,
+                                  OspreyVarPayload payload, double posterior,
+                                  bool hard_false, uint32_t ordinal)
+{
+    OspreyReferenceCandidate *candidate;
+    if (storage == NULL || storage->candidate_count >=
+            G_N_ELEMENTS(storage->candidates)) return false;
+    candidate = &storage->candidates[storage->candidate_count++];
+    memset(candidate, 0, sizeof(*candidate));
+    candidate->kind = kind;
+    candidate->belief_valid = 1;
+    candidate->hard_false = hard_false ? 1 : 0;
+    candidate->payload = payload;
+    candidate->posterior = posterior;
+    candidate->direct_support = 1 + (ordinal % 7);
+    candidate->source_rule_bits = UINT64_C(1) << (ordinal % 32);
+    return true;
+}
+
+static bool stage65_generate_case(uint32_t seed, Stage65CaseStorage *storage)
+{
+    static const uint64_t widths[] = { 1, 2, 4, 8, 16 };
+    uint32_t state = seed ^ UINT32_C(0x6d2b79f5);
+    OspreyRegionId global = make_region(OSPREY_REGION_GLOBAL,
+                                        UINT64_C(0x1000) + seed,
+                                        UINT64_C(0x10) + (seed % 3));
+    OspreyRegionId heap = make_region(OSPREY_REGION_HEAP_SITE,
+                                      UINT64_C(0x2000) + seed,
+                                      UINT64_C(0x20) + (seed % 5));
+    OspreyRegionId array_region = make_region(OSPREY_REGION_HEAP_SITE,
+                                              UINT64_C(0x3000) + seed,
+                                              UINT64_C(0x30) + (seed % 7));
+    OspreyRegionId stack = make_region(OSPREY_REGION_STACK_FUNCTION,
+                                       UINT64_C(0x4000) + seed,
+                                       UINT64_C(0x40) + (seed % 11));
+    uint32_t chunk_count = seed % 127 == 0 ? 64 :
+        1 + stage65_rng(&state) % 16;
+    uint32_t array_count = seed % 131 == 0 ? 64 :
+        stage65_rng(&state) % 17;
+    uint32_t ordinal = 0;
+    OspreyChunk first_chunk;
+
+    memset(storage, 0, sizeof(*storage));
+    storage->report_threshold = seed % 17 == 0 ? 0.0 : 0.6;
+    storage->generated_chunk_count = chunk_count;
+    storage->generated_array_count = array_count;
+    storage->extent_count = 4;
+    storage->extents[0] = (OspreyRegionExtent){ global, 0, 1024 };
+    storage->extents[1] = (OspreyRegionExtent){ heap, 0, 1024 };
+    storage->extents[2] = (OspreyRegionExtent){ array_region, 0, 1024 };
+    storage->extents[3] = (OspreyRegionExtent){ stack, -512, 512 };
+    memset(&first_chunk, 0, sizeof(first_chunk));
+
+    for (uint32_t i = 0; i < chunk_count; i++) {
+        OspreyRegionId region;
+        int64_t offset;
+        uint64_t width = widths[stage65_rng(&state) % G_N_ELEMENTS(widths)];
+        OspreyVarPayload primitive;
+        double primitive_posterior;
+
+        switch (i % 4) {
+        case 0: region = array_region; offset = (int64_t)(i / 4) * 8; break;
+        case 1: region = global; offset = (int64_t)(i / 4) * 8; break;
+        case 2: region = heap; offset = (int64_t)(i / 4) * 8; break;
+        default: region = stack; offset = -512 + (int64_t)(i / 4) * 8; break;
+        }
+        memset(&primitive, 0, sizeof(primitive));
+        primitive.chunk = make_chunk(region, offset, width);
+        if (i == 0) first_chunk = primitive.chunk;
+        switch ((i + seed) % 8) {
+        case 0: primitive_posterior = 0.0; break;
+        case 1: primitive_posterior = 1.0; break;
+        case 2: primitive_posterior = storage->report_threshold; break;
+        case 3: primitive_posterior = nextafter(storage->report_threshold, 1.0); break;
+        case 4: primitive_posterior = nextafter(storage->report_threshold, 0.0); break;
+        default: primitive_posterior = 0.61 +
+                     (stage65_rng(&state) % 38) / 100.0; break;
+        }
+        if (!stage65_add_candidate(storage, OSPREY_PRED_PRIMITIVE_VAR,
+                                   primitive, primitive_posterior, false,
+                                   ordinal++)) return false;
+        if (stage65_rng(&state) % 3 != 0) {
+            OspreyVarPayload scalar = primitive;
+            double posterior = ((i + seed) % 11 == 0) ? 1.0 :
+                0.58 + (stage65_rng(&state) % 41) / 100.0;
+            if (!stage65_add_candidate(storage, OSPREY_PRED_SCALAR, scalar,
+                                       posterior, false, ordinal++)) return false;
+        }
+        if (region.kind != array_region.kind ||
+            region.code_image_id != array_region.code_image_id ||
+            region.site_offset != array_region.site_offset) {
+            OspreyVarPayload field;
+            int64_t base_offset = region.kind == OSPREY_REGION_STACK_FUNCTION ?
+                -512 : 0;
+            memset(&field, 0, sizeof(field));
+            field.attached.chunk = primitive.chunk;
+            field.attached.base = make_address(region, base_offset);
+            if (!stage65_add_candidate(storage, OSPREY_PRED_FIELD_OF, field,
+                                       0.60 + (stage65_rng(&state) % 40) / 100.0,
+                                       false, ordinal++)) return false;
+            if (offset != base_offset && stage65_rng(&state) % 2 == 0) {
+                field.attached.base = make_address(region, offset);
+                if (!stage65_add_candidate(storage, OSPREY_PRED_FIELD_OF,
+                                           field,
+                                           0.60 + (stage65_rng(&state) % 40) / 100.0,
+                                           false, ordinal++)) return false;
+            }
+        }
+        if (width == sizeof(target_ulong)) {
+            OspreyVarPayload pointer;
+            memset(&pointer, 0, sizeof(pointer));
+            pointer.attached.chunk = primitive.chunk;
+            pointer.attached.base = make_address(heap, 0);
+            if (!stage65_add_candidate(storage, OSPREY_PRED_POINTER, pointer,
+                                       0.60 + (stage65_rng(&state) % 40) / 100.0,
+                                       false, ordinal++)) return false;
+            if (stage65_rng(&state) % 2 == 0) {
+                pointer.attached.base = make_address(
+                    array_region, (int64_t)(stage65_rng(&state) % 8) * 8);
+                if (!stage65_add_candidate(storage, OSPREY_PRED_POINTER,
+                                           pointer,
+                                           0.60 + (stage65_rng(&state) % 40) / 100.0,
+                                           false, ordinal++)) return false;
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < array_count; i++) {
+        OspreyVarPayload array;
+        uint64_t stride = UINT64_C(4) << (i % 3);
+        int64_t lo = (int64_t)i * 8;
+        int64_t span = (int64_t)stride * (int64_t)(1 + ((i + seed) % 4));
+        double posterior;
+        memset(&array, 0, sizeof(array));
+        array.segment.a1 = make_address(array_region, lo);
+        array.segment.a2 = make_address(
+            array_region, lo + span + (((i + seed) % 7 == 0) ? 2 : 0));
+        array.segment.size = (int64_t)stride;
+        switch ((i + seed) % 9) {
+        case 0: posterior = 0.0; break;
+        case 1: posterior = 1.0; break;
+        case 2: posterior = storage->report_threshold; break;
+        case 3: posterior = nextafter(storage->report_threshold, 1.0); break;
+        case 4: posterior = nextafter(storage->report_threshold, 0.0); break;
+        default: posterior = 0.62 + (stage65_rng(&state) % 37) / 100.0; break;
+        }
+        if (!stage65_add_candidate(storage, OSPREY_PRED_ARRAY, array,
+                                   posterior, (i + seed) % 19 == 0,
+                                   ordinal++)) return false;
+    }
+
+    if (seed % 5 == 0) {
+        OspreyVarPayload payload;
+        memset(&payload, 0, sizeof(payload));
+        payload.prim_access.chunk = first_chunk;
+        payload.prim_access.insn_pc = UINT64_C(0x40) + seed;
+        if (!stage65_add_candidate(storage, OSPREY_PRED_PRIMITIVE_ACCESS,
+                                   payload, 0.8, false, ordinal++)) return false;
+        memset(&payload, 0, sizeof(payload));
+        payload.heap_fold.region = heap;
+        payload.heap_fold.size = 16;
+        if (!stage65_add_candidate(storage, OSPREY_PRED_UNFOLDABLE_HEAP,
+                                   payload, 0.8, false, ordinal++)) return false;
+        payload.heap_fold.size = 8;
+        if (!stage65_add_candidate(storage, OSPREY_PRED_FOLDABLE_HEAP,
+                                   payload, 0.8, false, ordinal++)) return false;
+        memset(&payload, 0, sizeof(payload));
+        payload.segment.a1 = make_address(global, 0);
+        payload.segment.a2 = make_address(heap, 0);
+        payload.segment.size = 8;
+        if (!stage65_add_candidate(storage, OSPREY_PRED_HOMO_SEGMENT,
+                                   payload, 0.8, false, ordinal++)) return false;
+        memset(&payload, 0, sizeof(payload));
+        payload.addr = make_address(global, 0);
+        if (!stage65_add_candidate(storage, OSPREY_PRED_ARRAY_START,
+                                   payload, 0.8, false, ordinal++)) return false;
+    }
+    return true;
+}
+
+static OspreyContext *stage65_context_from_case(
+    const OspreyReferenceCase *reference, uint32_t permutation)
+{
+    OspreyContext *ctx = new_decode_context();
+    uint32_t order[512];
+    if (ctx == NULL || reference == NULL ||
+        reference->candidate_count > G_N_ELEMENTS(order)) {
+        osprey_free(ctx);
+        return NULL;
+    }
+    ctx->config.report_threshold = reference->report_threshold;
+    for (uint32_t i = 0; i < reference->extent_count; i++) {
+        add_extent(ctx, reference->extents[i].region,
+                   reference->extents[i].lo, reference->extents[i].hi);
+    }
+    for (uint32_t i = 0; i < reference->candidate_count; i++) order[i] = i;
+    for (uint32_t i = reference->candidate_count; i > 1; i--) {
+        uint32_t j = (permutation * 2654435761u + i * 17u) % i;
+        uint32_t tmp = order[i - 1];
+        order[i - 1] = order[j];
+        order[j] = tmp;
+    }
+    for (uint32_t i = 0; i < reference->candidate_count; i++) {
+        const OspreyReferenceCandidate *candidate =
+            &reference->candidates[order[i]];
+        uint32_t id = add_payload(ctx, candidate->kind, &candidate->payload);
+        if (id == UINT32_MAX) {
+            osprey_free(ctx);
+            return NULL;
+        }
+        set_belief(ctx, id, candidate->posterior);
+        OspreyVar *variable = &g_array_index(ctx->graph->vars,
+                                              OspreyVar, id);
+        variable->direct_support = candidate->direct_support;
+        variable->source_rule_bits = candidate->source_rule_bits;
+        if (candidate->hard_false) {
+            OspreyFactorResult factor = osprey_factor_add_hard_false(
+                ctx, OSPREY_RULE_CB06, OSPREY_GRAPH_SECONDARY, id);
+            if (factor.status != OSPREY_OK) {
+                osprey_free(ctx);
+                return NULL;
+            }
+            variable->hard_false = 1;
+        }
+    }
+    return ctx;
+}
+
+static bool stage65_compare_case(const OspreyReferenceCase *reference,
+                                 uint32_t permutation, const char *label)
+{
+    OspreyReferenceResult expected;
+    OspreyContext *ctx;
+    OspreyDecodeInput *input = NULL;
+    OspreyDecodePlan *plan = NULL;
+    OspreyModel *model = NULL;
+    OspreyStatus status;
+    bool passed = false;
+    static bool mismatch_reported;
+
+    memset(&expected, 0, sizeof(expected));
+    if (!osprey_reference_decode(reference, &expected)) {
+        CHECK(false, label);
+        return false;
+    }
+    ctx = stage65_context_from_case(reference, permutation);
+    if (ctx == NULL) {
+        osprey_reference_result_free(&expected);
+        CHECK(false, label);
+        return false;
+    }
+    status = osprey_decode_input_build(ctx, &input);
+    if (status == OSPREY_OK) status = osprey_decode_roles(ctx, input, &plan);
+    if (status == OSPREY_OK) status = osprey_decode_select_arrays(ctx, input, plan);
+    if (status == OSPREY_OK) status = osprey_model_build(ctx, plan, &model);
+    if (status == OSPREY_OK) {
+        OspreyModelValidationError error = OSPREY_MODEL_VALIDATION_NONE;
+        status = osprey_model_validate(ctx, model, &error);
+    }
+    CHECK(status == expected.status, "reference and production status agree");
+    if (status == OSPREY_OK && expected.status == OSPREY_OK) {
+        CHECK(input != NULL && plan != NULL && model != NULL &&
+                  input->discarded_hard_false == expected.discarded_hard_false &&
+                  input->discarded_threshold == expected.discarded_threshold &&
+                  plan->role_loss_count == expected.discarded_role &&
+                  plan->discarded_layout == expected.discarded_layout,
+              "reference and production discard accounting agree");
+        bool records_equal = osprey_reference_model_equal(&expected, model);
+        char *production_dump = dump_model(model);
+        char *reference_dump = dump_reference_model(&expected);
+        bool dumps_equal = production_dump != NULL && reference_dump != NULL &&
+                           strcmp(production_dump, reference_dump) == 0;
+        if ((!records_equal || !dumps_equal ||
+             input->discarded_hard_false != expected.discarded_hard_false ||
+             input->discarded_threshold != expected.discarded_threshold ||
+             plan->role_loss_count != expected.discarded_role ||
+             plan->discarded_layout != expected.discarded_layout) &&
+            !mismatch_reported && production_dump != NULL &&
+            reference_dump != NULL) {
+            mismatch_reported = true;
+            fprintf(stderr, "stage6.5 mismatch: %s permutation=%u "
+                    "discard=%" PRIu64 "/%" PRIu64 "/%u/%" PRIu64
+                    " expected=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+                    "/%" PRIu64 "\n--- production ---\n%s"
+                    "--- reference ---\n%s", label, permutation,
+                    input->discarded_hard_false,
+                    input->discarded_threshold, plan->role_loss_count,
+                    plan->discarded_layout, expected.discarded_hard_false,
+                    expected.discarded_threshold, expected.discarded_role,
+                    expected.discarded_layout, production_dump,
+                    reference_dump);
+        }
+        CHECK(records_equal,
+              "reference and production canonical model records agree");
+        CHECK(dumps_equal,
+              "reference and production canonical dumps agree");
+        passed = input != NULL && plan != NULL && model != NULL &&
+                 input->discarded_hard_false == expected.discarded_hard_false &&
+                 input->discarded_threshold == expected.discarded_threshold &&
+                 plan->role_loss_count == expected.discarded_role &&
+                 plan->discarded_layout == expected.discarded_layout &&
+                 records_equal && dumps_equal;
+        free(production_dump);
+        free(reference_dump);
+    }
+    osprey_model_free(model);
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+    osprey_reference_result_free(&expected);
+    return passed;
+}
+
+static void test_stage65_reference_matrix(void)
+{
+    Stage65CaseStorage storage;
+    OspreyReferenceCase reference;
+    CHECK(stage65_generate_case(1, &storage), "reference fixed corpus case builds");
+    reference.candidates = storage.candidates;
+    reference.candidate_count = storage.candidate_count;
+    reference.extents = storage.extents;
+    reference.extent_count = storage.extent_count;
+    reference.report_threshold = storage.report_threshold;
+    stage65_compare_case(&reference, 0, "reference fixed case compares");
+    stage65_compare_case(&reference, 1, "reference reverse case compares");
+    stage65_compare_case(&reference, 2, "reference shuffled case compares");
+}
+
+static void test_stage65_reference_boundaries(void)
+{
+    Stage65CaseStorage storage;
+    OspreyReferenceCase reference;
+    OspreyReferenceResult result;
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x650, 0x750);
+
+    memset(&storage, 0, sizeof(storage));
+    storage.extent_count = 1;
+    storage.extents[0] = (OspreyRegionExtent){ region, 0, 512 };
+    for (uint32_t i = 0; i < 64; i++) {
+        OspreyVarPayload payload;
+        memset(&payload, 0, sizeof(payload));
+        payload.segment.a1 = make_address(region, (int64_t)i * 8);
+        payload.segment.a2 = make_address(region, (int64_t)(i + 1u) * 8);
+        payload.segment.size = 8;
+        CHECK(stage65_add_candidate(&storage, OSPREY_PRED_ARRAY, payload,
+                                    0.75, false, i),
+              "64-array oracle fixture fits its declared bound");
+    }
+    reference = (OspreyReferenceCase){
+        .candidates = storage.candidates,
+        .candidate_count = storage.candidate_count,
+        .extents = storage.extents,
+        .extent_count = storage.extent_count,
+        .report_threshold = 0.6,
+    };
+    CHECK(stage65_compare_case(&reference, 0,
+                               "64-array oracle case compares"),
+          "independent array scheduler handles the maximum corpus width");
+    CHECK(stage65_compare_case(&reference, UINT32_C(0x9e3779b9),
+                               "64-array shuffled oracle case compares"),
+          "maximum-width array schedule ignores graph insertion order");
+
+    memset(&storage, 0, sizeof(storage));
+    storage.extent_count = 1;
+    storage.extents[0] = (OspreyRegionExtent){ region, 0, 8 };
+    OspreyVarPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    payload.chunk = make_chunk(region, 8, 8);
+    CHECK(stage65_add_candidate(&storage, OSPREY_PRED_PRIMITIVE_VAR,
+                                payload, 0.8, false, 0),
+          "out-of-extent oracle fixture builds");
+    reference = (OspreyReferenceCase){
+        .candidates = storage.candidates,
+        .candidate_count = storage.candidate_count,
+        .extents = storage.extents,
+        .extent_count = storage.extent_count,
+        .report_threshold = 0.6,
+    };
+    memset(&result, 0, sizeof(result));
+    CHECK(!osprey_reference_decode(&reference, &result) &&
+              result.status == OSPREY_INVALID_MODEL,
+          "oracle rejects an observed object outside its canonical extent");
+
+    memset(&storage, 0, sizeof(storage));
+    storage.extent_count = 1;
+    storage.extents[0] = (OspreyRegionExtent){ region, 0, 8 };
+    memset(&payload, 0, sizeof(payload));
+    payload.segment.a1 = make_address(region, 0);
+    payload.segment.a2 = make_address(region, 8);
+    payload.segment.size = 8;
+    CHECK(stage65_add_candidate(&storage, OSPREY_PRED_ARRAY, payload,
+                                0.8, false, 0),
+          "hard-false oracle fixture builds");
+    storage.candidates[0].hard_false = 2;
+    reference = (OspreyReferenceCase){
+        .candidates = storage.candidates,
+        .candidate_count = storage.candidate_count,
+        .extents = storage.extents,
+        .extent_count = storage.extent_count,
+        .report_threshold = 0.6,
+    };
+    memset(&result, 0, sizeof(result));
+    CHECK(!osprey_reference_decode(&reference, &result) &&
+              result.status == OSPREY_INVALID_MODEL,
+          "oracle rejects non-Boolean hard-false metadata");
+
+    reference.extents = NULL;
+    memset(&result, 0, sizeof(result));
+    CHECK(!osprey_reference_decode(&reference, &result) &&
+              result.status == OSPREY_INVALID_MODEL,
+          "oracle rejects a missing nonempty extent array");
+}
+
+static void test_stage65_generated_corpus(void)
+{
+    Stage65CaseStorage storage;
+    OspreyReferenceCase reference;
+    unsigned passed = 0;
+    bool saw_64_chunks = false;
+    bool saw_64_arrays = false;
+    bool saw_zero_threshold = false;
+    for (uint32_t seed = 0; seed < 2000; seed++) {
+        bool built = stage65_generate_case(seed + 1, &storage);
+        CHECK(built, "every generated reference seed builds");
+        if (!built) continue;
+        saw_64_chunks |= storage.generated_chunk_count == 64;
+        saw_64_arrays |= storage.generated_array_count == 64;
+        saw_zero_threshold |= storage.report_threshold == 0.0;
+        reference.candidates = storage.candidates;
+        reference.candidate_count = storage.candidate_count;
+        reference.extents = storage.extents;
+        reference.extent_count = storage.extent_count;
+        reference.report_threshold = storage.report_threshold;
+        char natural_label[64];
+        char shuffled_label[64];
+        snprintf(natural_label, sizeof(natural_label),
+                 "generated seed %u natural", seed + 1);
+        snprintf(shuffled_label, sizeof(shuffled_label),
+                 "generated seed %u shuffled", seed + 1);
+        bool natural = stage65_compare_case(&reference, seed + 1,
+                                             natural_label);
+        bool shuffled = stage65_compare_case(&reference, seed + 0x9e3779b9u,
+                                             shuffled_label);
+        if (natural && shuffled) passed++;
+    }
+    CHECK(passed == 2000, "all 2000 generated decoder cases compare");
+    CHECK(saw_64_chunks && saw_64_arrays && saw_zero_threshold,
+          "generated corpus reaches 64 chunks, 64 arrays, and threshold zero");
+}
+
+typedef bool (*Stage65InvalidMutator)(OspreyContext *ctx);
+
+typedef struct Stage65InvalidCase {
+    const char *name;
+    Stage65InvalidMutator mutate;
+} Stage65InvalidCase;
+
+static bool stage65_invalid_belief_validity(OspreyContext *ctx)
+{
+    if (ctx == NULL || ctx->graph == NULL || ctx->graph->vars->len == 0) return false;
+    g_array_index(ctx->graph->vars, OspreyVar, 0).belief_valid = 0;
+    return true;
+}
+
+static bool stage65_invalid_belief_value(OspreyContext *ctx)
+{
+    if (ctx == NULL || ctx->graph == NULL || ctx->graph->vars->len == 0) return false;
+    g_array_index(ctx->graph->vars, OspreyVar, 0).belief = NAN;
+    return true;
+}
+
+static bool stage65_invalid_extent(OspreyContext *ctx)
+{
+    if (ctx == NULL || ctx->graph == NULL || ctx->graph->extents->len == 0) return false;
+    OspreyRegionExtent *extent = &g_array_index(ctx->graph->extents,
+                                                 OspreyRegionExtent, 0);
+    extent->hi = extent->lo - 1;
+    return true;
+}
+
+static bool stage65_invalid_pointer_width(OspreyContext *ctx)
+{
+    if (ctx == NULL || ctx->graph == NULL) return false;
+    for (guint i = 0; i < ctx->graph->vars->len; i++) {
+        OspreyVar *var = &g_array_index(ctx->graph->vars, OspreyVar, i);
+        if (var->kind != OSPREY_PRED_POINTER) continue;
+        var->payload.attached.chunk.size = 4;
+        return true;
+    }
+    return false;
+}
+
+static bool stage65_invalid_pointer_target(OspreyContext *ctx)
+{
+    if (ctx == NULL || ctx->graph == NULL) return false;
+    for (guint i = 0; i < ctx->graph->vars->len; i++) {
+        OspreyVar *var = &g_array_index(ctx->graph->vars, OspreyVar, i);
+        if (var->kind != OSPREY_PRED_POINTER) continue;
+        var->payload.attached.base.offset = INT64_MAX;
+        return true;
+    }
+    return false;
+}
+
+static bool stage65_invalid_array_span(OspreyContext *ctx)
+{
+    if (ctx == NULL || ctx->graph == NULL) return false;
+    for (guint i = 0; i < ctx->graph->vars->len; i++) {
+        OspreyVar *var = &g_array_index(ctx->graph->vars, OspreyVar, i);
+        if (var->kind != OSPREY_PRED_ARRAY) continue;
+        var->payload.segment.a2 = var->payload.segment.a1;
+        return true;
+    }
+    return false;
+}
+
+static bool stage65_invalid_hard_false(OspreyContext *ctx)
+{
+    if (ctx == NULL || ctx->graph == NULL) return false;
+    for (guint i = 0; i < ctx->graph->vars->len; i++) {
+        OspreyVar *var = &g_array_index(ctx->graph->vars, OspreyVar, i);
+        if (var->kind != OSPREY_PRED_ARRAY) continue;
+        var->hard_false = 1;
+        return true;
+    }
+    return false;
+}
+
+static void test_stage65_invalid_registry(void)
+{
+    static const Stage65InvalidCase cases[] = {
+        { "missing belief validity", stage65_invalid_belief_validity },
+        { "non-finite belief", stage65_invalid_belief_value },
+        { "malformed extent", stage65_invalid_extent },
+        { "wrong pointer width", stage65_invalid_pointer_width },
+        { "pointer target outside extent", stage65_invalid_pointer_target },
+        { "malformed array span", stage65_invalid_array_span },
+        { "hard-false factor mismatch", stage65_invalid_hard_false },
+    };
+    for (size_t i = 0; i < G_N_ELEMENTS(cases); i++) {
+        for (unsigned order = 0; order < 2; order++) {
+            OspreyContext *ctx = make_projection_context(order);
+            OspreyGraph *committed_graph = NULL;
+            OspreyModel *committed_model = NULL;
+            OspreyStatus status;
+            char *before;
+            char *after;
+            bool applied;
+
+            CHECK(ctx != NULL, "invalid registry context builds");
+            if (ctx == NULL) continue;
+            osprey_tx_begin(ctx);
+            status = osprey_decode(ctx);
+            CHECK(status == OSPREY_OK && ctx->staged_model != NULL,
+                  "invalid registry installs committed sentinel");
+            if (status != OSPREY_OK || ctx->staged_model == NULL) {
+                osprey_free(ctx);
+                continue;
+            }
+            osprey_tx_install(ctx);
+            committed_graph = ctx->graph;
+            committed_model = ctx->model;
+            before = dump_model(committed_model);
+            osprey_tx_begin(ctx);
+            applied = cases[i].mutate(ctx);
+            status = osprey_decode(ctx);
+            CHECK(applied && status == OSPREY_INVALID_MODEL &&
+                      ctx->staged_model == NULL && ctx->model == committed_model &&
+                      ctx->graph == committed_graph,
+                  cases[i].name);
+            osprey_tx_reject(ctx, status, "decode", cases[i].name);
+            after = dump_model(committed_model);
+            CHECK(osprey_model(ctx) == NULL && ctx->model == committed_model &&
+                      before != NULL && after != NULL &&
+                      strcmp(before, after) == 0,
+                  "invalid registry preserves committed sentinel bytes");
+            free(before);
+            free(after);
+            osprey_free(ctx);
+        }
+    }
+}
+
+static void test_stage65_transaction_matrix(void)
+{
+    OspreyContext *ctx = make_projection_context(0);
+    OspreyModel *old_model = NULL;
+    OspreyGraph *old_graph = NULL;
+    char *before = NULL;
+    OspreyStatus status;
+
+    CHECK(ctx != NULL, "transaction matrix context builds");
+    if (ctx == NULL) return;
+    osprey_tx_begin(ctx);
+    status = osprey_decode(ctx);
+    CHECK(status == OSPREY_OK && ctx->staged_model != NULL,
+          "transaction matrix installs initial staged model");
+    if (status != OSPREY_OK || ctx->staged_model == NULL) {
+        osprey_free(ctx);
+        return;
+    }
+    osprey_tx_install(ctx);
+    old_model = ctx->model;
+    old_graph = ctx->graph;
+    before = dump_model(old_model);
+    CHECK(osprey_model(ctx) == old_model,
+          "committed sentinel is visible before replacement");
+
+    osprey_tx_begin(ctx);
+    CHECK(osprey_model(ctx) == NULL && ctx->model == old_model &&
+              ctx->graph == old_graph,
+          "new transaction hides but retains committed ownership");
+    bool saved_belief_valid = g_array_index(ctx->graph->vars, OspreyVar, 0)
+        .belief_valid;
+    g_array_index(ctx->graph->vars, OspreyVar, 0).belief_valid = 0;
+    status = osprey_decode(ctx);
+    g_array_index(ctx->graph->vars, OspreyVar, 0).belief_valid = saved_belief_valid;
+    CHECK(status == OSPREY_INVALID_MODEL && ctx->staged_model == NULL &&
+              ctx->model == old_model,
+          "malformed decoder transaction does not stage a replacement");
+    osprey_tx_reject(ctx, status, "decode", "invalid-model");
+    CHECK(osprey_model(ctx) == NULL && ctx->model == old_model &&
+              ctx->graph == old_graph,
+          "malformed transaction exposes no model and preserves ownership");
+    char *after = dump_model(old_model);
+    CHECK(before != NULL && after != NULL && strcmp(before, after) == 0,
+          "malformed transaction preserves committed model bytes");
+    free(after);
+
+    bool saw_allocation_success = false;
+    for (int64_t failure = 0; failure < 256; failure++) {
+        osprey_tx_begin(ctx);
+        osprey_decode_test_set_alloc_fail_after(failure);
+        status = osprey_decode(ctx);
+        osprey_decode_test_set_alloc_fail_after(-1);
+        if (status == OSPREY_OK) {
+            CHECK(ctx->staged_model != NULL,
+                  "allocation sweep success stages a model");
+            osprey_tx_install(ctx);
+            old_model = ctx->model;
+            saw_allocation_success = true;
+            break;
+        }
+        CHECK(status == OSPREY_INVALID_MODEL && ctx->staged_model == NULL &&
+                  ctx->model == old_model,
+              "allocation failure leaves committed model untouched");
+        osprey_tx_reject(ctx, status, "decode", "allocation");
+        CHECK(osprey_model(ctx) == NULL && ctx->model == old_model,
+              "allocation rejection hides prior model");
+    }
+    CHECK(saw_allocation_success, "transaction allocation sweep reaches success");
+    osprey_tx_begin(ctx);
+    status = osprey_decode(ctx);
+    CHECK(status == OSPREY_OK && ctx->staged_model != NULL,
+          "clean transaction recovers after rejection matrix");
+    osprey_tx_install(ctx);
+    CHECK(osprey_model(ctx) == ctx->model && ctx->model != NULL,
+          "clean transaction commits exactly once");
+    free(before);
+    osprey_free(ctx);
+}
+
 int main(void)
 {
     RUN(test_valid_projection_and_indexes);
@@ -3904,12 +4939,19 @@ int main(void)
     RUN(test_stage64_rejects_inconsistent_plan);
     RUN(test_stage64_model_permutation_and_atomic_stage);
     RUN(test_stage64_by_value_cycle_rejection);
+    RUN(test_stage64_later_field_by_value_cycle_rejection);
     RUN(test_stage64_recursive_pointer_is_legal);
     RUN(test_stage64_runtime_span_bridge);
     RUN(test_stage64_canonical_runtime_histories);
     RUN(test_stage64_model_allocation_atomicity);
     RUN(test_stage64_atomic_coordinator);
-    fprintf(stderr, "stage6.4: %u/%u tests passed\n", executed - failures,
+    RUN(test_stage65_semantic_field_matrix);
+    RUN(test_stage65_reference_matrix);
+    RUN(test_stage65_reference_boundaries);
+    RUN(test_stage65_generated_corpus);
+    RUN(test_stage65_invalid_registry);
+    RUN(test_stage65_transaction_matrix);
+    fprintf(stderr, "stage6.5: %u/%u tests passed\n", executed - failures,
             registered);
     return failures == 0 ? 0 : 1;
 }

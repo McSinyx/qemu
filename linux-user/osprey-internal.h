@@ -1725,6 +1725,9 @@ bool osprey_model_dump_file(const OspreyModel *model, FILE *out);
 typedef void (*OspreyDecodePreValidateTestHook)(OspreyModel *model);
 void osprey_decode_test_set_prevalidate_hook(
     OspreyDecodePreValidateTestHook hook);
+/* Direct graph-walk hook: preceding ownership checks make a synthetic later-
+ * edge cycle fail before the cycle validator in the public validation path. */
+bool osprey_decode_test_by_value_cycles_valid(const OspreyModel *model);
 
 /* Stage 6 entry (osprey-decode.c): canonical input, role/array selection,
  * immutable model construction, independent validation, and atomic staged

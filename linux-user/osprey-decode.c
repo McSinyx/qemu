@@ -6108,14 +6108,22 @@ static bool decode_model_by_value_cycles_valid(const OspreyModel *model)
                 child = type->element_type_id;
                 edges[current] = 1;
             }
-            if (child == UINT32_MAX ||
-                model->types[child].kind == OSPREY_TYPE_PRIMITIVE ||
-                model->types[child].kind == OSPREY_TYPE_POINTER) {
+            if (child == UINT32_MAX) {
                 state[current] = 2;
                 depth--;
                 continue;
             }
-            if (child >= model->type_count || state[child] == 1) {
+            if (child >= model->type_count) {
+                g_free(state);
+                g_free(stack);
+                g_free(edges);
+                return false;
+            }
+            if (model->types[child].kind == OSPREY_TYPE_PRIMITIVE ||
+                model->types[child].kind == OSPREY_TYPE_POINTER) {
+                continue;
+            }
+            if (state[child] == 1) {
                 g_free(state);
                 g_free(stack);
                 g_free(edges);
@@ -6136,6 +6144,11 @@ static bool decode_model_by_value_cycles_valid(const OspreyModel *model)
     g_free(stack);
     g_free(edges);
     return true;
+}
+
+bool osprey_decode_test_by_value_cycles_valid(const OspreyModel *model)
+{
+    return decode_model_by_value_cycles_valid(model);
 }
 
 static bool decode_model_runtime_spans_valid(const OspreyContext *ctx,
@@ -6482,6 +6495,13 @@ OspreyStatus osprey_decode(OspreyContext *ctx)
 
     if (ctx == NULL) return OSPREY_DISABLED;
     if (!ctx->config.enabled) return OSPREY_DISABLED;
+    if (ctx->graph != NULL &&
+        ((ctx->graph->vars != NULL &&
+          ctx->graph->vars->len > ctx->config.max_variables) ||
+         (ctx->graph->factors != NULL &&
+          ctx->graph->factors->len > ctx->config.max_factors))) {
+        return OSPREY_LIMIT_EXCEEDED;
+    }
     status = osprey_decode_input_build(ctx, &input);
     if (status != OSPREY_OK) goto fail;
     status = osprey_decode_roles(ctx, input, &plan);
