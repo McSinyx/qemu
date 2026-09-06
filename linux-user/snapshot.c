@@ -2596,6 +2596,14 @@ static void add_modification_primitive(GQueue *modifications, MutationCandidate 
     }
 }
 
+static bool osprey_decoded_object_is_pointer(
+    const OspreyModel *model, const OspreyDecodedObject *object)
+{
+    if (model == NULL || object == NULL || model->types == NULL ||
+        object->value_type_id >= model->type_count) return false;
+    return model->types[object->value_type_id].kind == OSPREY_TYPE_POINTER;
+}
+
 static void add_pointer_typed_candidate(GQueue *modifications,
                                         MutationCandidate *mod,
                                         const OspreyDecodedObject *pobj) {
@@ -2837,8 +2845,10 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
                     dobj = osprey_lookup_raw(pm, (uint64_t)prim->addr);
                 }
             }
-            if (dobj != NULL && dobj->kind == OSPREY_DECODED_POINTER &&
-                mod.size == sizeof(target_ulong)) {
+            if (dobj != NULL &&
+                osprey_decoded_object_is_pointer(
+                    g_osprey_ctx != NULL ? osprey_model(g_osprey_ctx) : NULL,
+                    dobj) && mod.size == sizeof(target_ulong)) {
                 log_msg("[inferred] [pointer] [addr %lx] [size %d]\n",
                         prim->addr, prim->size);
                 add_pointer_typed_candidate(mod_manager->modifications,
@@ -2875,7 +2885,10 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
                     pobj = osprey_lookup_raw(pm, (uint64_t)ptr->addr);
                 }
             }
-            if (pobj != NULL && pobj->kind == OSPREY_DECODED_POINTER) {
+            if (pobj != NULL &&
+                osprey_decoded_object_is_pointer(
+                    g_osprey_ctx != NULL ? osprey_model(g_osprey_ctx) : NULL,
+                    pobj)) {
                 log_msg("[inferred] [pointer] [addr %lx] [target %lx]\n",
                         ptr->addr, ptr->target);
                 add_pointer_typed_candidate(mod_manager->modifications,

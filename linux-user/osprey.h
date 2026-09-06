@@ -105,11 +105,18 @@ typedef enum OspreyStatus {
 
 typedef struct OspreyDecodedObject {
     OspreyChunk chunk;
-    uint64_t kind;      /* OspreyDecodedKind (see osprey-internal.h) */
-    double posterior;
-    int64_t parent_offset; /* structure base / array start offset */
-    OspreyRegionId parent_region;
-    uint32_t type_id;   /* stable ordinal into the model type table */
+    uint8_t storage_role;       /* OspreyStorageRole */
+    uint8_t has_pointer_target;
+    uint16_t reserved;
+    uint32_t value_type_id;     /* stable ordinal into model->types */
+    OspreyAddress owner_base;   /* valid for field/array-element roles */
+    OspreyAddress pointer_target; /* valid when has_pointer_target */
+    double storage_posterior;
+    double pointer_posterior;
+    uint64_t storage_support;
+    uint64_t storage_source_rule_bits;
+    uint64_t pointer_support;
+    uint64_t pointer_source_rule_bits;
 } OspreyDecodedObject;
 
 /* Configuration: parse + validate all BINRADAR_OSPREY_* env vars once.
@@ -161,16 +168,16 @@ const OspreyModel *osprey_model(const OspreyContext *ctx);
 const OspreyDecodedObject *osprey_lookup_chunk(const OspreyModel *model,
                                                 const OspreyChunk *chunk);
 
-/* Stage 7 consumer API (parent side): map a raw guest address back to
- * the decoded object covering it (chunk-exact for scalar/field/pointer
- * chunks; point base for array starts).  Returns NULL when the address
- * is outside every modeled instance. */
+/* Stage 7 consumer API (parent side): map a raw guest address back to the
+ * narrowest observed decoded chunk covering it.  Aggregate definitions have
+ * no synthetic objects or raw spans.  Returns NULL when the address is outside
+ * every modeled observed chunk. */
 const OspreyDecodedObject *osprey_lookup_raw(const OspreyModel *model,
                                               uint64_t raw);
 
-/* Raw extent of a decoded object's canonical span: for struct/array
- * bases the merged region-instance extent; for chunks their size.
- * Returns false when no instance resolves. */
+/* Raw extent of a decoded object's observed chunk span.  Stage 6 retains
+ * this chunk-exact bridge until Stage 7 replaces instance lookup.
+ * Returns false when no runtime instance resolves. */
 bool osprey_raw_extent(const OspreyModel *model,
                        const OspreyDecodedObject *obj, uint64_t *raw_out,
                        uint64_t *extent_out);

@@ -3978,7 +3978,9 @@ OspreyStatus osprey_analyze(OspreyContext *ctx) {
     /* Stage 4: consistent decoding into the OspreyModel. */
     st = osprey_decode(ctx);
     if (st != OSPREY_OK && st != OSPREY_DISABLED) {
-        osprey_tx_reject(ctx, st, "decode", "decoder rejected model");
+        osprey_tx_reject(ctx, st, "decode",
+                         ctx->tx_reason != NULL ? ctx->tx_reason :
+                         "decoder rejected model");
         goto fail;
     }
 

@@ -11,6 +11,72 @@ static unsigned failures;
 static unsigned registered;
 static unsigned executed;
 
+void osprey_test_log_reset(void);
+const char *osprey_test_log_contents(void);
+
+static void corrupt_model_value_type(OspreyModel *model)
+{
+    if (model != NULL && model->object_count != 0) {
+        model->objects[0].value_type_id = UINT32_MAX;
+    }
+}
+
+/* Ledger-corruption hooks: every one targets exactly one ledger family and
+ * restores nothing; the caller owns restoration and destruction ordering. */
+static void corrupt_model_ledger_objects_used(OspreyModel *model)
+{
+    if (model != NULL && model->object_count != 0) {
+        model->ledger[OSPREY_MODEL_LEDGER_OBJECTS].used = 0;
+    }
+}
+
+static void corrupt_model_ledger_types_capacity(OspreyModel *model)
+{
+    if (model != NULL && model->type_count != 0) {
+        model->ledger[OSPREY_MODEL_LEDGER_TYPES].capacity =
+            model->type_count + 1;
+    }
+}
+
+static void corrupt_model_ledger_fields_bytes(OspreyModel *model)
+{
+    if (model != NULL && model->field_count != 0) {
+        model->ledger[OSPREY_MODEL_LEDGER_FIELDS].bytes =
+            (uint64_t)model->field_count * sizeof(*model->fields) + 1;
+    }
+}
+
+static void corrupt_model_ledger_chunk_index_destructor(OspreyModel *model)
+{
+    if (model != NULL && model->chunk_index_count != 0) {
+        model->ledger[OSPREY_MODEL_LEDGER_CHUNK_INDEX].destructor_kind =
+            OSPREY_MODEL_DESTRUCTOR_NONE;
+    }
+}
+
+static void corrupt_model_ledger_aggregate_index_base(OspreyModel *model)
+{
+    if (model != NULL && model->aggregate_index_count != 0) {
+        model->ledger[OSPREY_MODEL_LEDGER_AGGREGATE_INDEX].base = NULL;
+    }
+}
+
+static void corrupt_model_ledger_type_index_used(OspreyModel *model)
+{
+    if (model != NULL && model->type_index_count != 0) {
+        model->ledger[OSPREY_MODEL_LEDGER_TYPE_INDEX].used =
+            model->ledger[OSPREY_MODEL_LEDGER_TYPE_INDEX].used - 1;
+    }
+}
+
+static void corrupt_model_ledger_names_destructor(OspreyModel *model)
+{
+    if (model != NULL && model->type_name_count != 0) {
+        model->ledger[OSPREY_MODEL_LEDGER_NAMES].destructor_kind =
+            OSPREY_MODEL_DESTRUCTOR_FREE;
+    }
+}
+
 #define CHECK(condition, message) do {                                      \
     if (!(condition)) {                                                      \
         fprintf(stderr, "FAIL: %s (line %d)\n", (message), __LINE__);     \
@@ -2621,6 +2687,1120 @@ static void test_stage63_permutations(void)
     }
 }
 
+static char *dump_model(const OspreyModel *model)
+{
+    char *data = NULL;
+    size_t length = 0;
+    FILE *out = open_memstream(&data, &length);
+    if (out == NULL) return NULL;
+    if (!osprey_model_dump_file(model, out) || fclose(out) != 0) {
+        free(data);
+        return NULL;
+    }
+    return data;
+}
+
+static bool build_model_fixture(OspreyContext *ctx, OspreyModel **model_out)
+{
+    OspreyDecodeInput *input = NULL;
+    OspreyDecodePlan *plan = NULL;
+    OspreyStatus status;
+    *model_out = NULL;
+    status = build_array_plan(ctx, &input, &plan) && plan != NULL
+        ? osprey_model_build(ctx, plan, model_out) : OSPREY_INVALID_MODEL;
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
+    CHECK(status == OSPREY_OK && *model_out != NULL,
+          "Stage 6.4 model builds from selected plan");
+    return status == OSPREY_OK && *model_out != NULL;
+}
+
+static uint32_t find_model_type_kind(const OspreyModel *model,
+                                      uint8_t kind)
+{
+    if (model == NULL) return UINT32_MAX;
+    for (uint32_t i = 0; i < model->type_count; i++) {
+        if (model->types[i].kind == kind) return i;
+    }
+    return UINT32_MAX;
+}
+
+static void append_runtime_instance(OspreyContext *ctx,
+                                    OspreyRegionId region, uint64_t raw_base)
+{
+    OspreyRegionInstance instance;
+    memset(&instance, 0, sizeof(instance));
+    instance.region = region;
+    instance.instance_id = raw_base ^ UINT64_C(0x55aa);
+    instance.raw_base = raw_base;
+    instance.raw_min = raw_base;
+    instance.raw_max = raw_base + UINT64_C(0x1000);
+    if (ctx != NULL) g_array_append_val(ctx->region_instances, instance);
+}
+
+static bool expect_model_error(OspreyContext *ctx, OspreyModel *model,
+                               OspreyModelValidationError expected,
+                               const char *message)
+{
+    OspreyModelValidationError error = OSPREY_MODEL_VALIDATION_NONE;
+    OspreyStatus status = osprey_model_validate(ctx, model, &error);
+    bool passed = status == OSPREY_INVALID_MODEL && error == expected;
+    CHECK(passed, message);
+    return passed;
+}
+
+static bool expect_model_valid(OspreyContext *ctx, OspreyModel *model,
+                               const char *message)
+{
+    OspreyModelValidationError error = OSPREY_MODEL_VALIDATION_NONE;
+    OspreyStatus status = osprey_model_validate(ctx, model, &error);
+    bool passed = status == OSPREY_OK &&
+                  error == OSPREY_MODEL_VALIDATION_NONE;
+    CHECK(passed, message);
+    return passed;
+}
+
+static void test_stage64_immutable_model_and_validation(void)
+{
+    OspreyContext *ctx = make_projection_context(false);
+    OspreyModel *model = NULL;
+    if (ctx != NULL && build_model_fixture(ctx, &model)) {
+        OspreyModelValidationError error = OSPREY_MODEL_VALIDATION_NONE;
+        OspreyStatus validation_status = osprey_model_validate(ctx, model, &error);
+        CHECK(validation_status == OSPREY_OK &&
+                  error == OSPREY_MODEL_VALIDATION_NONE,
+              "independent validator accepts built model");
+        CHECK(model->type_count != 0 &&
+                  model->chunk_index_count == model->object_count &&
+                  model->type_index_count == model->type_count,
+              "model owns canonical type and chunk indexes");
+        char *dump_before = dump_model(model);
+        CHECK(dump_before != NULL && strstr(dump_before, "[model-version 1]") != NULL &&
+                  strstr(dump_before, "[posterior-bits") != NULL &&
+                  strstr(dump_before, "raw-span") == NULL &&
+                  strstr(dump_before, "raw-spans") == NULL,
+              "model dump contains semantic rows but no runtime spans");
+        if (model->object_count != 0) {
+            uint32_t saved_type = model->objects[0].value_type_id;
+            model->objects[0].value_type_id = UINT32_MAX;
+            CHECK(osprey_model_validate(ctx, model, &error) ==
+                      OSPREY_INVALID_MODEL &&
+                      error == OSPREY_MODEL_VALIDATION_OBJECT_REFERENCE &&
+                      strcmp(osprey_model_validation_reason(error),
+                             "object-reference") == 0,
+                  "validator reports corrupted object reference");
+            model->objects[0].value_type_id = saved_type;
+            uint64_t saved_support = model->objects[0].storage_support;
+            model->objects[0].storage_support++;
+            CHECK(osprey_model_validate(ctx, model, &error) ==
+                      OSPREY_INVALID_MODEL &&
+                      error == OSPREY_MODEL_VALIDATION_OBJECT_EVIDENCE,
+                  "validator rejects storage evidence not present in the graph");
+            model->objects[0].storage_support = saved_support;
+        }
+        char *dump_after = dump_model(model);
+        CHECK(dump_before != NULL && dump_after != NULL &&
+                  strcmp(dump_before, dump_after) == 0,
+              "restored immutable model dump is byte-stable");
+        free(dump_before);
+        free(dump_after);
+    }
+    osprey_model_free(model);
+    osprey_free(ctx);
+}
+
+/* Per-family ledger corruption: every case mutates exactly one record family
+ * through the test-only hook, asserts the model-ledger rejection, and restores
+ * the untouched ledger copy before destruction. */
+static void test_stage64_ledger_corruption_matrix(void)
+{
+    struct LedgerFamily {
+        const char *name;
+        uint32_t slot;
+        bool present;
+        void (*corrupt)(OspreyModel *);
+    };
+    static const struct LedgerFamily families[] = {
+        { "objects", OSPREY_MODEL_LEDGER_OBJECTS, true,
+          corrupt_model_ledger_objects_used },
+        { "types", OSPREY_MODEL_LEDGER_TYPES, true,
+          corrupt_model_ledger_types_capacity },
+        { "fields", OSPREY_MODEL_LEDGER_FIELDS, true,
+          corrupt_model_ledger_fields_bytes },
+        { "chunk-index", OSPREY_MODEL_LEDGER_CHUNK_INDEX, true,
+          corrupt_model_ledger_chunk_index_destructor },
+        { "aggregate-index", OSPREY_MODEL_LEDGER_AGGREGATE_INDEX, true,
+          corrupt_model_ledger_aggregate_index_base },
+        { "type-index", OSPREY_MODEL_LEDGER_TYPE_INDEX, true,
+          corrupt_model_ledger_type_index_used },
+        { "runtime-spans", OSPREY_MODEL_LEDGER_RUNTIME_SPANS, true,
+          NULL },
+        { "names", OSPREY_MODEL_LEDGER_NAMES, true,
+          corrupt_model_ledger_names_destructor },
+    };
+    OspreyContext *ctx = make_projection_context(0);
+    OspreyModel *model = NULL;
+    OspreyModelAllocation ledger_backup[OSPREY_MODEL_LEDGER_COUNT];
+    OspreyRegionId global = make_region(OSPREY_REGION_GLOBAL, 0x101, 0x500);
+    append_runtime_instance(ctx, global, UINT64_C(0x1000));
+    if (ctx == NULL || !build_model_fixture(ctx, &model)) {
+        osprey_model_free(model);
+        osprey_free(ctx);
+        return;
+    }
+    memcpy(ledger_backup, model->ledger, sizeof(ledger_backup));
+    for (size_t i = 0; i < G_N_ELEMENTS(families); i++) {
+        OspreyModelValidationError error = OSPREY_MODEL_VALIDATION_NONE;
+        if (!families[i].present) {
+            /* Zero-count families own no allocation; ledger mutation of an
+             * empty family is a no-op by construction. */
+            CHECK(model->ledger[families[i].slot].base == NULL &&
+                      model->ledger[families[i].slot].capacity == 0,
+                  "empty ledger family owns no allocation");
+            continue;
+        }
+        if (families[i].corrupt != NULL) {
+            families[i].corrupt(model);
+            CHECK(osprey_model_validate(ctx, model, &error) ==
+                      OSPREY_INVALID_MODEL &&
+                      error == OSPREY_MODEL_VALIDATION_LEDGER,
+                  "each occupied ledger family rejects corruption");
+            model->ledger[families[i].slot] = ledger_backup[families[i].slot];
+        }
+    }
+    /* Every ledger field is independently checked for every occupied family;
+     * restore the complete entry before the next mutation and before free. */
+    for (uint32_t slot = 0; slot < OSPREY_MODEL_LEDGER_COUNT; slot++) {
+        OspreyModelAllocation saved = model->ledger[slot];
+        model->ledger[slot].base = NULL;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_LEDGER,
+                           "ledger base corruption rejects");
+        model->ledger[slot] = saved;
+        model->ledger[slot].capacity++;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_LEDGER,
+                           "ledger capacity corruption rejects");
+        model->ledger[slot] = saved;
+        model->ledger[slot].used++;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_LEDGER,
+                           "ledger used corruption rejects");
+        model->ledger[slot] = saved;
+        model->ledger[slot].bytes++;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_LEDGER,
+                           "ledger byte-size corruption rejects");
+        model->ledger[slot] = saved;
+        model->ledger[slot].element_size++;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_LEDGER,
+                           "ledger element-size corruption rejects");
+        model->ledger[slot] = saved;
+        model->ledger[slot].destructor_kind = OSPREY_MODEL_DESTRUCTOR_NONE;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_LEDGER,
+                           "ledger destructor corruption rejects");
+        model->ledger[slot] = saved;
+        model->ledger[slot].reserved[0] = 1;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_LEDGER,
+                           "ledger reserved corruption rejects");
+        model->ledger[slot] = saved;
+    }
+    memcpy(model->ledger, ledger_backup, sizeof(ledger_backup));
+    CHECK(osprey_model_validate(ctx, model, &(OspreyModelValidationError){0}) ==
+              OSPREY_OK,
+          "restored ledger validates before destruction");
+    osprey_model_free(model);
+    osprey_free(ctx);
+}
+
+static void test_stage64_header_count_matrix(void)
+{
+    OspreyContext *ctx = make_projection_context(0);
+    OspreyModel *model = NULL;
+    uint32_t *counts[8];
+    size_t count;
+
+    if (ctx == NULL || !build_model_fixture(ctx, &model)) {
+        osprey_model_free(model);
+        osprey_free(ctx);
+        return;
+    }
+    CHECK(model->version == OSPREY_MODEL_VERSION,
+          "model starts at the supported version");
+    model->version++;
+    expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_VERSION,
+                       "model version corruption rejects first");
+    model->version = OSPREY_MODEL_VERSION;
+    counts[0] = &model->object_count;
+    counts[1] = &model->type_count;
+    counts[2] = &model->field_count;
+    counts[3] = &model->chunk_index_count;
+    counts[4] = &model->aggregate_index_count;
+    counts[5] = &model->type_index_count;
+    counts[6] = &model->raw_span_count;
+    counts[7] = &model->type_name_count;
+    for (count = 0; count < G_N_ELEMENTS(counts); count++) {
+        uint32_t saved = *counts[count];
+        *counts[count] = saved + 1;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_LEDGER,
+                           "semantic count corruption rejects");
+        *counts[count] = saved;
+    }
+    expect_model_valid(ctx, model, "restored semantic counts validate");
+    osprey_model_free(model);
+    osprey_free(ctx);
+}
+
+static void test_stage64_type_field_object_index_matrix(void)
+{
+    OspreyContext *ctx = make_projection_context(0);
+    OspreyModel *model = NULL;
+    OspreyModelValidationError error = OSPREY_MODEL_VALIDATION_NONE;
+
+    if (ctx == NULL || !build_model_fixture(ctx, &model)) {
+        osprey_model_free(model);
+        osprey_free(ctx);
+        return;
+    }
+    if (model->type_count > 1) {
+        OspreyDecodedType saved = model->types[0];
+        model->types[0] = model->types[1];
+        model->types[1] = saved;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_TYPE_ORDER,
+                           "type insertion order corruption rejects");
+        model->types[1] = model->types[0];
+        model->types[0] = saved;
+    }
+    uint32_t primitive = find_model_type_kind(model, OSPREY_TYPE_PRIMITIVE);
+    if (primitive != UINT32_MAX) {
+        uint16_t saved_reserved = model->types[primitive].reserved;
+        model->types[primitive].reserved = 1;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_TYPE_IDENTITY,
+                           "type reserved-field corruption rejects");
+        model->types[primitive].reserved = saved_reserved;
+        uint8_t saved_reserved_byte = model->types[primitive].reserved2[0];
+        model->types[primitive].reserved2[0] = 1;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_TYPE_IDENTITY,
+                           "type reserved-byte corruption rejects");
+        model->types[primitive].reserved2[0] = saved_reserved_byte;
+        char saved_name = model->type_names[primitive][0];
+        model->type_names[primitive][0] = saved_name == 'p' ? 'x' : 'p';
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_TYPE_IDENTITY,
+                           "type name corruption rejects");
+        model->type_names[primitive][0] = saved_name;
+    }
+    if (model->field_count != 0) {
+        OspreyDecodedField *field = &model->fields[0];
+        OspreyChunk saved_chunk = field->chunk;
+        field->chunk.address.offset++;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_FIELD,
+                           "field chunk corruption rejects");
+        field->chunk = saved_chunk;
+        uint64_t saved_relative = field->relative_offset;
+        field->relative_offset++;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_FIELD,
+                           "field relative-offset corruption rejects");
+        field->relative_offset = saved_relative;
+        uint32_t saved_value = field->value_type_id;
+        field->value_type_id = UINT32_MAX;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_TYPE_REFERENCE,
+                           "field value-type corruption rejects");
+        field->value_type_id = saved_value;
+        double saved_posterior = field->posterior;
+        field->posterior = nextafter(saved_posterior,
+                                     saved_posterior < 1.0 ? 1.0 : 0.0);
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_FIELD,
+                           "field posterior corruption rejects");
+        field->posterior = saved_posterior;
+        uint64_t saved_support = field->support;
+        field->support++;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_FIELD,
+                           "field support corruption rejects");
+        field->support = saved_support;
+        uint64_t saved_rules = field->source_rule_bits;
+        field->source_rule_bits ^= 1;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_FIELD,
+                           "field rule corruption rejects");
+        field->source_rule_bits = saved_rules;
+    }
+    if (model->object_count != 0) {
+        uint32_t identity_object = UINT32_MAX;
+        for (uint32_t i = 0; i < model->object_count; i++) {
+            if (model->objects[i].storage_role != OSPREY_STORAGE_FIELD) {
+                identity_object = i;
+            }
+        }
+        CHECK(identity_object != UINT32_MAX,
+              "identity fixture has a non-field object");
+        if (identity_object != UINT32_MAX) {
+            OspreyChunk saved_chunk = model->objects[identity_object].chunk;
+            model->objects[identity_object].chunk.address.offset = 128;
+            expect_model_error(ctx, model,
+                               OSPREY_MODEL_VALIDATION_OBJECT_IDENTITY,
+                               "object extent identity corruption rejects");
+            model->objects[identity_object].chunk = saved_chunk;
+        }
+        uint8_t saved_role = model->objects[0].storage_role;
+        model->objects[0].storage_role = 0;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_OBJECT_ROLE,
+                           "object storage-role corruption rejects");
+        model->objects[0].storage_role = saved_role;
+        uint32_t saved_type = model->objects[0].value_type_id;
+        model->objects[0].value_type_id = UINT32_MAX;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_OBJECT_REFERENCE,
+                           "object value-type corruption rejects");
+        model->objects[0].value_type_id = saved_type;
+        uint64_t saved_support = model->objects[0].storage_support;
+        model->objects[0].storage_support++;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_OBJECT_EVIDENCE,
+                           "object evidence corruption rejects");
+        model->objects[0].storage_support = saved_support;
+        CHECK(osprey_model_validate(ctx, model, &error) == OSPREY_OK,
+              "restored object fields validate");
+    }
+    if (model->chunk_index_count > 1) {
+        OspreyModelIndexEntry saved = model->chunk_index[0];
+        model->chunk_index[0] = model->chunk_index[1];
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_INDEX_ORDER,
+                           "chunk-index order corruption rejects");
+        model->chunk_index[0] = saved;
+        uint32_t saved_ordinal = model->chunk_index[0].ordinal;
+        model->chunk_index[0].ordinal = model->chunk_index[1].ordinal;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_INDEX_CONTENT,
+                           "chunk-index content corruption rejects");
+        model->chunk_index[0].ordinal = saved_ordinal;
+    }
+    if (model->type_index_count > 1) {
+        OspreyModelIndexEntry saved = model->type_index[0];
+        model->type_index[0] = model->type_index[1];
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_INDEX_ORDER,
+                           "type-index order corruption rejects");
+        model->type_index[0] = saved;
+        uint32_t saved_ordinal = model->type_index[0].ordinal;
+        model->type_index[0].ordinal = model->type_index[1].ordinal;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_INDEX_CONTENT,
+                           "type-index content corruption rejects");
+        model->type_index[0].ordinal = saved_ordinal;
+    }
+    if (model->aggregate_index_count > 1) {
+        OspreyModelIndexEntry saved = model->aggregate_index[0];
+        model->aggregate_index[0] = model->aggregate_index[1];
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_INDEX_ORDER,
+                           "aggregate-index order corruption rejects");
+        model->aggregate_index[0] = saved;
+        uint32_t saved_ordinal = model->aggregate_index[0].ordinal;
+        model->aggregate_index[0].ordinal = model->aggregate_index[1].ordinal;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_INDEX_CONTENT,
+                           "aggregate-index content corruption rejects");
+        model->aggregate_index[0].ordinal = saved_ordinal;
+    }
+    expect_model_valid(ctx, model, "restored type/object/index model validates");
+    osprey_model_free(model);
+    osprey_free(ctx);
+}
+
+static void test_stage64_type_size_reference_and_aggregate_matrix(void)
+{
+    OspreyContext *ctx = make_array_permutation_context(0);
+    OspreyModel *model = NULL;
+    uint32_t array_id;
+    uint32_t saved_element;
+    uint64_t saved_size;
+
+    if (ctx == NULL || !build_model_fixture(ctx, &model)) {
+        osprey_model_free(model);
+        osprey_free(ctx);
+        return;
+    }
+    array_id = find_model_type_kind(model, OSPREY_TYPE_ARRAY);
+    CHECK(array_id != UINT32_MAX, "array corruption fixture has an array type");
+    if (array_id != UINT32_MAX) {
+        saved_size = model->types[array_id].size;
+        model->types[array_id].size = saved_size + 1;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_TYPE_SIZE,
+                           "array size arithmetic corruption rejects");
+        model->types[array_id].size = saved_size;
+        saved_element = model->types[array_id].element_type_id;
+        model->types[array_id].element_type_id = UINT32_MAX;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_TYPE_REFERENCE,
+                           "array element reference corruption rejects");
+        model->types[array_id].element_type_id = saved_element;
+    }
+    expect_model_valid(ctx, model, "restored array type validates");
+    osprey_model_free(model);
+    osprey_free(ctx);
+
+    ctx = new_decode_context();
+    OspreyRegionId aggregate_region = make_region(OSPREY_REGION_GLOBAL,
+                                                  0x660, 0x760);
+    OspreyChunk first_chunk = make_chunk(aggregate_region, 0, 4);
+    OspreyChunk second_chunk = make_chunk(aggregate_region, 8, 4);
+    if (ctx != NULL) {
+        add_field_candidate(ctx, first_chunk,
+                            make_address(aggregate_region, 0), 0.8);
+        add_field_candidate(ctx, second_chunk,
+                            make_address(aggregate_region, 8), 0.8);
+        add_extent(ctx, aggregate_region, 0, 16);
+    }
+    model = NULL;
+    if (ctx != NULL && build_model_fixture(ctx, &model)) {
+        uint32_t first = UINT32_MAX;
+        uint32_t second = UINT32_MAX;
+        for (uint32_t i = 0; i < model->type_count; i++) {
+            if (model->types[i].kind != OSPREY_TYPE_STRUCT) continue;
+            if (first == UINT32_MAX) first = i;
+            else {
+                second = i;
+                break;
+            }
+        }
+        CHECK(first != UINT32_MAX && second != UINT32_MAX,
+              "aggregate corruption fixture has two structures");
+        if (first != UINT32_MAX && second != UINT32_MAX) {
+            OspreyAddress saved_base = model->types[second].canonical_base;
+            char *saved_name = model->type_names[second];
+            char *duplicate_name = g_strdup(model->type_names[first]);
+            model->types[second].canonical_base =
+                model->types[first].canonical_base;
+            model->type_names[second] = duplicate_name;
+            expect_model_error(ctx, model,
+                               OSPREY_MODEL_VALIDATION_AGGREGATE_BASE,
+                               "duplicate aggregate base rejects");
+            model->types[second].canonical_base = saved_base;
+            model->type_names[second] = saved_name;
+            g_free(duplicate_name);
+            expect_model_valid(ctx, model,
+                               "restored aggregate bases validate");
+        }
+    }
+    osprey_model_free(model);
+    osprey_free(ctx);
+}
+
+static void test_stage64_noncanonical_field_ranges(void)
+{
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x663, 0x763);
+    OspreyContext *ctx = new_decode_context();
+    OspreyModel *model = NULL;
+    OspreyChunk first_chunk = make_chunk(region, 0, 4);
+    OspreyChunk second_chunk = make_chunk(region, 8, 4);
+    uint32_t first = UINT32_MAX;
+    uint32_t second = UINT32_MAX;
+
+    if (ctx != NULL) {
+        add_field_candidate(ctx, first_chunk, make_address(region, 0), 0.8);
+        add_field_candidate(ctx, second_chunk, make_address(region, 8), 0.8);
+        add_extent(ctx, region, 0, 16);
+    }
+    if (ctx != NULL && build_model_fixture(ctx, &model)) {
+        for (uint32_t i = 0; i < model->type_count; i++) {
+            if (model->types[i].kind != OSPREY_TYPE_STRUCT) continue;
+            if (first == UINT32_MAX) first = i;
+            else {
+                second = i;
+                break;
+            }
+        }
+        CHECK(first != UINT32_MAX && second != UINT32_MAX &&
+                  model->field_count == 2,
+              "field-range fixture has two canonical structures");
+        if (first != UINT32_MAX && second != UINT32_MAX &&
+            model->field_count == 2) {
+            OspreyDecodedField saved_first_field = model->fields[0];
+            OspreyDecodedField saved_second_field = model->fields[1];
+            uint32_t saved_first_begin = model->types[first].field_begin;
+            uint32_t saved_second_begin = model->types[second].field_begin;
+
+            model->fields[0] = saved_second_field;
+            model->fields[1] = saved_first_field;
+            model->types[first].field_begin = saved_second_begin;
+            model->types[second].field_begin = saved_first_begin;
+            for (uint32_t i = 0; i < model->type_index_count; i++) {
+                uint32_t ordinal = model->type_index[i].ordinal;
+                if (ordinal == first || ordinal == second) {
+                    model->type_index[i].key.w[7] =
+                        model->types[ordinal].field_begin;
+                }
+            }
+            expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_FIELD,
+                               "noncanonical structure field ranges reject");
+
+            model->fields[0] = saved_first_field;
+            model->fields[1] = saved_second_field;
+            model->types[first].field_begin = saved_first_begin;
+            model->types[second].field_begin = saved_second_begin;
+            for (uint32_t i = 0; i < model->type_index_count; i++) {
+                uint32_t ordinal = model->type_index[i].ordinal;
+                if (ordinal == first || ordinal == second) {
+                    model->type_index[i].key.w[7] =
+                        model->types[ordinal].field_begin;
+                }
+            }
+            expect_model_valid(ctx, model,
+                               "restored canonical field ranges validate");
+        }
+    }
+    osprey_model_free(model);
+    osprey_free(ctx);
+}
+
+static void test_stage64_array_and_pointer_corruption(void)
+{
+    OspreyContext *ctx = make_array_permutation_context(0);
+    OspreyModel *model = NULL;
+    uint32_t array_id;
+
+    if (ctx == NULL || !build_model_fixture(ctx, &model)) {
+        osprey_model_free(model);
+        osprey_free(ctx);
+        return;
+    }
+    array_id = find_model_type_kind(model, OSPREY_TYPE_ARRAY);
+    if (array_id != UINT32_MAX && model->object_count != 0) {
+        uint8_t saved_role = model->objects[0].storage_role;
+        model->objects[0].storage_role = OSPREY_STORAGE_PRIMITIVE;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_ARRAY,
+                           "array ownership loss rejects");
+        model->objects[0].storage_role = saved_role;
+    }
+    expect_model_valid(ctx, model, "restored array ownership validates");
+    osprey_model_free(model);
+    osprey_free(ctx);
+
+    ctx = make_projection_context(0);
+    model = NULL;
+    if (ctx != NULL && build_model_fixture(ctx, &model)) {
+        int pointer_object = -1;
+        for (uint32_t i = 0; i < model->object_count; i++) {
+            if (model->objects[i].has_pointer_target) {
+                pointer_object = (int)i;
+                break;
+            }
+        }
+        if (pointer_object >= 0) {
+            OspreyAddress saved_target =
+                model->objects[pointer_object].pointer_target;
+            model->objects[pointer_object].pointer_target.offset = 128;
+            expect_model_error(ctx, model,
+                               OSPREY_MODEL_VALIDATION_OBJECT_REFERENCE,
+                               "pointer target corruption rejects");
+            model->objects[pointer_object].pointer_target = saved_target;
+            uint8_t saved_has = model->objects[pointer_object].has_pointer_target;
+            model->objects[pointer_object].has_pointer_target = 2;
+            expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_OBJECT_ROLE,
+                               "pointer presence corruption rejects");
+            model->objects[pointer_object].has_pointer_target = saved_has;
+        }
+        expect_model_valid(ctx, model, "restored pointer object validates");
+    }
+    osprey_model_free(model);
+    osprey_free(ctx);
+}
+
+static void test_stage64_validation_precedence(void)
+{
+    OspreyContext *ctx = make_projection_context(0);
+    OspreyModel *model = NULL;
+    if (ctx == NULL || !build_model_fixture(ctx, &model)) {
+        osprey_model_free(model);
+        osprey_free(ctx);
+        return;
+    }
+    /* Two defects from different validator families: the earlier family
+     * must own the reported error regardless of record position. */
+    uint32_t saved_type = model->objects[0].value_type_id;
+    model->objects[0].value_type_id = UINT32_MAX;
+    uint64_t saved_support = model->objects[model->object_count - 1]
+        .storage_support;
+    model->objects[model->object_count - 1].storage_support = UINT64_MAX;
+    OspreyModelValidationError error = OSPREY_MODEL_VALIDATION_NONE;
+    CHECK(osprey_model_validate(ctx, model, &error) == OSPREY_INVALID_MODEL &&
+              error == OSPREY_MODEL_VALIDATION_FIELD,
+          "earlier validator family owns multi-defect precedence");
+    model->objects[model->object_count - 1].storage_support = saved_support;
+    CHECK(osprey_model_validate(ctx, model, &error) == OSPREY_INVALID_MODEL &&
+              error == OSPREY_MODEL_VALIDATION_OBJECT_REFERENCE,
+          "reference family is checked before evidence after restoration");
+    /* Two declaration fields of one object family: chunk order precedes
+     * the later evidence corruption. */
+    OspreyChunk saved_chunk = model->objects[0].chunk;
+    model->objects[0].chunk = model->objects[1].chunk;
+    CHECK(osprey_model_validate(ctx, model, &error) == OSPREY_INVALID_MODEL &&
+              error == OSPREY_MODEL_VALIDATION_OBJECT_ORDER,
+          "object family order defect precedes evidence checks");
+    model->objects[0].chunk = saved_chunk;
+    CHECK(osprey_model_validate(ctx, model, &error) == OSPREY_INVALID_MODEL &&
+              error == OSPREY_MODEL_VALIDATION_OBJECT_REFERENCE,
+          "restored chunk leaves only the reference defect");
+    model->objects[0].value_type_id = saved_type;
+    CHECK(osprey_model_validate(ctx, model, &error) == OSPREY_OK,
+          "fully restored model validates again");
+    osprey_model_free(model);
+    osprey_free(ctx);
+}
+
+static void test_stage64_empty_array_model(void)
+{
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x640, 0x740);
+    OspreyContext *ctx = new_decode_context();
+    OspreyDecodeInput *input = NULL;
+    OspreyDecodePlan *plan = NULL;
+    OspreyModel *model = NULL;
+    OspreyModelValidationError error = OSPREY_MODEL_VALIDATION_NONE;
+
+    add_array_candidate(ctx, region, 0, 16, 8, 0.9);
+    add_extent(ctx, region, 0, 16);
+    CHECK(build_array_plan(ctx, &input, &plan) && plan != NULL &&
+              plan->decision_count == 0 && plan->array_count == 1 &&
+              plan->arrays[0].member_count == 0,
+          "empty selected array reaches immutable model construction");
+    CHECK(plan != NULL && osprey_model_build(ctx, plan, &model) == OSPREY_OK &&
+              model != NULL && model->object_count == 0 &&
+              model->type_count == 2 &&
+              osprey_model_validate(ctx, model, &error) == OSPREY_OK,
+          "empty selected array uses a primitive element fallback");
+    if (model != NULL && model->type_count == 2) {
+        OspreyDecodedType *array = &model->types[1];
+        uint64_t saved_support = array->direct_support;
+        array->direct_support++;
+        CHECK(osprey_model_validate(ctx, model, &error) ==
+                  OSPREY_INVALID_MODEL &&
+                  error == OSPREY_MODEL_VALIDATION_OBJECT_EVIDENCE,
+              "validator binds empty-array evidence to its graph candidate");
+        array->direct_support = saved_support;
+    }
+    osprey_model_free(model);
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+}
+
+static void test_stage64_field_displacement_evidence(void)
+{
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x642, 0x742);
+    OspreyContext *ctx = new_decode_context();
+    OspreyChunk chunk = make_chunk(region, 0, 8);
+    OspreyDecodeInput *input = NULL;
+    OspreyDecodePlan *plan = NULL;
+    OspreyModel *model = NULL;
+    OspreyModelValidationError error = OSPREY_MODEL_VALIDATION_NONE;
+    uint32_t field = add_field_candidate(ctx, chunk, make_address(region, 0),
+                                         0.8);
+    add_array_candidate(ctx, region, 0, 8, 8, 1.0);
+    add_extent(ctx, region, 0, 8);
+
+    CHECK(build_array_plan(ctx, &input, &plan) && plan != NULL &&
+              plan->array_count == 1 && plan->field_group_count == 0 &&
+              plan_find_decision(plan, &chunk) != NULL &&
+              plan_find_decision(plan, &chunk)->final_role ==
+                  OSPREY_STORAGE_ARRAY_ELEMENT,
+          "array selection displaces the provisional field role");
+    CHECK(plan != NULL && osprey_model_build(ctx, plan, &model) == OSPREY_OK &&
+              model != NULL &&
+              osprey_model_validate(ctx, model, &error) == OSPREY_OK,
+          "displaced field metadata uses the selected array evidence");
+    if (model != NULL && model->object_count != 0) {
+        OspreyDecodedObject *object = &model->objects[0];
+        uint64_t saved_support = object->storage_support;
+        uint64_t saved_rules = object->storage_source_rule_bits;
+        object->storage_support = UINT64_MAX;
+        object->storage_source_rule_bits = UINT64_MAX;
+        CHECK(osprey_model_validate(ctx, model, &error) ==
+                  OSPREY_INVALID_MODEL &&
+                  error == OSPREY_MODEL_VALIDATION_OBJECT_EVIDENCE,
+              "validator binds displaced array evidence to the array type");
+        object->storage_support = saved_support;
+        object->storage_source_rule_bits = saved_rules;
+    }
+    osprey_model_free(model);
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+    (void)field;
+}
+
+static void test_stage64_multi_view_array_members(void)
+{
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x641, 0x741);
+    OspreyContext *ctx = new_decode_context();
+    OspreyChunk narrow = make_chunk(region, 0, 4);
+    OspreyChunk full = make_chunk(region, 0, 8);
+    OspreyDecodeInput *input = NULL;
+    OspreyDecodePlan *plan = NULL;
+    OspreyModel *model = NULL;
+    OspreyModelValidationError error = OSPREY_MODEL_VALIDATION_NONE;
+    uint32_t narrow_id = add_chunk_var(ctx, OSPREY_PRED_PRIMITIVE_VAR,
+                                       narrow);
+    uint32_t full_id = add_chunk_var(ctx, OSPREY_PRED_PRIMITIVE_VAR, full);
+    set_belief(ctx, narrow_id, 0.7);
+    set_belief(ctx, full_id, 0.7);
+    add_array_candidate(ctx, region, 0, 8, 8, 1.0);
+    add_extent(ctx, region, 0, 8);
+
+    CHECK(build_array_plan(ctx, &input, &plan) && plan != NULL &&
+              plan->array_count == 1 && plan->arrays[0].member_count == 2,
+          "array plan retains multiple observed chunks at one element");
+    CHECK(plan != NULL && osprey_model_build(ctx, plan, &model) == OSPREY_OK &&
+              model != NULL &&
+              osprey_model_validate(ctx, model, &error) == OSPREY_OK,
+          "multi-view array uses the stride-width primitive fallback");
+    osprey_model_free(model);
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+}
+
+static void test_stage64_rejects_inconsistent_plan(void)
+{
+    OspreyContext *ctx = make_array_permutation_context(0);
+    OspreyDecodeInput *input = NULL;
+    OspreyDecodePlan *plan = NULL;
+    OspreyModel *model = NULL;
+    bool built = ctx != NULL && build_array_plan(ctx, &input, &plan);
+
+    CHECK(built && plan != NULL && plan->array_count != 0 &&
+              plan->arrays[0].member_count != 0,
+          "inconsistent-plan fixture owns an array member");
+    if (built && plan != NULL && plan->array_count != 0) {
+        uint32_t saved_count = plan->arrays[0].member_count;
+        plan->arrays[0].member_count = 0;
+        model = (OspreyModel *)(uintptr_t)1;
+        CHECK(osprey_model_build(ctx, plan, &model) == OSPREY_INVALID_MODEL &&
+                  model == NULL,
+              "model builder rejects an unlisted array-element role");
+        plan->arrays[0].member_count = saved_count;
+    }
+    osprey_model_free(model);
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+}
+
+static void test_stage64_model_permutation_and_atomic_stage(void)
+{
+    OspreyContext *left_ctx = make_projection_context(0);
+    OspreyContext *right_ctx = make_projection_context(1);
+    OspreyModel *left = NULL;
+    OspreyModel *right = NULL;
+    bool left_ok = left_ctx != NULL && build_model_fixture(left_ctx, &left);
+    bool right_ok = right_ctx != NULL && build_model_fixture(right_ctx, &right);
+    char *left_dump = left_ok ? dump_model(left) : NULL;
+    char *right_dump = right_ok ? dump_model(right) : NULL;
+    CHECK(left_ok && right_ok && left_dump != NULL && right_dump != NULL &&
+              strcmp(left_dump, right_dump) == 0,
+          "model construction and dump ignore source insertion order");
+    if (left_ok) {
+        CHECK(left_ctx->staged_model == NULL && left_ctx->model == NULL,
+              "direct model construction does not publish state");
+    }
+    free(left_dump);
+    free(right_dump);
+    osprey_model_free(left);
+    osprey_model_free(right);
+    osprey_free(left_ctx);
+    osprey_free(right_ctx);
+
+    OspreyContext *array_ctx = make_array_permutation_context(0);
+    OspreyModel *array_model = NULL;
+    if (array_ctx != NULL && build_model_fixture(array_ctx, &array_model)) {
+        OspreyModelValidationError error = OSPREY_MODEL_VALIDATION_NONE;
+        char *array_dump = dump_model(array_model);
+        CHECK(osprey_model_validate(array_ctx, array_model, &error) == OSPREY_OK &&
+                  array_model->aggregate_index_count == 2 &&
+                  strstr(array_dump != NULL ? array_dump : "", "[array]") != NULL,
+              "array definitions validate and appear in canonical dump");
+        if (array_model->object_count != 0) {
+            OspreyDecodedObject *object = &array_model->objects[0];
+            uint8_t saved_role = object->storage_role;
+            OspreyAddress saved_owner = object->owner_base;
+            object->storage_role = OSPREY_STORAGE_PRIMITIVE;
+            memset(&object->owner_base, 0, sizeof(object->owner_base));
+            CHECK(osprey_model_validate(array_ctx, array_model, &error) ==
+                      OSPREY_INVALID_MODEL &&
+                      error == OSPREY_MODEL_VALIDATION_ARRAY,
+                  "validator rejects an unclaimed object inside an array");
+            object->storage_role = saved_role;
+            object->owner_base = saved_owner;
+        }
+        free(array_dump);
+    }
+    osprey_model_free(array_model);
+    osprey_free(array_ctx);
+}
+
+static void test_stage64_by_value_cycle_rejection(void)
+{
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x650, 0x750);
+    OspreyContext *ctx = new_decode_context();
+    OspreyChunk chunk = make_chunk(region, 0, 8);
+    OspreyModel *model = NULL;
+    uint32_t struct_id;
+
+    if (ctx == NULL) {
+        osprey_free(ctx);
+        return;
+    }
+    add_field_candidate(ctx, chunk, make_address(region, 0), 0.9);
+    add_extent(ctx, region, 0, 16);
+    if (!build_model_fixture(ctx, &model)) {
+        osprey_model_free(model);
+        osprey_free(ctx);
+        return;
+    }
+    struct_id = find_model_type_kind(model, OSPREY_TYPE_STRUCT);
+    CHECK(struct_id != UINT32_MAX && model->field_count == 1 &&
+              model->object_count == 1,
+          "cycle fixture has one structure field");
+    if (struct_id != UINT32_MAX && model->field_count == 1 &&
+        model->object_count == 1) {
+        model->fields[0].value_type_id = struct_id;
+        model->objects[0].value_type_id = struct_id;
+        expect_model_error(ctx, model, OSPREY_MODEL_VALIDATION_CYCLE,
+                           "by-value self-cycle rejects");
+    }
+    osprey_model_free(model);
+    osprey_free(ctx);
+}
+
+static void test_stage64_recursive_pointer_is_legal(void)
+{
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x651, 0x751);
+    OspreyContext *ctx = new_decode_context();
+    OspreyChunk chunk = make_chunk(region, 0, sizeof(target_ulong));
+    OspreyModel *model = NULL;
+
+    if (ctx == NULL) {
+        osprey_free(ctx);
+        return;
+    }
+    add_field_candidate(ctx, chunk, make_address(region, 0), 0.9);
+    add_pointer_candidate(ctx, chunk, make_address(region, 0), 0.9);
+    add_extent(ctx, region, 0, 16);
+    if (build_model_fixture(ctx, &model)) {
+        expect_model_valid(ctx, model,
+                           "recursive pointer reference is legal");
+    }
+    osprey_model_free(model);
+    osprey_free(ctx);
+}
+
+static void test_stage64_runtime_span_bridge(void)
+{
+    OspreyContext *ctx = make_projection_context(0);
+    OspreyRegionInstance instance;
+    OspreyModel *model = NULL;
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x101, 0x500);
+    memset(&instance, 0, sizeof(instance));
+    instance.region = region;
+    instance.instance_id = 7;
+    instance.raw_base = UINT64_C(0x1000);
+    instance.raw_min = UINT64_C(0x1000);
+    instance.raw_max = UINT64_C(0x1100);
+    CHECK(ctx != NULL, "runtime span fixture context allocated");
+    if (ctx != NULL) g_array_append_val(ctx->region_instances, instance);
+    if (ctx != NULL && build_model_fixture(ctx, &model)) {
+        OspreyModelValidationError error = OSPREY_MODEL_VALIDATION_NONE;
+        const OspreyDecodedObject *scalar = osprey_lookup_raw(model, 0x1000);
+        const OspreyDecodedObject *primitive = osprey_lookup_raw(model, 0x1020);
+        uint64_t raw = 0;
+        uint64_t extent = 0;
+        CHECK(osprey_model_validate(ctx, model, &error) == OSPREY_OK &&
+                  model->raw_span_count == 3 && scalar != NULL &&
+                  primitive != NULL && scalar != primitive &&
+                  osprey_raw_extent(model, primitive, &raw, &extent) &&
+                  raw == 0x1020 && extent == 8,
+              "runtime spans retain checked chunk lookup bridge");
+        /* Corrupt each span-identity dimension in turn: ordinal, source
+         * instance, raw start, raw end, and canonical ordering. */
+        OspRawSpan *span = &model->raw_spans[0];
+        uint32_t saved_obj = span->obj_idx;
+        span->obj_idx = model->object_count;
+        CHECK(osprey_model_validate(ctx, model, &error) ==
+                  OSPREY_INVALID_MODEL &&
+                  error == OSPREY_MODEL_VALIDATION_RUNTIME_SPAN,
+              "out-of-range span object ordinal rejects");
+        span->obj_idx = saved_obj;
+        uint32_t saved_instance = span->source_instance_idx;
+        span->source_instance_idx = (uint32_t)ctx->region_instances->len + 1;
+        CHECK(osprey_model_validate(ctx, model, &error) ==
+                  OSPREY_INVALID_MODEL &&
+                  error == OSPREY_MODEL_VALIDATION_RUNTIME_SPAN,
+              "out-of-range span instance ordinal rejects");
+        span->source_instance_idx = saved_instance;
+        uint64_t saved_start = span->raw_start;
+        span->raw_start = span->raw_end;
+        CHECK(osprey_model_validate(ctx, model, &error) ==
+                  OSPREY_INVALID_MODEL,
+              "empty span interval rejects");
+        if (saved_start > instance.raw_min) {
+            span->raw_start = saved_start - 1;
+            CHECK(osprey_model_validate(ctx, model, &error) ==
+                      OSPREY_INVALID_MODEL,
+                  "span below the instance raw minimum rejects");
+        }
+        span->raw_start = saved_start;
+        span->raw_start = saved_start + 1;
+        CHECK(osprey_model_validate(ctx, model, &error) ==
+                  OSPREY_INVALID_MODEL,
+              "span start mismatch rejects");
+        span->raw_start = saved_start;
+        if (model->raw_span_count > 1) {
+            uint32_t saved_second_obj = model->raw_spans[1].obj_idx;
+            model->raw_spans[1].obj_idx = span->obj_idx;
+            CHECK(osprey_model_validate(ctx, model, &error) ==
+                      OSPREY_INVALID_MODEL &&
+                      error == OSPREY_MODEL_VALIDATION_RUNTIME_SPAN,
+                  "duplicate span object rejects");
+            model->raw_spans[1].obj_idx = saved_second_obj;
+        }
+        uint64_t saved_end = span->raw_end;
+        span->raw_end = span->raw_start - 1;
+        CHECK(osprey_model_validate(ctx, model, &error) ==
+                  OSPREY_INVALID_MODEL,
+              "span end below its start rejects");
+        if (saved_end + 1 <= instance.raw_max) {
+            /* Widening any span by one byte must reject: the raw end must
+             * equal the checked chunk width for every span. */
+            span->raw_end = saved_end + 1;
+            CHECK(osprey_model_validate(ctx, model, &error) ==
+                      OSPREY_INVALID_MODEL,
+                  "span width beyond the chunk rejects");
+            span->raw_end = saved_end;
+        }
+        span->is_chunk = 0;
+        CHECK(osprey_model_validate(ctx, model, &error) ==
+                  OSPREY_INVALID_MODEL,
+              "non-chunk span class rejects");
+        span->is_chunk = 1;
+        OspRawSpan first = model->raw_spans[0];
+        OspRawSpan second = model->raw_spans[1];
+        model->raw_spans[0] = second;
+        model->raw_spans[1] = first;
+        CHECK(osprey_model_validate(ctx, model, &error) ==
+                  OSPREY_INVALID_MODEL,
+              "unsorted span ordering rejects");
+        model->raw_spans[0] = first;
+        model->raw_spans[1] = second;
+        CHECK(osprey_model_validate(ctx, model, &error) == OSPREY_OK,
+              "restored spans validate again");
+    }
+    osprey_model_free(model);
+    osprey_free(ctx);
+}
+
+static void test_stage64_canonical_runtime_histories(void)
+{
+    OspreyRegionId global = make_region(OSPREY_REGION_GLOBAL, 0x101, 0x500);
+    OspreyContext *left_ctx = make_projection_context(0);
+    OspreyContext *right_ctx = make_projection_context(1);
+    OspreyModel *left = NULL;
+    OspreyModel *right = NULL;
+    char *left_dump = NULL;
+    char *right_dump = NULL;
+
+    append_runtime_instance(left_ctx, global, UINT64_C(0x1000));
+    append_runtime_instance(left_ctx, global, UINT64_C(0x2000));
+    append_runtime_instance(right_ctx, global, UINT64_C(0x2000));
+    append_runtime_instance(right_ctx, global, UINT64_C(0x1000));
+    if (left_ctx != NULL && right_ctx != NULL) {
+        bool left_ok = build_model_fixture(left_ctx, &left);
+        bool right_ok = build_model_fixture(right_ctx, &right);
+        left_dump = left_ok ? dump_model(left) : NULL;
+        right_dump = right_ok ? dump_model(right) : NULL;
+        CHECK(left_ok && right_ok && left_dump != NULL && right_dump != NULL &&
+                  strcmp(left_dump, right_dump) == 0,
+              "model dump ignores raw-instance and graph-ID history");
+        if (left_ok) expect_model_valid(left_ctx, left,
+                                        "left runtime history validates");
+        if (right_ok) expect_model_valid(right_ctx, right,
+                                         "right runtime history validates");
+    }
+    free(left_dump);
+    free(right_dump);
+    osprey_model_free(left);
+    osprey_model_free(right);
+    osprey_free(left_ctx);
+    osprey_free(right_ctx);
+}
+
+static void test_stage64_model_allocation_atomicity(void)
+{
+    OspreyContext *ctx = make_projection_context(0);
+    OspreyRegionId global = make_region(OSPREY_REGION_GLOBAL, 0x101, 0x500);
+    OspreyDecodeInput *input = NULL;
+    append_runtime_instance(ctx, global, UINT64_C(0x1000));
+    OspreyDecodePlan *plan = NULL;
+    bool built = ctx != NULL && build_array_plan(ctx, &input, &plan);
+    bool saw_success = false;
+
+    CHECK(built && plan != NULL, "model allocation fixture builds plan");
+    for (int64_t failure = 0; built && failure < 512; failure++) {
+        OspreyModel *model = (OspreyModel *)(uintptr_t)1;
+        osprey_decode_test_set_alloc_fail_after(failure);
+        OspreyStatus status = osprey_model_build(ctx, plan, &model);
+        if (status == OSPREY_OK) {
+            CHECK(model != NULL, "model allocation success publishes output");
+            osprey_model_free(model);
+            saw_success = true;
+            break;
+        }
+        CHECK(status == OSPREY_INVALID_MODEL && model == NULL,
+              "model allocation failure clears output");
+    }
+    osprey_decode_test_set_alloc_fail_after(-1);
+    CHECK(saw_success, "model allocation sweep reaches success");
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
+    osprey_free(ctx);
+}
+
+static void test_stage64_atomic_coordinator(void)
+{
+    OspreyContext *ctx = make_projection_context(0);
+    OspreyModel *old_staged = NULL;
+    OspreyStatus status;
+
+    osprey_test_log_reset();
+    osprey_decode_test_set_prevalidate_hook(corrupt_model_value_type);
+    status = osprey_decode(ctx);
+    CHECK(status == OSPREY_INVALID_MODEL && ctx->staged_model == NULL &&
+              ctx->model == NULL,
+          "pre-validation corruption rejects without publication");
+    CHECK(strstr(osprey_test_log_contents(), "[decode]") == NULL,
+          "rejected decode emits no success aggregate");
+
+    osprey_decode_test_set_prevalidate_hook(NULL);
+    status = osprey_decode(ctx);
+    old_staged = ctx->staged_model;
+    CHECK(status == OSPREY_OK && old_staged != NULL,
+          "clean decode publishes only after validation");
+    osprey_tx_install(ctx);
+    OspreyModel *old_committed = ctx->model;
+    CHECK(old_committed == old_staged && ctx->staged_model == NULL,
+          "validated model commits through the transaction install point");
+    CHECK(strcmp(osprey_test_log_contents(),
+                 "[osprey] [decode] [objects 6] [types 5] [primitive 2] "
+                 "[scalar 1] [fields 3] [arrays 0] [pointers 1] "
+                 "[discarded-hard-false 0] [discarded-threshold 0] "
+                 "[discarded-role 0] [discarded-layout 1]\n") == 0,
+          "successful decode emits exact aggregate counters");
+
+    osprey_test_log_reset();
+    osprey_decode_test_set_prevalidate_hook(corrupt_model_value_type);
+    status = osprey_decode(ctx);
+    CHECK(status == OSPREY_INVALID_MODEL && ctx->staged_model == NULL &&
+              ctx->model == old_committed,
+          "failed replacement preserves committed model ownership");
+    CHECK(strstr(osprey_test_log_contents(), "[decode]") == NULL,
+          "failed replacement emits no success aggregate");
+    osprey_decode_test_set_prevalidate_hook(NULL);
+    status = osprey_decode(ctx);
+    OspreyModel *replacement = ctx->staged_model;
+    CHECK(status == OSPREY_OK && replacement != NULL &&
+              replacement != old_committed,
+          "later clean decode recovers after failed replacement");
+    osprey_tx_install(ctx);
+    CHECK(ctx->model == replacement && ctx->staged_model == NULL,
+          "successful replacement commits exactly once");
+    osprey_free(ctx);
+}
+
 static void test_stage63_allocation_atomicity(void)
 {
     OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x631, 0x731);
@@ -2710,7 +3890,26 @@ int main(void)
     RUN(test_stage63_evidence_and_dump);
     RUN(test_stage63_permutations);
     RUN(test_stage63_allocation_atomicity);
-    fprintf(stderr, "stage6.3: %u/%u tests passed\n", executed - failures,
+    RUN(test_stage64_immutable_model_and_validation);
+    RUN(test_stage64_header_count_matrix);
+    RUN(test_stage64_ledger_corruption_matrix);
+    RUN(test_stage64_type_field_object_index_matrix);
+    RUN(test_stage64_type_size_reference_and_aggregate_matrix);
+    RUN(test_stage64_noncanonical_field_ranges);
+    RUN(test_stage64_array_and_pointer_corruption);
+    RUN(test_stage64_validation_precedence);
+    RUN(test_stage64_empty_array_model);
+    RUN(test_stage64_field_displacement_evidence);
+    RUN(test_stage64_multi_view_array_members);
+    RUN(test_stage64_rejects_inconsistent_plan);
+    RUN(test_stage64_model_permutation_and_atomic_stage);
+    RUN(test_stage64_by_value_cycle_rejection);
+    RUN(test_stage64_recursive_pointer_is_legal);
+    RUN(test_stage64_runtime_span_bridge);
+    RUN(test_stage64_canonical_runtime_histories);
+    RUN(test_stage64_model_allocation_atomicity);
+    RUN(test_stage64_atomic_coordinator);
+    fprintf(stderr, "stage6.4: %u/%u tests passed\n", executed - failures,
             registered);
     return failures == 0 ? 0 : 1;
 }

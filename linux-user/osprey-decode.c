@@ -1,10 +1,10 @@
 /*
  * OSPREY posterior decoder.
  *
- * Stage 6.1 adds the canonical owned belief projection below without changing
- * the legacy production selection path.  Stage 6.2 selects provisional
- * scalar/field/pointer roles; Stage 6.3 validates and schedules arrays before
- * finalizing storage ownership.  Stage 6.4 owns the production clean cutover.
+ * Stage 6.1 builds the canonical owned belief projection.  Stage 6.2 selects
+ * provisional scalar/field/pointer roles; Stage 6.3 validates and schedules
+ * arrays before finalizing storage ownership.  Stage 6.4 builds, validates,
+ * and publishes the immutable model atomically.
  * The complete decoder design is reference §10:
  *
  * Plan §10 (design choice):
@@ -16,11 +16,10 @@
  *  4. Validate arrays per (region,stride), then run one region-wide weighted
  *     interval schedule across all strides using adjusted logit scores.
  *  5. At most one target base per pointer chunk.
- *  6. Deterministic names: struct_H_<site>, array_H_<site>, etc.
- *  7. Emit width-preserving placeholders (uint64_t/byte[8]/void *)
- *     for primitive chunks; the pointer/spatial decoding is what the
- *     binradar consumer needs (pointer -> target allocation, size).
- *  8. Every output carries its posterior.
+ *  6. Deterministic names use complete canonical region/base identity.
+ *  7. Emit width-preserving prim_b<width> placeholders; do not invent
+ *     signedness or semantic primitive names.
+ *  8. Every selected role and aggregate retains its exact evidence.
  */
 
 #include "osprey.h"
@@ -34,9 +33,6 @@
 
 /* Diagnostic sink (snapshot.c). */
 void log_msg(const char *fmt, ...);
-
-#define OSPREY_DECODE_MAX_FIELDS_PER_BASE 256u
-#define OSPREY_DECODE_MAX_ARRAYS_PER_SIDE 512u
 
 /* ------------------------------------------------------------------ */
 /* Stage 6.1 canonical decoder input                                   */
@@ -3758,566 +3754,2834 @@ bool osprey_decode_plan_dump_file(const OspreyDecodePlan *plan, FILE *out)
     return fprintf(out, "]\n") >= 0 && ferror(out) == 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* Model helpers                                                       */
-/* ------------------------------------------------------------------ */
-
-static void bucket_free(gpointer p) {
-    g_array_free((GArray *)p, TRUE);
-}
-
-static OspreyModel *model_new(void) {
-    OspreyModel *m = g_new0(OspreyModel, 1);
-    m->objects = g_array_new(FALSE, FALSE, sizeof(OspreyDecodedObject));
-    m->by_chunk = g_hash_table_new_full(osprey_key_hash, osprey_key_equal,
-                                        osprey_key_free, NULL);
-    m->type_names = g_array_new(FALSE, FALSE, sizeof(char *));
-    m->raw_spans = g_array_new(FALSE, FALSE, sizeof(OspRawSpan));
-    m->fields_by_base = g_hash_table_new_full(osprey_key_hash,
-                                              osprey_key_equal,
-                                              osprey_key_free, bucket_free);
-    m->ptr_by_chunk = g_hash_table_new_full(osprey_key_hash,
-                                            osprey_key_equal,
-                                            osprey_key_free, NULL);
-    return m;
-}
-
-static uint32_t model_add_type_name(OspreyModel *m, const char *name) {
-    for (guint i = 0; i < m->type_names->len; i++) {
-        if (strcmp(g_array_index(m->type_names, char *, i), name) == 0) {
-            return i;
-        }
-    }
-    char *copy = g_strdup(name);
-    g_array_append_val(m->type_names, copy);
-    return m->type_names->len - 1;
-}
-
-/* Insert or merge; returns the object index. */
-static uint32_t model_upsert(OspreyModel *m, const OspreyDecodedObject *o) {
-    OspreyKey k = osprey_chunk_key(&o->chunk);
-    gpointer existing = g_hash_table_lookup(m->by_chunk, &k);
-    if (existing != NULL) {
-        uint32_t idx = (uint32_t)(uintptr_t)existing - 1;
-        OspreyDecodedObject *cur = &g_array_index(m->objects,
-                                                  OspreyDecodedObject, idx);
-        /* keep the higher-posterior interpretation */
-        if (o->posterior > cur->posterior) {
-            *cur = *o;
-        }
-        return idx;
-    }
-    g_array_append_val(m->objects, *o);
-    uint32_t idx = m->objects->len - 1;
-    g_hash_table_insert(m->by_chunk, osprey_key_new(&k),
-                        GSIZE_TO_POINTER((gsize)idx + 1));
-    return idx;
-}
 
 /* ------------------------------------------------------------------ */
-/* Region name parts for deterministic naming                          */
+/* Stage 6.4 immutable model construction                             */
 /* ------------------------------------------------------------------ */
 
-static const char *region_tag(const OspreyRegionId *r) {
-    switch (r->kind) {
-    case OSPREY_REGION_HEAP_SITE: return "H";
-    case OSPREY_REGION_STACK_FUNCTION: return "S";
-    default: return "G";
+static OspreyDecodePreValidateTestHook osprey_decode_prevalidate_hook;
+
+void osprey_decode_test_set_prevalidate_hook(
+    OspreyDecodePreValidateTestHook hook)
+{
+    osprey_decode_prevalidate_hook = hook;
+}
+
+typedef struct DecodeTypeRef {
+    uint8_t kind;                 /* OSPREY_TYPE_PRIMITIVE/POINTER */
+    uint8_t target_is_void;
+    uint8_t target_aggregate_kind;
+    uint8_t reserved;
+    uint64_t primitive_size;
+    OspreyAddress target;
+} DecodeTypeRef;
+
+typedef struct DecodeFieldWork {
+    OspreyDecodedField field;
+    DecodeTypeRef value_ref;
+} DecodeFieldWork;
+
+typedef struct DecodeTypeWork {
+    uint8_t kind;
+    uint8_t target_is_void;
+    uint8_t target_aggregate_kind;
+    uint8_t reserved;
+    uint64_t size;
+    uint64_t element_count;
+    uint64_t element_size;
+    OspreyAddress canonical_base;
+    DecodeTypeRef element_ref;
+    DecodeTypeRef target_ref;
+    uint32_t element_work_id;
+    uint32_t target_work_id;
+    uint32_t field_begin;
+    uint32_t field_count;
+    double posterior;
+    uint64_t direct_support;
+    uint64_t source_rule_bits;
+    uint32_t old_index;
+} DecodeTypeWork;
+
+static bool decode_address_zero(const OspreyAddress *address)
+{
+    OspreyAddress zero;
+    memset(&zero, 0, sizeof(zero));
+    return address != NULL && memcmp(address, &zero, sizeof(zero)) == 0;
+}
+
+static bool decode_type_ref_equal(const DecodeTypeRef *left,
+                                  const DecodeTypeRef *right)
+{
+    if (left == NULL || right == NULL || left->kind != right->kind) {
+        return false;
+    }
+    if (left->kind == OSPREY_TYPE_PRIMITIVE) {
+        return left->primitive_size == right->primitive_size;
+    }
+    if (left->kind != OSPREY_TYPE_POINTER ||
+        left->target_is_void != right->target_is_void ||
+        left->target_aggregate_kind != right->target_aggregate_kind) {
+        return false;
+    }
+    return decode_address_compare(&left->target, &right->target) == 0;
+}
+
+static int decode_type_ref_compare(const DecodeTypeRef *left,
+                                   const DecodeTypeRef *right)
+{
+    int c;
+
+    if (left == NULL || right == NULL) return left == right ? 0 :
+        (left == NULL ? -1 : 1);
+    c = decode_cmp_u64(left->kind, right->kind);
+    if (c != 0) return c;
+    if (left->kind == OSPREY_TYPE_PRIMITIVE) {
+        return decode_cmp_u64(left->primitive_size, right->primitive_size);
+    }
+    c = decode_cmp_u64(left->target_is_void, right->target_is_void);
+    if (c != 0) return c;
+    c = decode_cmp_u64(left->target_aggregate_kind,
+                       right->target_aggregate_kind);
+    return c != 0 ? c : decode_address_compare(&left->target, &right->target);
+}
+
+static int decode_type_work_compare(const DecodeTypeWork *left,
+                                    const DecodeTypeWork *right,
+                                    const DecodeFieldWork *fields)
+{
+    int c;
+
+    if (left == NULL || right == NULL) return left == right ? 0 :
+        (left == NULL ? -1 : 1);
+    c = decode_cmp_u64(left->kind, right->kind);
+    if (c != 0) return c;
+    switch (left->kind) {
+    case OSPREY_TYPE_PRIMITIVE:
+        return decode_cmp_u64(left->size, right->size);
+    case OSPREY_TYPE_POINTER:
+        c = decode_cmp_u64(left->target_is_void, right->target_is_void);
+        if (c != 0) return c;
+        c = decode_cmp_u64(left->target_aggregate_kind,
+                           right->target_aggregate_kind);
+        return c != 0 ? c : decode_address_compare(&left->canonical_base,
+                                                   &right->canonical_base);
+    case OSPREY_TYPE_ARRAY:
+        c = decode_address_compare(&left->canonical_base,
+                                   &right->canonical_base);
+        if (c != 0) return c;
+        c = decode_cmp_u64(left->size, right->size);
+        if (c != 0) return c;
+        c = decode_cmp_u64(left->element_count, right->element_count);
+        if (c != 0) return c;
+        c = decode_cmp_u64(left->element_size, right->element_size);
+        return c != 0 ? c : decode_type_ref_compare(&left->element_ref,
+                                                    &right->element_ref);
+    case OSPREY_TYPE_STRUCT:
+        c = decode_address_compare(&left->canonical_base,
+                                   &right->canonical_base);
+        if (c != 0) return c;
+        c = decode_cmp_u64(left->field_count, right->field_count);
+        if (c != 0) return c;
+        for (uint32_t i = 0; i < left->field_count; i++) {
+            const DecodeFieldWork *lf = &fields[left->field_begin + i];
+            const DecodeFieldWork *rf = &fields[right->field_begin + i];
+            c = decode_cmp_u64(lf->field.relative_offset,
+                               rf->field.relative_offset);
+            if (c != 0) return c;
+            c = decode_chunk_compare(&lf->field.chunk, &rf->field.chunk);
+            if (c != 0) return c;
+            c = decode_type_ref_compare(&lf->value_ref, &rf->value_ref);
+            if (c != 0) return c;
+        }
+        return 0;
+    default:
+        return 0;
     }
 }
 
-static void region_name(const OspreyRegionId *r, char *buf, size_t n) {
-    snprintf(buf, n, "%s_%llx", region_tag(r),
-             (unsigned long long)r->site_offset);
+static bool decode_type_work_append(DecodeTypeWork *works, uint32_t *count,
+                                    uint32_t capacity,
+                                    const DecodeTypeWork *value,
+                                    uint32_t *id_out)
+{
+    if (works == NULL || count == NULL || value == NULL ||
+        *count >= capacity || *count == UINT32_MAX) return false;
+    works[*count] = *value;
+    works[*count].old_index = *count;
+    if (id_out != NULL) *id_out = *count;
+    (*count)++;
+    return true;
 }
 
-/* ------------------------------------------------------------------ */
-/* Decode: build the OspreyModel from posterior predicates            */
-/* ------------------------------------------------------------------ */
-
-static OspreyStatus decode_graph(OspreyContext *ctx) {
-    OspreyGraph *g = ctx->graph;
-    OspreyModel *m = ctx->staged_model;
-    if (m == NULL) return OSPREY_INVALID_MODEL;
-    double thresh = ctx->config.report_threshold;
-    /* Pass 1: primitives (with their chunk key) and pointers. */
-    GHashTable *prim_by_chunk = g_hash_table_new_full(osprey_key_hash,
-                                                     osprey_key_equal,
-                                                     osprey_key_free, NULL);
-    for (guint i = 0; i < g->vars->len; i++) {
-        OspreyVar *v = &g_array_index(g->vars, OspreyVar, i);
-        if (v->hard_false) continue;
-        if (v->belief < thresh) continue;
-        switch (v->kind) {
-        case OSPREY_PRED_PRIMITIVE_VAR:
-            {
-                OspreyKey ck = osprey_chunk_key(&v->payload.chunk);
-                g_hash_table_insert(prim_by_chunk, osprey_key_new(&ck),
-                                    GSIZE_TO_POINTER(v->id + 1));
-            }
-            break;
-        case OSPREY_PRED_POINTER:
-            /* pointer: at most one target base per chunk (§10.5),
-             * selected by max posterior; independent of the
-             * scalar/field exclusivity on the same chunk (§10.2). */
-            {
-                OspreyKey ck = osprey_chunk_key(&v->payload.attached.chunk);
-                gpointer cur = g_hash_table_lookup(m->ptr_by_chunk,
-                                                   &ck);
-                OspreyDecodedObject o;
-                memset(&o, 0, sizeof(o));
-                o.chunk = v->payload.attached.chunk;
-                o.kind = OSPREY_DECODED_POINTER;
-                o.posterior = v->belief;
-                o.parent_region = v->payload.attached.base.region;
-                o.parent_offset = v->payload.attached.base.offset;
-                if (cur != NULL) {
-                    uint32_t cidx = (uint32_t)(uintptr_t)cur - 1;
-                    OspreyDecodedObject *cur_o = &g_array_index(
-                        m->objects, OspreyDecodedObject, cidx);
-                    if (o.posterior <= cur_o->posterior) break;
-                    *cur_o = o;
-                } else {
-                    uint32_t idx = m->objects->len;
-                    g_array_append_val(m->objects, o);
-                    g_hash_table_insert(m->ptr_by_chunk,
-                                        osprey_key_new(&ck),
-                                        GSIZE_TO_POINTER((gsize)idx + 1));
-                }
-            }
-            break;
-        case OSPREY_PRED_SCALAR:
-            {
-                OspreyDecodedObject o;
-                memset(&o, 0, sizeof(o));
-                o.chunk = v->payload.chunk;
-                o.kind = OSPREY_DECODED_SCALAR;
-                o.posterior = v->belief;
-                model_upsert(m, &o);
-            }
-            break;
-        case OSPREY_PRED_FIELD_OF:
-            {
-                OspreyDecodedObject o;
-                memset(&o, 0, sizeof(o));
-                o.chunk = v->payload.attached.chunk;
-                o.kind = OSPREY_DECODED_FIELD;
-                o.posterior = v->belief;
-                o.parent_region = v->payload.attached.base.region;
-                o.parent_offset = v->payload.attached.base.offset;
-                uint32_t idx = model_upsert(m, &o);
-                /* index fields by base for the consumer */
-                OspreyKey bk = osprey_base_key(&o.parent_region,
-                                               o.parent_offset);
-                GArray *list = g_hash_table_lookup(m->fields_by_base,
-                                                   &bk);
-                if (list == NULL) {
-                    list = g_array_new(FALSE, FALSE, sizeof(uint32_t));
-                    g_hash_table_insert(m->fields_by_base,
-                                        osprey_key_new(&bk), list);
-                }
-                g_array_append_val(list, idx);
-            }
-            break;
-        case OSPREY_PRED_ARRAY_START:
-            {
-                OspreyDecodedObject o;
-                memset(&o, 0, sizeof(o));
-                o.chunk.address = v->payload.addr;
-                o.chunk.size = 0; /* start marker */
-                o.kind = OSPREY_DECODED_ARRAY_START;
-                o.posterior = v->belief;
-                model_upsert(m, &o);
-            }
-            break;
-        default:
-            break;
+static bool decode_type_add_primitive(DecodeTypeWork *works, uint32_t *count,
+                                      uint32_t capacity, uint64_t size,
+                                      uint32_t *id_out)
+{
+    if (size == 0) return false;
+    for (uint32_t i = 0; i < *count; i++) {
+        if (works[i].kind == OSPREY_TYPE_PRIMITIVE &&
+            works[i].size == size) {
+            if (id_out != NULL) *id_out = i;
+            return true;
         }
     }
-    g_hash_table_destroy(prim_by_chunk);
+    DecodeTypeWork value;
+    memset(&value, 0, sizeof(value));
+    value.kind = OSPREY_TYPE_PRIMITIVE;
+    value.size = size;
+    return decode_type_work_append(works, count, capacity, &value, id_out);
+}
 
-    /* Pass 2: arrays by weighted interval scheduling per (region,
-     * stride).  Interval weight = logit(P(Array)); avoid spans covered
-     * by scalar/field primitives. */
-    {
-        GArray *arrs = g_array_new(FALSE, FALSE, sizeof(uint32_t));
-        for (guint i = 0; i < g->vars->len; i++) {
-            OspreyVar *v = &g_array_index(g->vars, OspreyVar, i);
-            if (v->kind != OSPREY_PRED_ARRAY) continue;
-            if (v->hard_false || v->belief < thresh) continue;
-            uint32_t id = v->id;
-            g_array_append_val(arrs, id);
+static bool decode_type_add_pointer(DecodeTypeWork *works, uint32_t *count,
+                                    uint32_t capacity,
+                                    const DecodeTypeRef *target,
+                                    uint32_t *id_out)
+{
+    if (target == NULL || target->kind != OSPREY_TYPE_POINTER) return false;
+    for (uint32_t i = 0; i < *count; i++) {
+        if (works[i].kind != OSPREY_TYPE_POINTER) continue;
+        if (works[i].target_is_void == target->target_is_void &&
+            works[i].target_aggregate_kind == target->target_aggregate_kind &&
+            decode_address_compare(&works[i].canonical_base,
+                                   &target->target) == 0) {
+            if (id_out != NULL) *id_out = i;
+            return true;
         }
-        /* group by (region, stride) and run interval scheduling per
-         * group; bounded by OSPREY_DECODE_MAX_ARRAYS_PER_SIDE. */
-        if (arrs->len > OSPREY_DECODE_MAX_ARRAYS_PER_SIDE) {
-            g_array_free(arrs, TRUE);
-            return OSPREY_LIMIT_EXCEEDED;
-        }
-        {
-            for (guint i = 0; i < arrs->len; i++) {
-                uint32_t id = g_array_index(arrs, uint32_t, i);
-                OspreyVar *v = &g_array_index(g->vars, OspreyVar, id);
-                OspreyDecodedObject o;
-                memset(&o, 0, sizeof(o));
-                o.chunk.address.region = v->payload.segment.a1.region;
-                o.chunk.address.offset = v->payload.segment.a1.offset;
-                o.chunk.size = (uint64_t)v->payload.segment.size;
-                o.kind = OSPREY_DECODED_ARRAY;
-                o.posterior = v->belief;
-                o.parent_region = v->payload.segment.a2.region;
-                o.parent_offset = v->payload.segment.a2.offset;
-                model_upsert(m, &o);
-            }
-        }
-        g_array_free(arrs, TRUE);
     }
+    DecodeTypeWork value;
+    memset(&value, 0, sizeof(value));
+    value.kind = OSPREY_TYPE_POINTER;
+    value.size = sizeof(target_ulong);
+    value.target_is_void = target->target_is_void;
+    value.target_aggregate_kind = target->target_aggregate_kind;
+    value.canonical_base = target->target;
+    value.target_ref = *target;
+    return decode_type_work_append(works, count, capacity, &value, id_out);
+}
 
-    /* Pass 3: struct bases — field groups per base with non-overlap. */
-    {
-        GHashTable *bases = g_hash_table_new_full(osprey_key_hash,
-                                                  osprey_key_equal,
-                                                  osprey_key_free,
-                                                  bucket_free);
-        for (guint i = 0; i < g->vars->len; i++) {
-            OspreyVar *v = &g_array_index(g->vars, OspreyVar, i);
-            if (v->kind != OSPREY_PRED_FIELD_OF) continue;
-            if (v->hard_false || v->belief < thresh) continue;
-            OspreyKey bk = osprey_base_key(&v->payload.attached.base.region,
-                                           v->payload.attached.base.offset);
-            GArray *fields = g_hash_table_lookup(bases, &bk);
-            if (fields == NULL) {
-                fields = g_array_new(FALSE, FALSE, sizeof(uint32_t));
-                g_hash_table_insert(bases, osprey_key_new(&bk), fields);
-            }
-            uint32_t id = v->id;
-            g_array_append_val(fields, id);
+static bool decode_model_extent_contains(const OspreyContext *ctx,
+                                         const OspreyAddress *address)
+{
+    if (ctx == NULL || ctx->graph == NULL || ctx->graph->extents == NULL ||
+        address == NULL) return false;
+    for (guint i = 0; i < ctx->graph->extents->len; i++) {
+        const OspreyRegionExtent *extent = &g_array_index(
+            ctx->graph->extents, OspreyRegionExtent, i);
+        if (decode_region_compare(&extent->region, &address->region) == 0 &&
+            address->offset >= extent->lo && address->offset < extent->hi) {
+            return true;
         }
-        GHashTableIter bit;
-        gpointer rk, arr_ptr;
-        g_hash_table_iter_init(&bit, bases);
-        while (g_hash_table_iter_next(&bit, &rk, &arr_ptr)) {
-            GArray *fields = (GArray *)arr_ptr;
-            if (fields->len > OSPREY_DECODE_MAX_FIELDS_PER_BASE) {
-                g_hash_table_destroy(bases);
-                return OSPREY_LIMIT_EXCEEDED;
-            }
-            /* sort by offset */
-            uint32_t *ids = (uint32_t *)fields->data;
-            for (guint i = 1; i < fields->len; i++) {
-                uint32_t id = ids[i];
-                guint j = i;
-                while (j > 0 &&
-                       g_array_index(g->vars, OspreyVar, ids[j - 1])
-                           .payload.attached.chunk.address.offset >
-                       g_array_index(g->vars, OspreyVar, id)
-                           .payload.attached.chunk.address.offset) {
-                    ids[j] = ids[j - 1];
-                    j--;
-                }
-                ids[j] = id;
-            }
-            /* greedy non-overlapping selection by start offset; fields
-             * already entered the model in pass 1, so this only decides
-             * which fields stay (drop the overlapping ones). */
-            int64_t last_end = INT64_MIN;
-            for (guint i = 0; i < fields->len; i++) {
-                OspreyVar *v = &g_array_index(g->vars, OspreyVar, ids[i]);
-                int64_t off = v->payload.attached.chunk.address.offset;
-                int64_t end = off + (int64_t)v->payload.attached.chunk.size;
-                if (off < last_end) {
-                    /* overlap: drop the lower-posterior field */
-                    OspreyKey ck = osprey_chunk_key(
-                        &v->payload.attached.chunk);
-                    gpointer cur = g_hash_table_lookup(m->by_chunk,
-                                                       &ck);
-                    if (cur != NULL) {
-                        uint32_t idx = (uint32_t)(uintptr_t)cur - 1;
-                        OspreyDecodedObject *cur_o = &g_array_index(
-                            m->objects, OspreyDecodedObject, idx);
-                        cur_o->posterior = 0.0; /* discarded */
-                    }
-                    continue;
-                }
-                last_end = end;
-            }
-        }
-        /* emit one STRUCT base object per surviving base */
-        g_hash_table_iter_init(&bit, bases);
-        while (g_hash_table_iter_next(&bit, &rk, &arr_ptr)) {
-            GArray *fields = (GArray *)arr_ptr;
-            if (fields->len == 0) continue;
-            OspreyVar *f0 = &g_array_index(g->vars, OspreyVar,
-                                           g_array_index(fields, uint32_t, 0));
-            OspreyDecodedObject o;
-            memset(&o, 0, sizeof(o));
-            o.chunk.address.region = f0->payload.attached.base.region;
-            o.chunk.address.offset = f0->payload.attached.base.offset;
-            o.chunk.size = 0;
-            o.kind = OSPREY_DECODED_STRUCT;
-            o.posterior = f0->belief;
-            o.parent_region = f0->payload.attached.base.region;
-            o.parent_offset = f0->payload.attached.base.offset;
-            model_upsert(m, &o);
-        }
-        g_hash_table_destroy(bases);
     }
+    return false;
+}
 
-    /* Pass 4: raw spans from merged region instances. */
-    for (guint j = 0; j < m->objects->len; j++) {
-        OspreyDecodedObject *o = &g_array_index(m->objects,
-                                                OspreyDecodedObject, j);
-        if (o->kind == OSPREY_DECODED_SCALAR ||
-            o->kind == OSPREY_DECODED_POINTER ||
-            o->kind == OSPREY_DECODED_FIELD) {
+static bool decode_model_extent_span_contains(const OspreyContext *ctx,
+                                              const OspreyRegionId *region,
+                                              int64_t lo, int64_t hi)
+{
+    if (ctx == NULL || ctx->graph == NULL || ctx->graph->extents == NULL ||
+        region == NULL || lo > hi) return false;
+    for (guint i = 0; i < ctx->graph->extents->len; i++) {
+        const OspreyRegionExtent *extent = &g_array_index(
+            ctx->graph->extents, OspreyRegionExtent, i);
+        if (decode_region_compare(&extent->region, region) == 0 &&
+            lo >= extent->lo && hi <= extent->hi) return true;
+    }
+    return false;
+}
+
+static bool decode_plan_find_aggregate(const OspreyDecodePlan *plan,
+                                       const OspreyAddress *base,
+                                       uint8_t *kind_out)
+{
+    bool found = false;
+    uint8_t kind = 0;
+
+    if (plan == NULL || base == NULL || kind_out == NULL) return false;
+    for (uint32_t i = 0; i < plan->field_group_count; i++) {
+        if (decode_address_compare(&plan->field_groups[i].base, base) != 0) {
             continue;
         }
-        if (o->kind == OSPREY_DECODED_ARRAY_START &&
-            o->chunk.size != 0) {
-            continue;
+        if (found) return false;
+        found = true;
+        kind = OSPREY_TYPE_STRUCT;
+    }
+    for (uint32_t i = 0; i < plan->array_count; i++) {
+        OspreyAddress array_base = {
+            .region = plan->arrays[i].region, .offset = plan->arrays[i].lo,
+        };
+        if (decode_address_compare(&array_base, base) != 0) continue;
+        if (found) return false;
+        found = true;
+        kind = OSPREY_TYPE_ARRAY;
+    }
+    *kind_out = kind;
+    return true;
+}
+
+static bool decode_plan_model_shape_valid(const OspreyContext *ctx,
+                                          const OspreyDecodePlan *plan,
+                                          OspreyDecodeAllocator *allocator)
+{
+    const OspreyChunkDecision *decisions;
+    uint8_t *members = NULL;
+
+    if (ctx == NULL || ctx->graph == NULL || plan == NULL || allocator == NULL ||
+        !isfinite(ctx->config.report_threshold) ||
+        ctx->config.report_threshold < 0.0 ||
+        ctx->config.report_threshold > 1.0 ||
+        plan->decision_count > ctx->config.max_variables ||
+        (plan->decision_count != 0 &&
+         (plan->decisions == NULL || plan->chunk_index == NULL)) ||
+        (plan->decision_count == 0 &&
+         (plan->decisions != NULL || plan->chunk_index != NULL)) ||
+        plan->field_group_count > plan->decision_count ||
+        (plan->field_group_count != 0 && plan->field_groups == NULL) ||
+        plan->array_count > ctx->config.max_variables ||
+        (plan->array_count != 0 && plan->arrays == NULL) ||
+        (plan->role_loss_count != 0 && plan->role_loss_keys == NULL)) {
+        return false;
+    }
+    decisions = plan->decisions;
+    for (uint32_t i = 0; i < plan->decision_count; i++) {
+        const OspreyChunkDecision *d = &decisions[i];
+        int64_t end;
+        if (!decode_region_valid(&d->chunk.address.region) ||
+            d->chunk.size == 0 || d->chunk.size > (uint64_t)INT64_MAX ||
+            !decode_chunk_end(&d->chunk, &end) ||
+            !decode_model_extent_span_contains(ctx,
+                &d->chunk.address.region, d->chunk.address.offset, end) ||
+            d->provisional_role < OSPREY_STORAGE_PRIMITIVE ||
+            d->provisional_role > OSPREY_STORAGE_ARRAY_ELEMENT ||
+            d->final_role < OSPREY_STORAGE_PRIMITIVE ||
+            d->final_role > OSPREY_STORAGE_ARRAY_ELEMENT ||
+            d->has_pointer_target > 1 || d->role_has_predicate > 1 ||
+            d->has_array_owner > 1 || !isfinite(d->role_posterior) ||
+            d->role_posterior < 0.0 || d->role_posterior > 1.0 ||
+            !isfinite(d->pointer_posterior) || d->pointer_posterior < 0.0 ||
+            d->pointer_posterior > 1.0 || !isfinite(d->array_posterior) ||
+            d->array_posterior < 0.0 || d->array_posterior > 1.0) {
+            return false;
         }
-        for (guint i = 0; i < ctx->region_instances->len; i++) {
-            const OspreyRegionInstance *ri = &g_array_index(
-                ctx->region_instances, OspreyRegionInstance, i);
-            if (ri->region.kind != o->chunk.address.region.kind) continue;
-            if (ri->region.code_image_id !=
-                o->chunk.address.region.code_image_id)
-                continue;
-            if (ri->region.site_offset !=
-                o->chunk.address.region.site_offset)
-                continue;
-            OspRawSpan sp;
-            memset(&sp, 0, sizeof(sp));
-            if (ri->region.kind == OSPREY_REGION_STACK_FUNCTION) {
-                /* Downward stack: the observed window is
-                 * [raw_min, raw_max] == [min_sp, entry_sp].  The object
-                 * span runs from the object's raw start up to the frame
-                 * top; never treat the stack as
-                 * [entry_sp, entry_sp+extent). */
-                sp.raw_start = ri->raw_base +
-                               (uint64_t)o->chunk.address.offset;
-                sp.raw_end = ri->raw_max;
+        if (i != 0 && decode_chunk_compare(&decisions[i - 1].chunk,
+                                           &d->chunk) >= 0) return false;
+        /* The array scheduler may replace a provisional field role with
+         * array membership; any remaining owner base is then stale. */
+        if (d->final_role != OSPREY_STORAGE_FIELD &&
+            decode_address_compare(&d->owner_base, &d->chunk.address) > 0) {
+            return false;
+        }
+        if ((d->provisional_role == OSPREY_STORAGE_FIELD ||
+             d->final_role == OSPREY_STORAGE_FIELD) &&
+            (!d->role_has_predicate ||
+             decode_address_compare(&d->owner_base,
+                                    &d->chunk.address) > 0 ||
+             !decode_model_extent_contains(ctx, &d->owner_base) ||
+             decode_region_compare(&d->owner_base.region,
+                                   &d->chunk.address.region) != 0)) {
+            return false;
+        }
+        if (d->final_role == OSPREY_STORAGE_ARRAY_ELEMENT) {
+            if (!d->has_array_owner) return false;
+        } else if (d->has_array_owner) {
+            return false;
+        }
+        if (d->has_pointer_target &&
+            (d->chunk.size != sizeof(target_ulong) ||
+             !decode_model_extent_contains(ctx, &d->pointer_target))) {
+            return false;
+        }
+    }
+    members = decode_alloc(allocator, plan->decision_count,
+                           sizeof(*members));
+    if (plan->decision_count != 0 && members == NULL) return false;
+    for (uint32_t i = 0; i < plan->field_group_count; i++) {
+        const OspreyDecodeFieldGroup *group = &plan->field_groups[i];
+        if (group->field_count == 0 || group->decision_ordinals == NULL ||
+            !decode_model_extent_contains(ctx, &group->base) ||
+            (i != 0 && decode_address_compare(
+                &plan->field_groups[i - 1].base, &group->base) >= 0)) {
+            g_free(members);
+            return false;
+        }
+        for (uint32_t j = 0; j < group->field_count; j++) {
+            uint32_t ordinal = group->decision_ordinals[j];
+            const OspreyChunkDecision *d;
+            if (ordinal >= plan->decision_count || members[ordinal] ||
+                plan->decisions[ordinal].final_role != OSPREY_STORAGE_FIELD ||
+                decode_address_compare(&plan->decisions[ordinal].owner_base,
+                                       &group->base) != 0 ||
+                (j != 0 && decode_chunk_compare(
+                    &plan->decisions[group->decision_ordinals[j - 1]].chunk,
+                    &plan->decisions[ordinal].chunk) >= 0)) {
+                g_free(members);
+                return false;
+            }
+            d = &plan->decisions[ordinal];
+            if (j != 0) {
+                const OspreyChunk *previous = &plan->decisions[
+                    group->decision_ordinals[j - 1]].chunk;
+                int64_t previous_end;
+                if (!decode_chunk_end(previous, &previous_end) ||
+                    previous_end > d->chunk.address.offset) {
+                    g_free(members);
+                    return false;
+                }
+            }
+            members[ordinal] = 1;
+        }
+    }
+    for (uint32_t i = 0; i < plan->array_count; i++) {
+        const OspreyDecodeArray *array = &plan->arrays[i];
+        OspreyAddress base = {
+            .region = array->region, .offset = array->lo,
+        };
+        int64_t span;
+        uint64_t count;
+        if (!decode_region_valid(&array->region) || array->stride == 0 ||
+            array->lo >= array->hi ||
+            !osprey_check_sub(array->hi, array->lo, &span) || span <= 0 ||
+            (uint64_t)span % array->stride != 0 ||
+            (count = (uint64_t)span / array->stride) == 0 ||
+            count != array->count ||
+            !decode_model_extent_contains(ctx, &base) ||
+            !decode_model_extent_contains(ctx, &(OspreyAddress){
+                .region = array->region, .offset = array->hi - 1 })) {
+            g_free(members);
+            return false;
+        }
+        if (array->member_count != 0 && array->member_decision_ordinals == NULL) {
+            g_free(members);
+            return false;
+        }
+        for (uint32_t j = 0; j < array->member_count; j++) {
+            uint32_t ordinal = array->member_decision_ordinals[j];
+            const OspreyChunkDecision *d;
+            bool aligned;
+            int64_t delta;
+            if (ordinal >= plan->decision_count || members[ordinal]) {
+                g_free(members);
+                return false;
+            }
+            d = &plan->decisions[ordinal];
+            if (!osprey_check_sub(d->chunk.address.offset, array->lo, &delta) ||
+                delta < 0 || (uint64_t)delta % array->stride != 0 ||
+                d->chunk.size > array->stride ||
+                !decode_chunk_end(&d->chunk, &span) || span > array->hi) {
+                g_free(members);
+                return false;
+            }
+            aligned = (d->final_role == OSPREY_STORAGE_ARRAY_ELEMENT &&
+                       d->has_array_owner &&
+                       decode_address_compare(&d->array_owner, &base) == 0);
+            if (!aligned) {
+                g_free(members);
+                return false;
+            }
+            members[ordinal] = 1;
+        }
+        if (i != 0) {
+            const OspreyDecodeArray *previous = &plan->arrays[i - 1];
+            if (decode_region_compare(&previous->region, &array->region) == 0 &&
+                previous->hi > array->lo) {
+                g_free(members);
+                return false;
+            }
+        }
+        for (uint32_t j = 0; j < plan->field_group_count; j++) {
+            if (decode_address_compare(&plan->field_groups[j].base, &base) == 0) {
+                g_free(members);
+                return false;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < plan->decision_count; i++) {
+        if ((plan->decisions[i].final_role == OSPREY_STORAGE_FIELD ||
+             plan->decisions[i].final_role ==
+                 OSPREY_STORAGE_ARRAY_ELEMENT) &&
+            !members[i]) {
+            g_free(members);
+            return false;
+        }
+    }
+    g_free(members);
+    for (uint32_t i = 1; i < plan->role_loss_count; i++) {
+        if (decode_key_compare(&plan->role_loss_keys[i - 1],
+                               &plan->role_loss_keys[i]) >= 0) return false;
+    }
+    return true;
+}
+
+static bool decode_signed_raw_add(uint64_t base, int64_t offset,
+                                  uint64_t *out)
+{
+    uint64_t magnitude;
+    if (out == NULL) return false;
+    if (offset < 0) {
+        magnitude = 0 - (uint64_t)offset;
+        if (base < magnitude) return false;
+        *out = base - magnitude;
+    } else {
+        magnitude = (uint64_t)offset;
+        if (base > UINT64_MAX - magnitude) return false;
+        *out = base + magnitude;
+    }
+    return true;
+}
+
+static const OspreyRegionInstance *decode_first_runtime_instance(
+    const OspreyContext *ctx, const OspreyRegionId *region,
+    uint32_t *ordinal_out)
+{
+    if (ctx == NULL || region == NULL || ordinal_out == NULL ||
+        ctx->region_instances == NULL) return NULL;
+    for (guint i = 0; i < ctx->region_instances->len; i++) {
+        const OspreyRegionInstance *instance = &g_array_index(
+            ctx->region_instances, OspreyRegionInstance, i);
+        if (decode_region_compare(&instance->region, region) == 0) {
+            *ordinal_out = i;
+            return instance;
+        }
+    }
+    return NULL;
+}
+
+static void model_ledger_set(OspreyModel *model, uint32_t slot,
+                             void *base, uint64_t capacity, uint64_t used,
+                             uint64_t bytes, uint64_t element_size,
+                             uint8_t destructor_kind)
+{
+    OspreyModelAllocation *entry = &model->ledger[slot];
+    entry->base = base;
+    entry->capacity = capacity;
+    entry->used = used;
+    entry->bytes = bytes;
+    entry->element_size = element_size;
+    entry->destructor_kind = destructor_kind;
+}
+
+static void *model_alloc_family(OspreyDecodeAllocator *allocator,
+                                OspreyModel *model, uint32_t slot,
+                                uint32_t count, size_t element_size,
+                                uint8_t destructor_kind)
+{
+    void *base;
+    size_t bytes;
+
+    if (allocator == NULL || model == NULL || slot >= OSPREY_MODEL_LEDGER_COUNT ||
+        !decode_size_mul(count, element_size, &bytes)) return NULL;
+    base = decode_alloc(allocator, count, element_size);
+    if (count != 0 && base == NULL) return NULL;
+    model_ledger_set(model, slot, base, count, count, bytes, element_size,
+                     count == 0 ? OSPREY_MODEL_DESTRUCTOR_NONE :
+                     destructor_kind);
+    return base;
+}
+
+static OspreyModel *decode_model_new(OspreyDecodeAllocator *allocator)
+{
+    OspreyModel *model;
+
+    model = decode_alloc(allocator, 1, sizeof(*model));
+    if (model == NULL) return NULL;
+    model->version = OSPREY_MODEL_VERSION;
+    return model;
+}
+
+void osprey_model_free(OspreyModel *model)
+{
+    if (model == NULL) return;
+    for (uint32_t i = 0; i < OSPREY_MODEL_LEDGER_COUNT; i++) {
+        OspreyModelAllocation *entry = &model->ledger[i];
+        if (entry->base == NULL) continue;
+        if (entry->destructor_kind == OSPREY_MODEL_DESTRUCTOR_NAMES) {
+            char **names = entry->base;
+            for (uint64_t j = 0; j < entry->used; j++) {
+                g_free(names[j]);
+            }
+        }
+        g_free(entry->base);
+        entry->base = NULL;
+    }
+    g_free(model);
+}
+
+static bool decode_type_ref_from_work(const DecodeTypeWork *works,
+                                      uint32_t count, uint32_t id,
+                                      DecodeTypeRef *out)
+{
+    if (works == NULL || out == NULL || id >= count) return false;
+    memset(out, 0, sizeof(*out));
+    if (works[id].kind == OSPREY_TYPE_PRIMITIVE) {
+        out->kind = OSPREY_TYPE_PRIMITIVE;
+        out->primitive_size = works[id].size;
+        return true;
+    }
+    if (works[id].kind != OSPREY_TYPE_POINTER) return false;
+    out->kind = OSPREY_TYPE_POINTER;
+    out->target_is_void = works[id].target_is_void;
+    out->target_aggregate_kind = works[id].target_aggregate_kind;
+    out->target = works[id].canonical_base;
+    return true;
+}
+
+static bool decode_decision_value_ref(const OspreyContext *ctx,
+                                      const OspreyDecodePlan *plan,
+                                      const OspreyChunkDecision *decision,
+                                      DecodeTypeRef *out)
+{
+    uint8_t aggregate_kind = 0;
+
+    if (ctx == NULL || plan == NULL || decision == NULL || out == NULL) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!decision->has_pointer_target) {
+        if (decision->chunk.size == 0) return false;
+        out->kind = OSPREY_TYPE_PRIMITIVE;
+        out->primitive_size = decision->chunk.size;
+        return true;
+    }
+    if (decision->chunk.size != sizeof(target_ulong) ||
+        !decode_model_extent_contains(ctx, &decision->pointer_target) ||
+        !decode_plan_find_aggregate(plan, &decision->pointer_target,
+                                    &aggregate_kind)) {
+        return false;
+    }
+    out->kind = OSPREY_TYPE_POINTER;
+    out->target_is_void = aggregate_kind == 0;
+    out->target_aggregate_kind = aggregate_kind;
+    out->target = decision->pointer_target;
+    return true;
+}
+
+static bool decode_type_work_sort(DecodeTypeWork *works, uint32_t count,
+                                  const DecodeFieldWork *fields)
+{
+    if (count > 1 && works == NULL) return false;
+    for (uint32_t i = 1; i < count; i++) {
+        DecodeTypeWork value = works[i];
+        uint32_t j = i;
+        while (j != 0 && decode_type_work_compare(&value, &works[j - 1],
+                                                  fields) < 0) {
+            works[j] = works[j - 1];
+            j--;
+        }
+        works[j] = value;
+    }
+    for (uint32_t i = 1; i < count; i++) {
+        if (decode_type_work_compare(&works[i - 1], &works[i], fields) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int decode_model_index_compare(const void *ap, const void *bp)
+{
+    const OspreyModelIndexEntry *a = ap;
+    const OspreyModelIndexEntry *b = bp;
+    return decode_key_compare(&a->key, &b->key);
+}
+
+static OspreyKey decode_model_aggregate_key(const OspreyDecodedType *type)
+{
+    OspreyKey key = osprey_base_key(&type->canonical_base.region,
+                                    type->canonical_base.offset);
+    key.tag = 0x414747ULL; /* AGG */
+    key.w[4] = type->kind;
+    return key;
+}
+
+static OspreyKey decode_model_type_key(const OspreyModel *model,
+                                       const OspreyDecodedType *type)
+{
+    OspreyKey key;
+    memset(&key, 0, sizeof(key));
+    key.tag = 0x545950ULL; /* TYP */
+    key.w[0] = type->kind;
+    key.w[1] = type->size;
+    if (type->kind == OSPREY_TYPE_PRIMITIVE) return key;
+    key.w[2] = type->canonical_base.region.kind;
+    key.w[3] = type->canonical_base.region.code_image_id;
+    key.w[4] = type->canonical_base.region.site_offset;
+    key.w[5] = (uint64_t)type->canonical_base.offset;
+    if (type->kind == OSPREY_TYPE_POINTER) {
+        key.w[6] = type->target_is_void;
+        key.w[7] = type->target_type_id;
+        if (type->target_is_void) {
+            key.w[7] = 0;
+        }
+    } else if (type->kind == OSPREY_TYPE_ARRAY) {
+        key.w[6] = type->element_count;
+        key.w[7] = type->element_size;
+        key.w[8] = type->element_type_id;
+    } else if (type->kind == OSPREY_TYPE_STRUCT) {
+        key.w[6] = type->field_count;
+        key.w[7] = type->field_begin;
+    }
+    (void)model;
+    return key;
+}
+
+static const char *decode_model_region_tag(const OspreyRegionId *region)
+{
+    if (region == NULL) return "x";
+    switch (region->kind) {
+    case OSPREY_REGION_GLOBAL: return "g";
+    case OSPREY_REGION_HEAP_SITE: return "h";
+    case OSPREY_REGION_STACK_FUNCTION: return "s";
+    default: return "x";
+    }
+}
+
+static bool decode_model_address_text(const OspreyAddress *address,
+                                      char *buffer, size_t size)
+{
+    uint64_t magnitude;
+    int written;
+
+    if (address == NULL || buffer == NULL || size == 0 ||
+        !decode_region_valid(&address->region)) return false;
+    magnitude = address->offset < 0 ? 0 - (uint64_t)address->offset :
+        (uint64_t)address->offset;
+    written = snprintf(buffer, size, "%s_i%016" PRIx64 "_s%016" PRIx64
+                       "_o%c%016" PRIx64, decode_model_region_tag(
+                           &address->region), address->region.code_image_id,
+                       address->region.site_offset,
+                       address->offset < 0 ? 'n' : 'p', magnitude);
+    return written >= 0 && (size_t)written < size;
+}
+
+static bool decode_model_aggregate_name(const OspreyDecodedType *type,
+                                        char *buffer, size_t size)
+{
+    char address[128];
+    int written;
+
+    if (type == NULL || buffer == NULL ||
+        !decode_model_address_text(&type->canonical_base, address,
+                                   sizeof(address))) return false;
+    if (type->kind == OSPREY_TYPE_STRUCT) {
+        written = snprintf(buffer, size, "struct_%s", address);
+    } else if (type->kind == OSPREY_TYPE_ARRAY) {
+        written = snprintf(buffer, size, "array_%s_stride_%016" PRIx64,
+                           address, type->element_size);
+    } else {
+        return false;
+    }
+    return written >= 0 && (size_t)written < size;
+}
+
+static bool decode_model_type_name(const OspreyModel *model, uint32_t id,
+                                   char *buffer, size_t size)
+{
+    const OspreyDecodedType *type;
+    char address[128];
+    char aggregate[256];
+    int written;
+
+    if (model == NULL || buffer == NULL || size == 0 || id >= model->type_count ||
+        model->types == NULL) return false;
+    type = &model->types[id];
+    switch (type->kind) {
+    case OSPREY_TYPE_PRIMITIVE:
+        written = snprintf(buffer, size, "prim_b%" PRIu64, type->size);
+        return written >= 0 && (size_t)written < size;
+    case OSPREY_TYPE_STRUCT:
+    case OSPREY_TYPE_ARRAY:
+        return decode_model_aggregate_name(type, buffer, size);
+    case OSPREY_TYPE_POINTER:
+        if (type->target_is_void) {
+            if (!decode_model_address_text(&type->canonical_base, address,
+                                            sizeof(address))) return false;
+            written = snprintf(buffer, size, "ptr_void_%s", address);
+        } else {
+            if (type->target_type_id >= model->type_count ||
+                !decode_model_aggregate_name(
+                    &model->types[type->target_type_id], aggregate,
+                    sizeof(aggregate))) return false;
+            written = snprintf(buffer, size, "ptr_to_%s", aggregate);
+        }
+        return written >= 0 && (size_t)written < size;
+    default:
+        return false;
+    }
+}
+
+static char *decode_model_strdup(OspreyDecodeAllocator *allocator,
+                                 const char *text)
+{
+    size_t length;
+    char *copy;
+
+    if (allocator == NULL || text == NULL) return NULL;
+    length = strlen(text);
+    if (length == SIZE_MAX) return NULL;
+    copy = decode_alloc(allocator, length + 1, sizeof(*copy));
+    if (copy == NULL) return NULL;
+    memcpy(copy, text, length + 1);
+    return copy;
+}
+
+/* Build one local model.  No context ownership is changed here. */
+OspreyStatus osprey_model_build(const OspreyContext *ctx,
+                                const OspreyDecodePlan *plan,
+                                OspreyModel **out)
+{
+    OspreyDecodeAllocator allocator;
+    OspreyModel *model = NULL;
+    DecodeTypeWork *works = NULL;
+    DecodeFieldWork *field_work = NULL;
+    uint32_t *remap = NULL;
+    uint32_t max_types = 0;
+    uint32_t type_count = 0;
+    uint32_t field_total = 0;
+    uint32_t raw_count = 0;
+    uint32_t aggregate_count;
+
+    if (out == NULL) return OSPREY_INVALID_MODEL;
+    *out = NULL;
+    memset(&allocator, 0, sizeof(allocator));
+    if (!decode_plan_model_shape_valid(ctx, plan, &allocator)) {
+        return OSPREY_INVALID_MODEL;
+    }
+    /* Each selected array owns its aggregate type and may additionally need
+     * a stride-width primitive when membership is empty, partial, or mixed. */
+    if (!decode_u32_add(plan->decision_count, plan->array_count,
+                        &max_types) ||
+        !decode_u32_add(max_types, plan->array_count, &max_types) ||
+        !decode_u32_add(max_types, plan->field_group_count, &max_types)) {
+        return OSPREY_INVALID_MODEL;
+    }
+    if (max_types == 0) max_types = 1;
+    for (uint32_t i = 0; i < plan->field_group_count; i++) {
+        if (!decode_u32_add(field_total, plan->field_groups[i].field_count,
+                            &field_total)) return OSPREY_INVALID_MODEL;
+    }
+    if (!decode_u32_add(plan->array_count, plan->field_group_count,
+                        &aggregate_count)) return OSPREY_INVALID_MODEL;
+
+    model = decode_model_new(&allocator);
+    if (model == NULL) goto failure;
+    model->object_count = plan->decision_count;
+    model->objects = model_alloc_family(&allocator, model,
+        OSPREY_MODEL_LEDGER_OBJECTS, model->object_count,
+        sizeof(*model->objects), OSPREY_MODEL_DESTRUCTOR_FREE);
+    if (model->object_count != 0 && model->objects == NULL) goto failure;
+    works = decode_alloc(&allocator, max_types, sizeof(*works));
+    if (works == NULL) goto failure;
+    field_work = decode_alloc(&allocator, field_total, sizeof(*field_work));
+    if (field_total != 0 && field_work == NULL) goto failure;
+
+    for (uint32_t i = 0; i < plan->decision_count; i++) {
+        const OspreyChunkDecision *decision = &plan->decisions[i];
+        OspreyDecodedObject *object = &model->objects[i];
+        DecodeTypeRef ref;
+        uint32_t type_id = UINT32_MAX;
+
+        memset(object, 0, sizeof(*object));
+        object->chunk = decision->chunk;
+        object->storage_role = decision->final_role;
+        if (decision->final_role == OSPREY_STORAGE_FIELD) {
+            object->owner_base = decision->owner_base;
+        } else if (decision->final_role == OSPREY_STORAGE_ARRAY_ELEMENT) {
+            object->owner_base = decision->array_owner;
+        }
+        if (decision->final_role == OSPREY_STORAGE_ARRAY_ELEMENT) {
+            object->storage_posterior = decision->array_posterior;
+            object->storage_support = decision->array_support;
+            object->storage_source_rule_bits =
+                decision->array_source_rule_bits;
+        } else {
+            object->storage_posterior = decision->role_posterior;
+            object->storage_support = decision->role_support;
+            object->storage_source_rule_bits =
+                decision->role_source_rule_bits;
+        }
+        object->has_pointer_target = decision->has_pointer_target;
+        object->pointer_target = decision->pointer_target;
+        object->pointer_posterior = decision->pointer_posterior;
+        object->pointer_support = decision->pointer_support;
+        object->pointer_source_rule_bits = decision->pointer_source_rule_bits;
+        if (!decode_decision_value_ref(ctx, plan, decision, &ref)) goto failure;
+        if (ref.kind == OSPREY_TYPE_PRIMITIVE) {
+            if (!decode_type_add_primitive(works, &type_count, max_types,
+                                           ref.primitive_size, &type_id)) {
+                goto failure;
+            }
+        } else if (!decode_type_add_pointer(works, &type_count, max_types,
+                                            &ref, &type_id)) {
+            goto failure;
+        }
+        object->value_type_id = type_id;
+    }
+
+    uint32_t field_position = 0;
+    for (uint32_t i = 0; i < plan->field_group_count; i++) {
+        const OspreyDecodeFieldGroup *group = &plan->field_groups[i];
+        DecodeTypeWork value;
+        uint64_t aggregate_size = 0;
+        memset(&value, 0, sizeof(value));
+        value.kind = OSPREY_TYPE_STRUCT;
+        value.canonical_base = group->base;
+        value.field_begin = field_position;
+        value.field_count = group->field_count;
+        value.posterior = 1.0;
+        value.direct_support = UINT64_MAX;
+        for (uint32_t j = 0; j < group->field_count; j++) {
+            uint32_t ordinal = group->decision_ordinals[j];
+            const OspreyChunkDecision *decision = &plan->decisions[ordinal];
+            OspreyDecodedField *field = &field_work[field_position++].field;
+            DecodeTypeRef ref;
+            int64_t relative;
+            int64_t end;
+            memset(field, 0, sizeof(*field));
+            if (!osprey_check_sub(decision->chunk.address.offset,
+                                  group->base.offset, &relative) ||
+                relative < 0 || !decode_chunk_end(&decision->chunk, &end) ||
+                !decode_decision_value_ref(ctx, plan, decision, &ref)) {
+                goto failure;
+            }
+            field->chunk = decision->chunk;
+            field->relative_offset = (uint64_t)relative;
+            field->value_type_id = model->objects[ordinal].value_type_id;
+            field->posterior = decision->role_posterior;
+            field->support = decision->role_support;
+            field->source_rule_bits = decision->role_source_rule_bits;
+            field_work[field_position - 1].value_ref = ref;
+            if ((uint64_t)relative > UINT64_MAX - decision->chunk.size ||
+                (uint64_t)relative + decision->chunk.size >
+                    (uint64_t)INT64_MAX) {
+                goto failure;
+            }
+            if (aggregate_size < (uint64_t)relative + decision->chunk.size) {
+                aggregate_size = (uint64_t)relative + decision->chunk.size;
+            }
+            if (field->posterior < value.posterior) value.posterior =
+                field->posterior;
+            if (field->support < value.direct_support) value.direct_support =
+                field->support;
+            value.source_rule_bits |= field->source_rule_bits;
+        }
+        if (value.direct_support == UINT64_MAX) value.direct_support = 0;
+        if (aggregate_size == 0) goto failure;
+        value.size = aggregate_size;
+        if (!decode_type_work_append(works, &type_count, max_types, &value,
+                                     NULL)) goto failure;
+    }
+
+    for (uint32_t i = 0; i < plan->array_count; i++) {
+        const OspreyDecodeArray *array = &plan->arrays[i];
+        DecodeTypeWork value;
+        DecodeTypeRef common;
+        bool homogeneous = array->member_count == array->count &&
+                           array->count <= UINT32_MAX;
+        memset(&value, 0, sizeof(value));
+        memset(&common, 0, sizeof(common));
+        value.kind = OSPREY_TYPE_ARRAY;
+        value.canonical_base.region = array->region;
+        value.canonical_base.offset = array->lo;
+        value.size = array->hi - array->lo;
+        value.element_count = array->count;
+        value.element_size = array->stride;
+        value.posterior = array->posterior;
+        value.direct_support = array->direct_support;
+        value.source_rule_bits = array->source_rule_bits;
+        for (uint32_t j = 0; homogeneous && j < array->member_count; j++) {
+            uint32_t ordinal = array->member_decision_ordinals[j];
+            const OspreyChunkDecision *decision = &plan->decisions[ordinal];
+            DecodeTypeRef ref;
+            int64_t delta;
+            uint64_t position;
+            if (!decode_decision_value_ref(ctx, plan, decision, &ref) ||
+                decision->chunk.size != array->stride ||
+                !osprey_check_sub(decision->chunk.address.offset, array->lo,
+                                  &delta) || delta < 0 ||
+                (uint64_t)delta % array->stride != 0) {
+                homogeneous = false;
+                break;
+            }
+            position = (uint64_t)delta / array->stride;
+            if (position >= array->count) {
+                homogeneous = false;
+                break;
+            }
+            for (uint32_t k = 0; k < j; k++) {
+                uint32_t previous = array->member_decision_ordinals[k];
+                int64_t previous_delta;
+                if (!osprey_check_sub(plan->decisions[previous].chunk.address.offset,
+                                      array->lo, &previous_delta) ||
+                    previous_delta == delta) {
+                    homogeneous = false;
+                    break;
+                }
+            }
+            if (!homogeneous) break;
+            if (j == 0) common = ref;
+            else if (!decode_type_ref_equal(&common, &ref)) homogeneous = false;
+        }
+        if (homogeneous && array->member_count != 0) {
+            for (uint32_t j = 0; j < array->member_count; j++) {
+                uint32_t ordinal = array->member_decision_ordinals[j];
+                DecodeTypeRef ref;
+                if (!decode_decision_value_ref(ctx, plan,
+                                               &plan->decisions[ordinal],
+                                               &ref) ||
+                    !decode_type_ref_equal(&common, &ref)) {
+                    homogeneous = false;
+                    break;
+                }
+            }
+        }
+        if (!homogeneous) {
+            if (!decode_type_add_primitive(works, &type_count, max_types,
+                                           array->stride,
+                                           &value.element_work_id)) goto failure;
+        } else {
+            value.element_ref = common;
+            bool found = false;
+            for (uint32_t j = 0; j < type_count; j++) {
+                DecodeTypeRef ref;
+                if (decode_type_ref_from_work(works, type_count, j, &ref) &&
+                    decode_type_ref_equal(&ref, &common)) {
+                    value.element_work_id = j;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) goto failure;
+        }
+        if (!decode_type_work_append(works, &type_count, max_types, &value,
+                                     NULL)) goto failure;
+    }
+
+    if (!decode_type_work_sort(works, type_count, field_work)) goto failure;
+    remap = decode_alloc(&allocator, type_count, sizeof(*remap));
+    if (type_count != 0 && remap == NULL) goto failure;
+    for (uint32_t i = 0; i < type_count; i++) {
+        if (works[i].old_index >= type_count) goto failure;
+        remap[works[i].old_index] = i;
+    }
+    model->type_count = type_count;
+    model->types = model_alloc_family(&allocator, model,
+        OSPREY_MODEL_LEDGER_TYPES, type_count, sizeof(*model->types),
+        OSPREY_MODEL_DESTRUCTOR_FREE);
+    if (type_count != 0 && model->types == NULL) goto failure;
+    model->field_count = field_total;
+    model->fields = model_alloc_family(&allocator, model,
+        OSPREY_MODEL_LEDGER_FIELDS, field_total, sizeof(*model->fields),
+        OSPREY_MODEL_DESTRUCTOR_FREE);
+    if (field_total != 0 && model->fields == NULL) goto failure;
+    for (uint32_t i = 0; i < field_total; i++) {
+        model->fields[i] = field_work[i].field;
+    }
+    for (uint32_t i = 0; i < model->object_count; i++) {
+        if (model->objects[i].value_type_id >= type_count) goto failure;
+        model->objects[i].value_type_id =
+            remap[model->objects[i].value_type_id];
+    }
+    for (uint32_t i = 0; i < field_total; i++) {
+        if (model->fields[i].value_type_id >= type_count) goto failure;
+        model->fields[i].value_type_id = remap[model->fields[i].value_type_id];
+    }
+    for (uint32_t i = 0; i < type_count; i++) {
+        const DecodeTypeWork *work = &works[i];
+        OspreyDecodedType *type = &model->types[i];
+        memset(type, 0, sizeof(*type));
+        type->id = i;
+        type->kind = work->kind;
+        type->target_is_void = work->kind == OSPREY_TYPE_POINTER
+            ? work->target_is_void : 0;
+        type->size = work->size;
+        type->element_count = work->element_count;
+        type->element_size = work->element_size;
+        type->element_type_id = UINT32_MAX;
+        type->target_type_id = UINT32_MAX;
+        type->canonical_base = work->canonical_base;
+        type->field_begin = work->field_begin;
+        type->field_count = work->field_count;
+        type->evidence_valid = (work->kind == OSPREY_TYPE_ARRAY ||
+                                work->kind == OSPREY_TYPE_STRUCT);
+        type->posterior = type->evidence_valid ? work->posterior : 0.0;
+        type->direct_support = type->evidence_valid ? work->direct_support : 0;
+        type->source_rule_bits = type->evidence_valid ?
+            work->source_rule_bits : 0;
+        if (work->kind == OSPREY_TYPE_ARRAY) {
+            if (work->element_work_id >= type_count) goto failure;
+            type->element_type_id = remap[work->element_work_id];
+        }
+    }
+    for (uint32_t i = 0; i < type_count; i++) {
+        const DecodeTypeWork *work = &works[i];
+        OspreyDecodedType *type = &model->types[i];
+        if (work->kind == OSPREY_TYPE_POINTER && !work->target_is_void) {
+            uint32_t target = UINT32_MAX;
+            for (uint32_t j = 0; j < type_count; j++) {
+                if ((model->types[j].kind == OSPREY_TYPE_STRUCT ||
+                     model->types[j].kind == OSPREY_TYPE_ARRAY) &&
+                    decode_address_compare(&model->types[j].canonical_base,
+                                           &work->canonical_base) == 0) {
+                    if (target != UINT32_MAX) goto failure;
+                    target = j;
+                }
+            }
+            if (target == UINT32_MAX) goto failure;
+            type->target_type_id = target;
+        }
+    }
+    g_free(remap);
+    remap = NULL;
+    g_free(works);
+    works = NULL;
+    g_free(field_work);
+    field_work = NULL;
+
+    model->type_name_count = type_count;
+    model->type_names = model_alloc_family(&allocator, model,
+        OSPREY_MODEL_LEDGER_NAMES, type_count, sizeof(*model->type_names),
+        OSPREY_MODEL_DESTRUCTOR_NAMES);
+    if (type_count != 0 && model->type_names == NULL) goto failure;
+    for (uint32_t i = 0; i < type_count; i++) {
+        char name[512];
+        if (!decode_model_type_name(model, i, name, sizeof(name))) goto failure;
+        model->type_names[i] = decode_model_strdup(&allocator, name);
+        if (model->type_names[i] == NULL) goto failure;
+    }
+
+    model->chunk_index_count = model->object_count;
+    model->chunk_index = model_alloc_family(&allocator, model,
+        OSPREY_MODEL_LEDGER_CHUNK_INDEX, model->chunk_index_count,
+        sizeof(*model->chunk_index), OSPREY_MODEL_DESTRUCTOR_FREE);
+    if (model->chunk_index_count != 0 && model->chunk_index == NULL) goto failure;
+    for (uint32_t i = 0; i < model->object_count; i++) {
+        model->chunk_index[i].key = osprey_chunk_key(&model->objects[i].chunk);
+        model->chunk_index[i].ordinal = i;
+    }
+    if (model->chunk_index_count > 1) {
+        qsort(model->chunk_index, model->chunk_index_count,
+              sizeof(*model->chunk_index), decode_model_index_compare);
+    }
+
+    model->aggregate_index_count = aggregate_count;
+    model->aggregate_index = model_alloc_family(&allocator, model,
+        OSPREY_MODEL_LEDGER_AGGREGATE_INDEX, aggregate_count,
+        sizeof(*model->aggregate_index), OSPREY_MODEL_DESTRUCTOR_FREE);
+    if (aggregate_count != 0 && model->aggregate_index == NULL) goto failure;
+    uint32_t aggregate_position = 0;
+    for (uint32_t i = 0; i < type_count; i++) {
+        if (model->types[i].kind != OSPREY_TYPE_STRUCT &&
+            model->types[i].kind != OSPREY_TYPE_ARRAY) continue;
+        if (aggregate_position == aggregate_count) goto failure;
+        model->aggregate_index[aggregate_position].key =
+            decode_model_aggregate_key(&model->types[i]);
+        model->aggregate_index[aggregate_position++].ordinal = i;
+    }
+    if (aggregate_position != aggregate_count) goto failure;
+    if (aggregate_count > 1) qsort(model->aggregate_index, aggregate_count,
+                                    sizeof(*model->aggregate_index),
+                                    decode_model_index_compare);
+
+    model->type_index_count = type_count;
+    model->type_index = model_alloc_family(&allocator, model,
+        OSPREY_MODEL_LEDGER_TYPE_INDEX, type_count,
+        sizeof(*model->type_index), OSPREY_MODEL_DESTRUCTOR_FREE);
+    if (type_count != 0 && model->type_index == NULL) goto failure;
+    for (uint32_t i = 0; i < type_count; i++) {
+        model->type_index[i].key = decode_model_type_key(model, &model->types[i]);
+        model->type_index[i].ordinal = i;
+    }
+    if (type_count > 1) qsort(model->type_index, type_count,
+                               sizeof(*model->type_index),
+                               decode_model_index_compare);
+
+    for (uint32_t i = 0; i < model->object_count; i++) {
+        uint32_t instance_ordinal;
+        if (decode_first_runtime_instance(ctx,
+                                           &model->objects[i].chunk.address.region,
+                                           &instance_ordinal) != NULL) {
+            if (raw_count == UINT32_MAX) goto failure;
+            raw_count++;
+        }
+    }
+    model->raw_span_count = raw_count;
+    model->raw_spans = model_alloc_family(&allocator, model,
+        OSPREY_MODEL_LEDGER_RUNTIME_SPANS, raw_count, sizeof(*model->raw_spans),
+        OSPREY_MODEL_DESTRUCTOR_FREE);
+    if (raw_count != 0 && model->raw_spans == NULL) goto failure;
+    uint32_t raw_position = 0;
+    for (uint32_t i = 0; i < model->object_count; i++) {
+        uint32_t instance_ordinal;
+        const OspreyRegionInstance *instance =
+            decode_first_runtime_instance(ctx,
+                &model->objects[i].chunk.address.region, &instance_ordinal);
+        if (instance == NULL) continue;
+        uint64_t raw_start;
+        uint64_t raw_end;
+        if (instance->raw_min > instance->raw_max ||
+            !decode_signed_raw_add(instance->raw_base,
+                                   model->objects[i].chunk.address.offset,
+                                   &raw_start) ||
+            raw_start > UINT64_MAX - model->objects[i].chunk.size ||
+            (raw_end = raw_start + model->objects[i].chunk.size) <= raw_start ||
+            raw_start < instance->raw_min || raw_end > instance->raw_max) {
+            goto failure;
+        }
+        if (raw_position == raw_count) goto failure;
+        model->raw_spans[raw_position++] = (OspRawSpan){
+            .raw_start = raw_start,
+            .raw_end = raw_end,
+            .obj_idx = i,
+            .source_instance_idx = instance_ordinal,
+            .is_chunk = 1,
+        };
+    }
+    if (raw_position != raw_count) goto failure;
+    for (uint32_t i = 1; i < raw_count; i++) {
+        OspRawSpan value = model->raw_spans[i];
+        uint32_t j = i;
+        while (j != 0) {
+            const OspRawSpan *previous = &model->raw_spans[j - 1];
+            const OspRawSpan *current = &value;
+            int c = decode_cmp_u64(previous->raw_start, current->raw_start);
+            if (c == 0) c = decode_cmp_u64(previous->raw_end,
+                                            current->raw_end);
+            if (c == 0) c = decode_chunk_compare(
+                &model->objects[previous->obj_idx].chunk,
+                &model->objects[current->obj_idx].chunk);
+            if (c <= 0) break;
+            model->raw_spans[j] = model->raw_spans[j - 1];
+            j--;
+        }
+        model->raw_spans[j] = value;
+    }
+    *out = model;
+    return OSPREY_OK;
+
+failure:
+    g_free(remap);
+    g_free(works);
+    g_free(field_work);
+    osprey_model_free(model);
+    return OSPREY_INVALID_MODEL;
+}
+
+static const char *const decode_validation_reasons[] = {
+    [OSPREY_MODEL_VALIDATION_NONE] = "none",
+    [OSPREY_MODEL_VALIDATION_VERSION] = "model-version",
+    [OSPREY_MODEL_VALIDATION_LEDGER] = "model-ledger",
+    [OSPREY_MODEL_VALIDATION_TYPE_ORDER] = "type-order",
+    [OSPREY_MODEL_VALIDATION_TYPE_IDENTITY] = "type-identity",
+    [OSPREY_MODEL_VALIDATION_TYPE_SIZE] = "type-size",
+    [OSPREY_MODEL_VALIDATION_TYPE_REFERENCE] = "type-reference",
+    [OSPREY_MODEL_VALIDATION_AGGREGATE_BASE] = "aggregate-base",
+    [OSPREY_MODEL_VALIDATION_FIELD] = "field-ownership",
+    [OSPREY_MODEL_VALIDATION_ARRAY] = "array-ownership",
+    [OSPREY_MODEL_VALIDATION_OBJECT_ORDER] = "object-order",
+    [OSPREY_MODEL_VALIDATION_OBJECT_IDENTITY] = "object-identity",
+    [OSPREY_MODEL_VALIDATION_OBJECT_ROLE] = "object-role",
+    [OSPREY_MODEL_VALIDATION_OBJECT_REFERENCE] = "object-reference",
+    [OSPREY_MODEL_VALIDATION_OBJECT_EVIDENCE] = "object-evidence",
+    [OSPREY_MODEL_VALIDATION_INDEX_ORDER] = "index-order",
+    [OSPREY_MODEL_VALIDATION_INDEX_CONTENT] = "index-content",
+    [OSPREY_MODEL_VALIDATION_CYCLE] = "by-value-cycle",
+    [OSPREY_MODEL_VALIDATION_RUNTIME_SPAN] = "runtime-span",
+};
+
+const char *osprey_model_validation_reason(
+    OspreyModelValidationError error)
+{
+    if ((uint32_t)error >= G_N_ELEMENTS(decode_validation_reasons) ||
+        decode_validation_reasons[error] == NULL) return "unknown";
+    return decode_validation_reasons[error];
+}
+
+static OspreyStatus decode_model_invalid(
+    OspreyModelValidationError *error_out,
+    OspreyModelValidationError error)
+{
+    if (error_out != NULL) *error_out = error;
+    return OSPREY_INVALID_MODEL;
+}
+
+static bool decode_model_ledger_slot_valid(
+    const OspreyModel *model, uint32_t slot, const void *actual,
+    uint64_t count, uint64_t element_size, uint8_t destructor_kind)
+{
+    const OspreyModelAllocation *entry;
+    size_t expected_bytes;
+
+    if (model == NULL || slot >= OSPREY_MODEL_LEDGER_COUNT) return false;
+    entry = &model->ledger[slot];
+    if (count > SIZE_MAX || element_size > SIZE_MAX ||
+        !decode_size_mul((size_t)count, (size_t)element_size,
+                         &expected_bytes)) {
+        return false;
+    }
+    uint8_t zero_reserved[7] = { 0 };
+    if (memcmp(entry->reserved, zero_reserved, sizeof(zero_reserved)) != 0 ||
+        entry->base != actual || entry->capacity != count ||
+        entry->used != count || entry->bytes != expected_bytes ||
+        entry->element_size != element_size ||
+        entry->destructor_kind != (count == 0
+            ? OSPREY_MODEL_DESTRUCTOR_NONE : destructor_kind)) {
+        return false;
+    }
+    if (count == 0) return actual == NULL && expected_bytes == 0;
+    return actual != NULL;
+}
+
+static bool decode_model_ledger_valid(const OspreyModel *model)
+{
+    if (model == NULL ||
+        !decode_model_ledger_slot_valid(model, OSPREY_MODEL_LEDGER_OBJECTS,
+            model->objects, model->object_count, sizeof(*model->objects),
+            OSPREY_MODEL_DESTRUCTOR_FREE) ||
+        !decode_model_ledger_slot_valid(model, OSPREY_MODEL_LEDGER_TYPES,
+            model->types, model->type_count, sizeof(*model->types),
+            OSPREY_MODEL_DESTRUCTOR_FREE) ||
+        !decode_model_ledger_slot_valid(model, OSPREY_MODEL_LEDGER_FIELDS,
+            model->fields, model->field_count, sizeof(*model->fields),
+            OSPREY_MODEL_DESTRUCTOR_FREE) ||
+        !decode_model_ledger_slot_valid(model,
+            OSPREY_MODEL_LEDGER_CHUNK_INDEX, model->chunk_index,
+            model->chunk_index_count, sizeof(*model->chunk_index),
+            OSPREY_MODEL_DESTRUCTOR_FREE) ||
+        !decode_model_ledger_slot_valid(model,
+            OSPREY_MODEL_LEDGER_AGGREGATE_INDEX, model->aggregate_index,
+            model->aggregate_index_count, sizeof(*model->aggregate_index),
+            OSPREY_MODEL_DESTRUCTOR_FREE) ||
+        !decode_model_ledger_slot_valid(model, OSPREY_MODEL_LEDGER_TYPE_INDEX,
+            model->type_index, model->type_index_count,
+            sizeof(*model->type_index), OSPREY_MODEL_DESTRUCTOR_FREE) ||
+        !decode_model_ledger_slot_valid(model,
+            OSPREY_MODEL_LEDGER_RUNTIME_SPANS, model->raw_spans,
+            model->raw_span_count, sizeof(*model->raw_spans),
+            OSPREY_MODEL_DESTRUCTOR_FREE) ||
+        model->type_name_count != model->type_count ||
+        !decode_model_ledger_slot_valid(model, OSPREY_MODEL_LEDGER_NAMES,
+            model->type_names, model->type_name_count,
+            sizeof(*model->type_names), OSPREY_MODEL_DESTRUCTOR_NAMES)) {
+        return false;
+    }
+    return true;
+}
+
+static bool decode_model_type_ids_inactive(const OspreyDecodedType *type,
+                                           uint32_t element_type_id,
+                                           uint32_t target_type_id)
+{
+    return type != NULL && type->element_type_id == element_type_id &&
+           type->target_type_id == target_type_id;
+}
+
+static bool decode_model_type_ref_id_valid(const OspreyModel *model,
+                                           uint32_t id)
+{
+    return model != NULL && id < model->type_count && model->types != NULL;
+}
+
+static int decode_model_type_ref_compare(const OspreyModel *model,
+                                         uint32_t left_id,
+                                         uint32_t right_id)
+{
+    const OspreyDecodedType *left;
+    const OspreyDecodedType *right;
+    int c;
+
+    if (model == NULL || left_id >= model->type_count ||
+        right_id >= model->type_count || model->types == NULL) {
+        return decode_cmp_u64(left_id, right_id);
+    }
+    left = &model->types[left_id];
+    right = &model->types[right_id];
+    c = decode_cmp_u64(left->kind, right->kind);
+    if (c != 0) return c;
+    if (left->kind == OSPREY_TYPE_PRIMITIVE &&
+        right->kind == OSPREY_TYPE_PRIMITIVE) {
+        return decode_cmp_u64(left->size, right->size);
+    }
+    if (left->kind != OSPREY_TYPE_POINTER ||
+        right->kind != OSPREY_TYPE_POINTER) return decode_cmp_u64(left_id,
+                                                                   right_id);
+    c = decode_cmp_u64(left->target_is_void, right->target_is_void);
+    if (c != 0) return c;
+    if (!left->target_is_void && !right->target_is_void) {
+        uint8_t left_kind = 0;
+        uint8_t right_kind = 0;
+        if (left->target_type_id < model->type_count) {
+            left_kind = model->types[left->target_type_id].kind;
+        }
+        if (right->target_type_id < model->type_count) {
+            right_kind = model->types[right->target_type_id].kind;
+        }
+        c = decode_cmp_u64(left_kind, right_kind);
+        if (c != 0) return c;
+    }
+    return decode_address_compare(&left->canonical_base,
+                                 &right->canonical_base);
+}
+
+static int decode_model_type_compare(const OspreyModel *model,
+                                     const OspreyDecodedType *left,
+                                     const OspreyDecodedType *right)
+{
+    int c;
+
+    if (left == NULL || right == NULL) return left == right ? 0 :
+        (left == NULL ? -1 : 1);
+    c = decode_cmp_u64(left->kind, right->kind);
+    if (c != 0) return c;
+    if (left->kind == OSPREY_TYPE_PRIMITIVE) {
+        return decode_cmp_u64(left->size, right->size);
+    }
+    if (left->kind == OSPREY_TYPE_POINTER) {
+        c = decode_cmp_u64(left->target_is_void, right->target_is_void);
+        if (c != 0) return c;
+        if (!left->target_is_void && !right->target_is_void) {
+            uint8_t left_kind = 0;
+            uint8_t right_kind = 0;
+            if (model != NULL && left->target_type_id < model->type_count) {
+                left_kind = model->types[left->target_type_id].kind;
+            }
+            if (model != NULL && right->target_type_id < model->type_count) {
+                right_kind = model->types[right->target_type_id].kind;
+            }
+            c = decode_cmp_u64(left_kind, right_kind);
+            if (c != 0) return c;
+        }
+        return decode_address_compare(&left->canonical_base,
+                                      &right->canonical_base);
+    }
+    c = decode_address_compare(&left->canonical_base,
+                               &right->canonical_base);
+    if (c != 0) return c;
+    if (left->kind == OSPREY_TYPE_ARRAY) {
+        c = decode_cmp_u64(left->size, right->size);
+        if (c != 0) return c;
+        c = decode_cmp_u64(left->element_count, right->element_count);
+        if (c != 0) return c;
+        c = decode_cmp_u64(left->element_size, right->element_size);
+        return c != 0 ? c : decode_model_type_ref_compare(
+            model, left->element_type_id, right->element_type_id);
+    }
+    c = decode_cmp_u64(left->field_count, right->field_count);
+    if (c != 0) return c;
+    if (model == NULL ||
+        left->field_begin > model->field_count ||
+        right->field_begin > model->field_count ||
+        left->field_count > model->field_count - left->field_begin ||
+        right->field_count > model->field_count - right->field_begin ||
+        (left->field_count != 0 && model->fields == NULL) ||
+        (right->field_count != 0 && model->fields == NULL)) {
+        c = decode_cmp_u64(left->field_begin, right->field_begin);
+        return c != 0 ? c : decode_cmp_u64(left->field_count,
+                                            right->field_count);
+    }
+    for (uint32_t i = 0; i < left->field_count; i++) {
+        const OspreyDecodedField *lf = &model->fields[left->field_begin + i];
+        const OspreyDecodedField *rf = &model->fields[right->field_begin + i];
+        c = decode_cmp_u64(lf->relative_offset, rf->relative_offset);
+        if (c != 0) return c;
+        c = decode_chunk_compare(&lf->chunk, &rf->chunk);
+        if (c != 0) return c;
+        c = decode_model_type_ref_compare(model, lf->value_type_id,
+                                          rf->value_type_id);
+        if (c != 0) return c;
+    }
+    return 0;
+}
+
+static bool decode_model_expected_name(const OspreyModel *model,
+                                       uint32_t id, char *buffer,
+                                       size_t buffer_size)
+{
+    return decode_model_type_name(model, id, buffer, buffer_size);
+}
+
+static bool decode_model_type_key_matches(const OspreyModel *model,
+                                          uint32_t id,
+                                          const OspreyKey *key)
+{
+    OspreyKey expected;
+    if (model == NULL || key == NULL || id >= model->type_count) return false;
+    expected = decode_model_type_key(model, &model->types[id]);
+    return decode_key_compare(&expected, key) == 0;
+}
+
+static int decode_model_object_find(const OspreyModel *model,
+                                    const OspreyChunk *chunk)
+{
+    if (model == NULL || chunk == NULL || model->objects == NULL) return -1;
+    for (uint32_t i = 0; i < model->object_count; i++) {
+        if (decode_chunk_compare(&model->objects[i].chunk, chunk) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static int decode_model_aggregate_find(const OspreyModel *model,
+                                       const OspreyAddress *base,
+                                       uint8_t *kind_out)
+{
+    int found = -1;
+    uint8_t kind = 0;
+    if (model == NULL || base == NULL || model->types == NULL) return -1;
+    for (uint32_t i = 0; i < model->type_count; i++) {
+        const OspreyDecodedType *type = &model->types[i];
+        if (type->kind != OSPREY_TYPE_STRUCT &&
+            type->kind != OSPREY_TYPE_ARRAY) continue;
+        if (decode_address_compare(&type->canonical_base, base) != 0) continue;
+        if (found >= 0) return -2;
+        found = (int)i;
+        kind = type->kind;
+    }
+    if (kind_out != NULL) *kind_out = kind;
+    return found;
+}
+
+static bool decode_model_type_extent_valid(const OspreyContext *ctx,
+                                           const OspreyDecodedType *type)
+{
+    int64_t end;
+    if (ctx == NULL || type == NULL ||
+        (type->kind != OSPREY_TYPE_STRUCT && type->kind != OSPREY_TYPE_ARRAY) ||
+        type->size == 0 || type->size > (uint64_t)INT64_MAX ||
+        !osprey_check_add(type->canonical_base.offset,
+                          (int64_t)type->size, &end)) return false;
+    return decode_model_extent_span_contains(ctx, &type->canonical_base.region,
+                                             type->canonical_base.offset, end);
+}
+
+static bool decode_model_double_valid(double value)
+{
+    return isfinite(value) && value >= 0.0 && value <= 1.0;
+}
+
+static uint64_t decode_model_double_bits(double value)
+{
+    uint64_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static const OspreyVar *decode_model_graph_candidate(
+    const OspreyContext *ctx, uint8_t kind, const OspreyVarPayload *payload)
+{
+    OspreyKey key;
+    gpointer indexed;
+    uintptr_t raw;
+    uint32_t id;
+    const OspreyVar *variable;
+
+    if (ctx == NULL || ctx->graph == NULL || ctx->graph->vars == NULL ||
+        ctx->graph->var_index == NULL || payload == NULL ||
+        !isfinite(ctx->config.report_threshold) ||
+        ctx->config.report_threshold < 0.0 ||
+        ctx->config.report_threshold > 1.0 ||
+        !osprey_var_payload_valid(kind, payload)) {
+        return NULL;
+    }
+    key = osprey_var_key(kind, payload);
+    indexed = g_hash_table_lookup(ctx->graph->var_index, &key);
+    raw = (uintptr_t)indexed;
+    if (raw == 0 || raw - 1u > UINT32_MAX) return NULL;
+    id = (uint32_t)(raw - 1u);
+    if (id >= ctx->graph->vars->len) return NULL;
+    variable = &g_array_index(ctx->graph->vars, OspreyVar, id);
+    if (variable->id != id || variable->kind != kind ||
+        !variable->belief_valid || variable->hard_false ||
+        !decode_model_double_valid(variable->belief) ||
+        variable->belief < ctx->config.report_threshold) {
+        return NULL;
+    }
+    OspreyKey actual = osprey_var_key(variable->kind, &variable->payload);
+    return decode_key_compare(&key, &actual) == 0 ? variable : NULL;
+}
+
+static bool decode_model_evidence_matches(const OspreyVar *variable,
+                                          double posterior,
+                                          uint64_t support,
+                                          uint64_t source_rule_bits)
+{
+    return variable != NULL &&
+           decode_model_double_bits(variable->belief) ==
+               decode_model_double_bits(posterior) &&
+           variable->direct_support == support &&
+           variable->source_rule_bits == source_rule_bits;
+}
+
+static bool decode_model_type_identity_valid(const OspreyModel *model,
+                                             uint32_t id)
+{
+    const OspreyDecodedType *type = &model->types[id];
+    char expected_name[512];
+    uint8_t zero_reserved[7] = { 0 };
+    bool name_valid = false;
+
+    if (type->kind >= OSPREY_TYPE_PRIMITIVE &&
+        type->kind <= OSPREY_TYPE_STRUCT && type->target_is_void <= 1 &&
+        type->reserved == 0 && memcmp(type->reserved2, zero_reserved,
+                                      sizeof(zero_reserved)) == 0 &&
+        model->type_names != NULL && model->type_names[id] != NULL) {
+        /* A bad non-void target ID belongs to the reference family.  Do not
+         * dereference it while checking the derived pointer spelling. */
+        name_valid = type->kind == OSPREY_TYPE_POINTER &&
+                     !type->target_is_void &&
+                     type->target_type_id >= model->type_count;
+        if (name_valid ||
+            (decode_model_expected_name(model, id, expected_name,
+                                        sizeof(expected_name)) &&
+             strcmp(model->type_names[id], expected_name) == 0)) {
+            name_valid = true;
+        }
+    }
+    if (!name_valid) return false;
+
+    switch (type->kind) {
+    case OSPREY_TYPE_PRIMITIVE:
+        return type->target_is_void == 0 &&
+               decode_address_zero(&type->canonical_base) &&
+               type->element_count == 0 && type->element_size == 0 &&
+               decode_model_type_ids_inactive(type, UINT32_MAX, UINT32_MAX) &&
+               type->field_begin == 0 && type->field_count == 0 &&
+               type->evidence_valid == 0 && type->posterior == 0.0 &&
+               type->direct_support == 0 && type->source_rule_bits == 0;
+    case OSPREY_TYPE_POINTER:
+        return type->element_count == 0 && type->element_size == 0 &&
+               decode_model_type_ids_inactive(type, UINT32_MAX,
+                                              type->target_is_void
+                                              ? UINT32_MAX
+                                              : type->target_type_id) &&
+               type->field_begin == 0 && type->field_count == 0 &&
+               type->evidence_valid == 0 && type->posterior == 0.0 &&
+               type->direct_support == 0 && type->source_rule_bits == 0;
+    case OSPREY_TYPE_ARRAY:
+        return type->target_is_void == 0 && type->target_type_id == UINT32_MAX &&
+               type->field_begin == 0 && type->field_count == 0 &&
+               type->evidence_valid == 1 &&
+               decode_model_double_valid(type->posterior);
+    case OSPREY_TYPE_STRUCT:
+        return type->target_is_void == 0 && type->target_type_id == UINT32_MAX &&
+               type->element_count == 0 && type->element_size == 0 &&
+               type->element_type_id == UINT32_MAX && type->evidence_valid == 1 &&
+               decode_model_double_valid(type->posterior);
+    default:
+        return false;
+    }
+}
+
+static bool decode_model_type_order_valid(const OspreyModel *model)
+{
+    if (model == NULL || (model->type_count != 0 && model->types == NULL))
+        return false;
+    for (uint32_t i = 0; i < model->type_count; i++) {
+        if (model->types[i].id != i) return false;
+        if (i != 0 && decode_model_type_compare(
+                model, &model->types[i - 1], &model->types[i]) >= 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool decode_model_type_sizes_valid(const OspreyContext *ctx,
+                                          const OspreyModel *model)
+{
+    if (ctx == NULL || model == NULL ||
+        (model->type_count != 0 && model->types == NULL)) return false;
+    for (uint32_t i = 0; i < model->type_count; i++) {
+        const OspreyDecodedType *type = &model->types[i];
+        if (type->kind == OSPREY_TYPE_PRIMITIVE) {
+            if (type->size == 0 || type->size > (uint64_t)INT64_MAX) {
+                return false;
+            }
+        } else if (type->kind == OSPREY_TYPE_POINTER) {
+            if (type->size != sizeof(target_ulong)) return false;
+        } else if (type->kind == OSPREY_TYPE_ARRAY) {
+            uint64_t product;
+            if (type->size == 0 || type->size > (uint64_t)INT64_MAX ||
+                type->element_count == 0 ||
+                type->element_size == 0 ||
+                type->element_count > UINT64_MAX / type->element_size ||
+                (product = type->element_count * type->element_size) !=
+                    type->size) {
+                return false;
+            }
+        } else if (type->kind == OSPREY_TYPE_STRUCT) {
+            uint64_t max_end = 0;
+            if (type->size == 0 || type->size > (uint64_t)INT64_MAX ||
+                type->field_count == 0 ||
+                type->field_begin > model->field_count ||
+                type->field_count > model->field_count - type->field_begin) {
+                return false;
+            }
+            for (uint32_t j = 0; j < type->field_count; j++) {
+                const OspreyDecodedField *field = &model->fields[
+                    type->field_begin + j];
+                if (field->chunk.size == 0 ||
+                    field->chunk.size > (uint64_t)INT64_MAX ||
+                    field->relative_offset > (uint64_t)INT64_MAX ||
+                    field->relative_offset >
+                        (uint64_t)INT64_MAX - field->chunk.size) return false;
+                uint64_t end = field->relative_offset + field->chunk.size;
+                if (end > max_end) max_end = end;
+            }
+            if (max_end == 0 || type->size != max_end) return false;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool decode_model_type_references_valid(const OspreyModel *model)
+{
+    if (model == NULL ||
+        (model->type_count != 0 && model->types == NULL)) return false;
+    for (uint32_t i = 0; i < model->type_count; i++) {
+        const OspreyDecodedType *type = &model->types[i];
+        if (type->kind == OSPREY_TYPE_POINTER) {
+            if (type->target_is_void) {
+                if (type->target_type_id != UINT32_MAX) return false;
+                if (decode_model_aggregate_find(model,
+                                                &type->canonical_base, NULL) >= 0) {
+                    return false;
+                }
             } else {
-                sp.raw_start = ri->raw_base +
-                               (uint64_t)o->chunk.address.offset;
-                /* raw_max is already the exclusive end of the runtime
-                 * region.  Adding the full span to an interior object
-                 * start would extend the lookup beyond the allocation or
-                 * global window. */
-                sp.raw_end = ri->raw_max;
+                uint8_t aggregate_kind = 0;
+                int target = decode_model_aggregate_find(
+                    model, &type->canonical_base, &aggregate_kind);
+                if (target < 0 || type->target_type_id != (uint32_t)target ||
+                    type->target_type_id >= model->type_count ||
+                    (model->types[type->target_type_id].kind !=
+                         OSPREY_TYPE_STRUCT &&
+                     model->types[type->target_type_id].kind !=
+                         OSPREY_TYPE_ARRAY) ||
+                    aggregate_kind != model->types[type->target_type_id].kind) {
+                    return false;
+                }
             }
-            sp.obj_idx = j;
-            sp.is_chunk = 0;
-            g_array_append_val(m->raw_spans, sp);
-            break;
+        } else if (type->kind == OSPREY_TYPE_ARRAY) {
+            if (!decode_model_type_ref_id_valid(model, type->element_type_id) ||
+                (model->types[type->element_type_id].kind !=
+                     OSPREY_TYPE_PRIMITIVE &&
+                 model->types[type->element_type_id].kind !=
+                     OSPREY_TYPE_POINTER) ||
+                model->types[type->element_type_id].size != type->element_size) {
+                return false;
+            }
+        } else if (type->kind == OSPREY_TYPE_STRUCT) {
+            if (type->field_begin > model->field_count ||
+                type->field_count > model->field_count - type->field_begin) {
+                return false;
+            }
+            for (uint32_t j = 0; j < type->field_count; j++) {
+                const OspreyDecodedField *field = &model->fields[
+                    type->field_begin + j];
+                if (!decode_model_type_ref_id_valid(model,
+                                                    field->value_type_id)) {
+                    return false;
+                }
+                const OspreyDecodedType *value =
+                    &model->types[field->value_type_id];
+                if (value->kind == OSPREY_TYPE_PRIMITIVE ||
+                    value->kind == OSPREY_TYPE_POINTER) continue;
+                if ((value->kind != OSPREY_TYPE_STRUCT &&
+                     value->kind != OSPREY_TYPE_ARRAY) ||
+                    value->size != field->chunk.size ||
+                    decode_address_compare(&value->canonical_base,
+                                           &field->chunk.address) != 0 ||
+                    decode_model_aggregate_find(model,
+                        &field->chunk.address, NULL) !=
+                        (int)field->value_type_id) {
+                    return false;
+                }
+            }
         }
     }
-    /* chunk-exact spans for scalars/fields/pointers */
-    for (guint j = 0; j < m->objects->len; j++) {
-        OspreyDecodedObject *o = &g_array_index(m->objects,
-                                                OspreyDecodedObject, j);
-        if (o->kind != OSPREY_DECODED_SCALAR &&
-            o->kind != OSPREY_DECODED_POINTER &&
-            o->kind != OSPREY_DECODED_FIELD) {
-            continue;
-        }
-        if (o->chunk.size == 0) continue;
-        for (guint i = 0; i < ctx->region_instances->len; i++) {
-            const OspreyRegionInstance *ri = &g_array_index(
-                ctx->region_instances, OspreyRegionInstance, i);
-            if (ri->region.kind != o->chunk.address.region.kind) continue;
-            if (ri->region.code_image_id !=
-                o->chunk.address.region.code_image_id)
-                continue;
-            if (ri->region.site_offset !=
-                o->chunk.address.region.site_offset)
-                continue;
-            OspRawSpan sp;
-            memset(&sp, 0, sizeof(sp));
-            sp.raw_start = ri->raw_base +
-                           (uint64_t)o->chunk.address.offset;
-            sp.raw_end = sp.raw_start + o->chunk.size;
-            sp.obj_idx = j;
-            sp.is_chunk = 1;
-            g_array_append_val(m->raw_spans, sp);
-            break;
-        }
-    }
-    /* sort by raw_start */
-    for (guint i = 1; i < m->raw_spans->len; i++) {
-        OspRawSpan v = g_array_index(m->raw_spans, OspRawSpan, i);
-        guint j2 = i;
-        while (j2 > 0 &&
-               g_array_index(m->raw_spans, OspRawSpan, j2 - 1).raw_start >
-                   v.raw_start) {
-            g_array_index(m->raw_spans, OspRawSpan, j2) =
-                g_array_index(m->raw_spans, OspRawSpan, j2 - 1);
-            j2--;
-        }
-        g_array_index(m->raw_spans, OspRawSpan, j2) = v;
-    }
+    return true;
+}
 
-    /* Pass 5: type names + type_id ordinals. */
-    for (guint i = 0; i < m->objects->len; i++) {
-        OspreyDecodedObject *o = &g_array_index(m->objects,
-                                                OspreyDecodedObject, i);
-        char name[128];
-        switch (o->kind) {
-        case OSPREY_DECODED_STRUCT:
-        case OSPREY_DECODED_FIELD:
-            {
-                char rn[64];
-                region_name(&o->parent_region, rn, sizeof(rn));
-                snprintf(name, sizeof(name), "struct_%s_off%llx", rn,
-                         (unsigned long long)o->parent_offset);
+static bool decode_model_aggregate_bases_valid(const OspreyContext *ctx,
+                                               const OspreyModel *model)
+{
+    if (ctx == NULL || model == NULL) return false;
+    for (uint32_t i = 0; i < model->type_count; i++) {
+        const OspreyDecodedType *left = &model->types[i];
+        if (left->kind != OSPREY_TYPE_STRUCT &&
+            left->kind != OSPREY_TYPE_ARRAY) continue;
+        if (!decode_model_type_extent_valid(ctx, left)) return false;
+        for (uint32_t j = 0; j < i; j++) {
+            const OspreyDecodedType *right = &model->types[j];
+            if ((right->kind == OSPREY_TYPE_STRUCT ||
+                 right->kind == OSPREY_TYPE_ARRAY) &&
+                decode_address_compare(&left->canonical_base,
+                                       &right->canonical_base) == 0) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool decode_model_fields_valid(const OspreyContext *ctx,
+                                      const OspreyModel *model)
+{
+    uint8_t *seen;
+    uint8_t *object_seen;
+    uint32_t expected_field_begin = 0;
+
+    if (ctx == NULL || model == NULL ||
+        (model->field_count != 0 && model->fields == NULL) ||
+        (model->object_count != 0 && model->objects == NULL)) return false;
+    seen = model->field_count == 0 ? NULL :
+        g_try_malloc0((size_t)model->field_count);
+    object_seen = model->object_count == 0 ? NULL :
+        g_try_malloc0((size_t)model->object_count);
+    if ((model->field_count != 0 && seen == NULL) ||
+        (model->object_count != 0 && object_seen == NULL)) {
+        g_free(seen);
+        g_free(object_seen);
+        return false;
+    }
+    for (uint32_t i = 0; i < model->type_count; i++) {
+        const OspreyDecodedType *type = &model->types[i];
+        if (type->kind != OSPREY_TYPE_STRUCT) continue;
+        /* The field array is canonical model state, not merely a bag of
+         * disjoint ranges: structure order must own contiguous ranges in the
+         * same order or a range permutation changes IDs and dump bytes. */
+        if (type->field_begin != expected_field_begin ||
+            type->field_count > model->field_count - expected_field_begin) {
+            g_free(seen);
+            g_free(object_seen);
+            return false;
+        }
+        expected_field_begin += type->field_count;
+        int64_t previous_end = 0;
+        for (uint32_t j = 0; j < type->field_count; j++) {
+            uint32_t field_index = type->field_begin + j;
+            const OspreyDecodedField *field;
+            int object_index;
+            int64_t relative;
+            int64_t end;
+            if (field_index >= model->field_count || seen[field_index]) {
+                g_free(seen);
+                g_free(object_seen);
+                return false;
+            }
+            field = &model->fields[field_index];
+            if (!decode_region_valid(&field->chunk.address.region) ||
+                decode_region_compare(&field->chunk.address.region,
+                                      &type->canonical_base.region) != 0 ||
+                !decode_chunk_end(&field->chunk, &end) ||
+                !osprey_check_sub(field->chunk.address.offset,
+                                  type->canonical_base.offset, &relative) ||
+                relative < 0 || (uint64_t)relative != field->relative_offset ||
+                (j != 0 && previous_end > field->chunk.address.offset) ||
+                !decode_model_extent_span_contains(ctx,
+                    &field->chunk.address.region,
+                    field->chunk.address.offset, end) ||
+                !decode_model_type_ref_id_valid(model, field->value_type_id)) {
+                g_free(seen);
+                g_free(object_seen);
+                return false;
+            }
+            object_index = decode_model_object_find(model, &field->chunk);
+            if (object_index < 0 ||
+                model->objects[object_index].storage_role !=
+                    OSPREY_STORAGE_FIELD ||
+                decode_address_compare(
+                    &model->objects[object_index].owner_base,
+                    &type->canonical_base) != 0 ||
+                model->objects[object_index].value_type_id !=
+                    field->value_type_id ||
+                decode_model_double_bits(
+                    model->objects[object_index].storage_posterior) !=
+                    decode_model_double_bits(field->posterior) ||
+                model->objects[object_index].storage_support != field->support ||
+                model->objects[object_index].storage_source_rule_bits !=
+                    field->source_rule_bits) {
+                g_free(seen);
+                g_free(object_seen);
+                return false;
+            }
+            object_seen[object_index] = 1;
+            previous_end = end;
+            seen[field_index] = 1;
+        }
+    }
+    for (uint32_t i = 0; i < model->field_count; i++) {
+        if (!seen[i]) {
+            g_free(seen);
+            g_free(object_seen);
+            return false;
+        }
+    }
+    for (uint32_t i = 0; i < model->object_count; i++) {
+        if (model->objects[i].storage_role == OSPREY_STORAGE_FIELD &&
+            !object_seen[i]) {
+            g_free(seen);
+            g_free(object_seen);
+            return false;
+        }
+    }
+    g_free(seen);
+    g_free(object_seen);
+    return true;
+}
+
+static int decode_model_array_for_base(const OspreyModel *model,
+                                       const OspreyAddress *base)
+{
+    if (model == NULL || base == NULL) return -1;
+    for (uint32_t i = 0; i < model->type_count; i++) {
+        if (model->types[i].kind == OSPREY_TYPE_ARRAY &&
+            decode_address_compare(&model->types[i].canonical_base, base) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static bool decode_model_arrays_valid(const OspreyContext *ctx,
+                                      const OspreyModel *model)
+{
+    if (ctx == NULL || model == NULL) return false;
+    for (uint32_t i = 0; i < model->type_count; i++) {
+        const OspreyDecodedType *array = &model->types[i];
+        if (array->kind != OSPREY_TYPE_ARRAY) continue;
+        int64_t array_end;
+        uint64_t positions = 0;
+        uint64_t previous_position = 0;
+        uint32_t common_type = UINT32_MAX;
+        bool have_position = false;
+        bool full = true;
+        if (!osprey_check_add(array->canonical_base.offset,
+                              (int64_t)array->size, &array_end) ||
+            !decode_model_extent_span_contains(ctx,
+                &array->canonical_base.region, array->canonical_base.offset,
+                array_end)) return false;
+        for (uint32_t j = 0; j < model->object_count; j++) {
+            const OspreyDecodedObject *object = &model->objects[j];
+            int64_t delta;
+            int64_t object_end;
+            uint64_t position;
+            bool owned = object->storage_role ==
+                             OSPREY_STORAGE_ARRAY_ELEMENT &&
+                         decode_address_compare(&object->owner_base,
+                                                &array->canonical_base) == 0;
+            bool same_region = decode_region_compare(
+                &object->chunk.address.region,
+                &array->canonical_base.region) == 0;
+            if (owned && !same_region) return false;
+            if (!same_region) continue;
+            if (!decode_chunk_end(&object->chunk, &object_end)) return false;
+            bool overlaps = object->chunk.address.offset < array_end &&
+                            array->canonical_base.offset < object_end;
+            if (!overlaps) {
+                if (owned) return false;
+                continue;
+            }
+            /* A selected array owns every observed chunk that intersects its
+             * span.  Leaving an overlapping scalar/field/primitive object in
+             * place would publish contradictory storage ownership. */
+            if (!owned ||
+                !osprey_check_sub(object->chunk.address.offset,
+                                  array->canonical_base.offset, &delta) ||
+                delta < 0 || (uint64_t)delta % array->element_size != 0 ||
+                object->chunk.size > array->element_size ||
+                object_end > array_end) {
+                return false;
+            }
+            position = (uint64_t)delta / array->element_size;
+            if (position >= array->element_count ||
+                (have_position && position < previous_position)) return false;
+            if (have_position && position == previous_position) {
+                /* Distinct observed widths at one element position are legal
+                 * members, but they preclude a unique homogeneous value type. */
+                full = false;
+            } else {
+                previous_position = position;
+                have_position = true;
+                positions++;
+            }
+            if (object->chunk.size != array->element_size) {
+                full = false;
+            } else if (common_type == UINT32_MAX) {
+                common_type = object->value_type_id;
+            } else if (common_type != object->value_type_id) {
+                full = false;
+            }
+        }
+        if (positions != array->element_count) full = false;
+        if (full) {
+            if (common_type == UINT32_MAX ||
+                common_type != array->element_type_id) return false;
+        } else {
+            uint32_t primitive = UINT32_MAX;
+            for (uint32_t j = 0; j < model->type_count; j++) {
+                if (model->types[j].kind == OSPREY_TYPE_PRIMITIVE &&
+                    model->types[j].size == array->element_size) {
+                    primitive = j;
+                    break;
+                }
+            }
+            if (primitive == UINT32_MAX || array->element_type_id != primitive) {
+                return false;
+            }
+        }
+        for (uint32_t j = i + 1; j < model->type_count; j++) {
+            const OspreyDecodedType *other = &model->types[j];
+            int64_t other_end;
+            if (other->kind != OSPREY_TYPE_ARRAY ||
+                decode_region_compare(&array->canonical_base.region,
+                                      &other->canonical_base.region) != 0) {
+                continue;
+            }
+            if (!osprey_check_add(other->canonical_base.offset,
+                                  (int64_t)other->size, &other_end)) {
+                return false;
+            }
+            if (array->canonical_base.offset < other_end &&
+                other->canonical_base.offset < array_end) return false;
+        }
+    }
+    for (uint32_t i = 0; i < model->object_count; i++) {
+        const OspreyDecodedObject *object = &model->objects[i];
+        if (object->storage_role != OSPREY_STORAGE_ARRAY_ELEMENT) continue;
+        if (decode_model_array_for_base(model, &object->owner_base) < 0) return false;
+    }
+    return true;
+}
+
+static bool decode_model_objects_order_valid(const OspreyModel *model)
+{
+    if (model == NULL || (model->object_count != 0 && model->objects == NULL)) {
+        return false;
+    }
+    for (uint32_t i = 1; i < model->object_count; i++) {
+        if (decode_chunk_compare(&model->objects[i - 1].chunk,
+                                 &model->objects[i].chunk) >= 0) return false;
+    }
+    return true;
+}
+
+static bool decode_model_objects_identity_valid(const OspreyContext *ctx,
+                                               const OspreyModel *model)
+{
+    if (ctx == NULL || model == NULL) return false;
+    for (uint32_t i = 0; i < model->object_count; i++) {
+        int64_t end;
+        const OspreyDecodedObject *object = &model->objects[i];
+        if (!decode_region_valid(&object->chunk.address.region) ||
+            object->chunk.size == 0 || object->chunk.size > (uint64_t)INT64_MAX ||
+            !decode_chunk_end(&object->chunk, &end) ||
+            !decode_model_extent_span_contains(ctx,
+                &object->chunk.address.region, object->chunk.address.offset,
+                end)) return false;
+    }
+    return true;
+}
+
+static bool decode_model_objects_roles_valid(const OspreyModel *model)
+{
+    if (model == NULL) return false;
+    for (uint32_t i = 0; i < model->object_count; i++) {
+        const OspreyDecodedObject *object = &model->objects[i];
+        if (object->storage_role < OSPREY_STORAGE_PRIMITIVE ||
+            object->storage_role > OSPREY_STORAGE_ARRAY_ELEMENT ||
+            object->has_pointer_target > 1) return false;
+        if ((object->storage_role == OSPREY_STORAGE_PRIMITIVE ||
+             object->storage_role == OSPREY_STORAGE_SCALAR) &&
+            !decode_address_zero(&object->owner_base)) return false;
+    }
+    return true;
+}
+
+static bool decode_model_objects_references_valid(const OspreyContext *ctx,
+                                                  const OspreyModel *model)
+{
+    if (ctx == NULL || model == NULL) return false;
+    for (uint32_t i = 0; i < model->object_count; i++) {
+        const OspreyDecodedObject *object = &model->objects[i];
+        const OspreyDecodedType *value;
+        if (!decode_model_type_ref_id_valid(model, object->value_type_id)) return false;
+        value = &model->types[object->value_type_id];
+        if (object->has_pointer_target) {
+            int target;
+            if (object->chunk.size != sizeof(target_ulong) ||
+                !decode_model_extent_contains(ctx, &object->pointer_target) ||
+                value->kind != OSPREY_TYPE_POINTER ||
+                decode_address_compare(&value->canonical_base,
+                                       &object->pointer_target) != 0) return false;
+            target = decode_model_aggregate_find(model,
+                                                 &object->pointer_target, NULL);
+            if ((value->target_is_void && target >= 0) ||
+                (!value->target_is_void &&
+                 (target < 0 || value->target_type_id != (uint32_t)target))) {
+                return false;
+            }
+        } else if (value->kind == OSPREY_TYPE_PRIMITIVE) {
+            if (value->size != object->chunk.size) return false;
+        } else if (object->storage_role == OSPREY_STORAGE_FIELD &&
+                   (value->kind == OSPREY_TYPE_STRUCT ||
+                    value->kind == OSPREY_TYPE_ARRAY) &&
+                   value->size == object->chunk.size &&
+                   decode_address_compare(&value->canonical_base,
+                                          &object->chunk.address) == 0) {
+            /* Legal by-value aggregate edge; cycle validation owns the
+             * recursive check. */
+        } else {
+            return false;
+        }
+        if (object->storage_role == OSPREY_STORAGE_FIELD) {
+            int type = decode_model_aggregate_find(model, &object->owner_base,
+                                                   NULL);
+            if (type < 0 || model->types[type].kind != OSPREY_TYPE_STRUCT) {
+                return false;
+            }
+        } else if (object->storage_role == OSPREY_STORAGE_ARRAY_ELEMENT &&
+                   decode_model_array_for_base(model, &object->owner_base) < 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool decode_model_objects_evidence_valid(const OspreyContext *ctx,
+                                                const OspreyModel *model)
+{
+    if (ctx == NULL || model == NULL) return false;
+    for (uint32_t i = 0; i < model->type_count; i++) {
+        const OspreyDecodedType *type = &model->types[i];
+        if (type->kind == OSPREY_TYPE_STRUCT) {
+            double posterior = 1.0;
+            uint64_t support = UINT64_MAX;
+            uint64_t rules = 0;
+            for (uint32_t j = 0; j < type->field_count; j++) {
+                const OspreyDecodedField *field = &model->fields[
+                    type->field_begin + j];
+                if (field->posterior < posterior) posterior = field->posterior;
+                if (field->support < support) support = field->support;
+                rules |= field->source_rule_bits;
+            }
+            if (support == UINT64_MAX) support = 0;
+            if (decode_model_double_bits(type->posterior) !=
+                    decode_model_double_bits(posterior) ||
+                type->direct_support != support ||
+                type->source_rule_bits != rules) return false;
+        } else if (type->kind == OSPREY_TYPE_ARRAY) {
+            OspreyVarPayload payload;
+            int64_t hi;
+            memset(&payload, 0, sizeof(payload));
+            if (type->element_size > (uint64_t)INT64_MAX ||
+                !osprey_check_add(type->canonical_base.offset,
+                                  (int64_t)type->size, &hi)) {
+                return false;
+            }
+            payload.segment.a1 = type->canonical_base;
+            payload.segment.a2.region = type->canonical_base.region;
+            payload.segment.a2.offset = hi;
+            payload.segment.size = (int64_t)type->element_size;
+            if (!decode_model_evidence_matches(
+                    decode_model_graph_candidate(ctx, OSPREY_PRED_ARRAY,
+                                                 &payload),
+                    type->posterior, type->direct_support,
+                    type->source_rule_bits)) {
+                return false;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < model->object_count; i++) {
+        const OspreyDecodedObject *object = &model->objects[i];
+        OspreyVarPayload payload;
+        const OspreyVar *role = NULL;
+        memset(&payload, 0, sizeof(payload));
+        if (object->reserved != 0 ||
+            !decode_model_double_valid(object->storage_posterior) ||
+            !decode_model_double_valid(object->pointer_posterior)) return false;
+        switch (object->storage_role) {
+        case OSPREY_STORAGE_PRIMITIVE:
+            payload.chunk = object->chunk;
+            role = decode_model_graph_candidate(
+                ctx, OSPREY_PRED_PRIMITIVE_VAR, &payload);
+            if (role == NULL) {
+                if (decode_model_double_bits(object->storage_posterior) != 0 ||
+                    object->storage_support != 0 ||
+                    object->storage_source_rule_bits != 0) return false;
+            } else if (!decode_model_evidence_matches(
+                           role, object->storage_posterior,
+                           object->storage_support,
+                           object->storage_source_rule_bits)) {
+                return false;
             }
             break;
-        case OSPREY_DECODED_ARRAY:
-            {
-                char rn[64];
-                region_name(&o->chunk.address.region, rn, sizeof(rn));
-                snprintf(name, sizeof(name), "array_%s_%llx", rn,
-                         (unsigned long long)o->chunk.address.offset);
-            }
+        case OSPREY_STORAGE_SCALAR:
+            payload.chunk = object->chunk;
+            role = decode_model_graph_candidate(ctx, OSPREY_PRED_SCALAR,
+                                                &payload);
+            if (!decode_model_evidence_matches(
+                    role, object->storage_posterior,
+                    object->storage_support,
+                    object->storage_source_rule_bits)) return false;
             break;
-        case OSPREY_DECODED_POINTER:
-            {
-                char rn[64];
-                region_name(&o->parent_region, rn, sizeof(rn));
-                snprintf(name, sizeof(name), "ptr_%s_%llx", rn,
-                         (unsigned long long)o->parent_offset);
-            }
+        case OSPREY_STORAGE_FIELD:
+            payload.attached.chunk = object->chunk;
+            payload.attached.base = object->owner_base;
+            role = decode_model_graph_candidate(ctx, OSPREY_PRED_FIELD_OF,
+                                                &payload);
+            if (!decode_model_evidence_matches(
+                    role, object->storage_posterior,
+                    object->storage_support,
+                    object->storage_source_rule_bits)) return false;
             break;
-        case OSPREY_DECODED_SCALAR:
+        case OSPREY_STORAGE_ARRAY_ELEMENT: {
+            int array = decode_model_array_for_base(model, &object->owner_base);
+            if (array < 0 ||
+                decode_model_double_bits(object->storage_posterior) !=
+                    decode_model_double_bits(model->types[array].posterior) ||
+                object->storage_support != model->types[array].direct_support ||
+                object->storage_source_rule_bits !=
+                    model->types[array].source_rule_bits) return false;
+            /* The selected array owns storage even when a field candidate
+             * was eligible before array scheduling.  The field candidate is
+             * a discarded role, not malformed graph evidence; the array
+             * decision supplies the object's final storage evidence. */
+            break;
+        }
         default:
-            snprintf(name, sizeof(name), "prim_%llx",
-                     (unsigned long long)o->chunk.size);
+            return false;
+        }
+        if (object->has_pointer_target) {
+            payload.attached.chunk = object->chunk;
+            payload.attached.base = object->pointer_target;
+            if (!decode_model_evidence_matches(
+                    decode_model_graph_candidate(ctx, OSPREY_PRED_POINTER,
+                                                 &payload),
+                    object->pointer_posterior, object->pointer_support,
+                    object->pointer_source_rule_bits)) return false;
+        } else if (!decode_address_zero(&object->pointer_target) ||
+                   decode_model_double_bits(object->pointer_posterior) != 0 ||
+                   object->pointer_support != 0 ||
+                   object->pointer_source_rule_bits != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool decode_model_index_order_valid(const OspreyModelIndexEntry *index,
+                                           uint32_t count)
+{
+    if (count != 0 && index == NULL) return false;
+    for (uint32_t i = 1; i < count; i++) {
+        if (decode_key_compare(&index[i - 1].key, &index[i].key) >= 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool decode_model_indexes_content_valid(const OspreyModel *model)
+{
+    uint8_t *seen = NULL;
+    if (model == NULL) return false;
+    if (model->chunk_index_count != model->object_count) return false;
+    seen = model->object_count == 0 ? NULL :
+        g_try_malloc0((size_t)model->object_count);
+    if (model->object_count != 0 && seen == NULL) return false;
+    for (uint32_t i = 0; i < model->chunk_index_count; i++) {
+        const OspreyModelIndexEntry *entry = &model->chunk_index[i];
+        OspreyKey expected;
+        if (entry->ordinal >= model->object_count || seen[entry->ordinal]) {
+            g_free(seen);
+            return false;
+        }
+        expected = osprey_chunk_key(&model->objects[entry->ordinal].chunk);
+        if (decode_key_compare(&entry->key, &expected) != 0) {
+            g_free(seen);
+            return false;
+        }
+        seen[entry->ordinal] = 1;
+    }
+    for (uint32_t i = 0; i < model->object_count; i++) {
+        if (!seen[i]) {
+            g_free(seen);
+            return false;
+        }
+    }
+    g_free(seen);
+
+    uint32_t aggregate_count = 0;
+    for (uint32_t i = 0; i < model->type_count; i++) {
+        if (model->types[i].kind == OSPREY_TYPE_STRUCT ||
+            model->types[i].kind == OSPREY_TYPE_ARRAY) aggregate_count++;
+    }
+    if (aggregate_count != model->aggregate_index_count) return false;
+    seen = model->type_count == 0 ? NULL : g_try_malloc0((size_t)model->type_count);
+    if (model->type_count != 0 && seen == NULL) return false;
+    for (uint32_t i = 0; i < model->aggregate_index_count; i++) {
+        const OspreyModelIndexEntry *entry = &model->aggregate_index[i];
+        OspreyKey expected;
+        if (entry->ordinal >= model->type_count || seen[entry->ordinal] ||
+            (model->types[entry->ordinal].kind != OSPREY_TYPE_STRUCT &&
+             model->types[entry->ordinal].kind != OSPREY_TYPE_ARRAY)) {
+            g_free(seen);
+            return false;
+        }
+        expected = decode_model_aggregate_key(&model->types[entry->ordinal]);
+        if (decode_key_compare(&entry->key, &expected) != 0) {
+            g_free(seen);
+            return false;
+        }
+        seen[entry->ordinal] = 1;
+    }
+    for (uint32_t i = 0; i < model->type_count; i++) {
+        if ((model->types[i].kind == OSPREY_TYPE_STRUCT ||
+             model->types[i].kind == OSPREY_TYPE_ARRAY) && !seen[i]) {
+            g_free(seen);
+            return false;
+        }
+    }
+    g_free(seen);
+
+    if (model->type_index_count != model->type_count) return false;
+    seen = model->type_count == 0 ? NULL : g_try_malloc0((size_t)model->type_count);
+    if (model->type_count != 0 && seen == NULL) return false;
+    for (uint32_t i = 0; i < model->type_index_count; i++) {
+        const OspreyModelIndexEntry *entry = &model->type_index[i];
+        if (entry->ordinal >= model->type_count || seen[entry->ordinal] ||
+            !decode_model_type_key_matches(model, entry->ordinal,
+                                            &entry->key)) {
+            g_free(seen);
+            return false;
+        }
+        seen[entry->ordinal] = 1;
+    }
+    for (uint32_t i = 0; i < model->type_count; i++) {
+        if (!seen[i]) {
+            g_free(seen);
+            return false;
+        }
+    }
+    g_free(seen);
+    return true;
+}
+
+static bool decode_model_by_value_cycles_valid(const OspreyModel *model)
+{
+    uint8_t *state;
+    uint32_t *stack;
+    uint32_t *edges;
+
+    if (model == NULL) return false;
+    state = model->type_count == 0 ? NULL :
+        g_try_malloc0((size_t)model->type_count);
+    stack = model->type_count == 0 ? NULL :
+        g_try_malloc((size_t)model->type_count * sizeof(*stack));
+    edges = model->type_count == 0 ? NULL :
+        g_try_malloc0((size_t)model->type_count * sizeof(*edges));
+    if (model->type_count != 0 &&
+        (state == NULL || stack == NULL || edges == NULL)) {
+        g_free(state);
+        g_free(stack);
+        g_free(edges);
+        return false;
+    }
+    for (uint32_t root = 0; root < model->type_count; root++) {
+        uint32_t depth = 0;
+        if (state[root] != 0) continue;
+        state[root] = 1;
+        stack[depth++] = root;
+        while (depth != 0) {
+            uint32_t current = stack[depth - 1];
+            const OspreyDecodedType *type = &model->types[current];
+            uint32_t child = UINT32_MAX;
+            if (type->kind == OSPREY_TYPE_STRUCT) {
+                if (edges[current] < type->field_count) {
+                    child = model->fields[type->field_begin +
+                                         edges[current]++].value_type_id;
+                }
+            } else if (type->kind == OSPREY_TYPE_ARRAY && edges[current] == 0) {
+                child = type->element_type_id;
+                edges[current] = 1;
+            }
+            if (child == UINT32_MAX ||
+                model->types[child].kind == OSPREY_TYPE_PRIMITIVE ||
+                model->types[child].kind == OSPREY_TYPE_POINTER) {
+                state[current] = 2;
+                depth--;
+                continue;
+            }
+            if (child >= model->type_count || state[child] == 1) {
+                g_free(state);
+                g_free(stack);
+                g_free(edges);
+                return false;
+            }
+            if (state[child] == 2) continue;
+            if (depth == model->type_count) {
+                g_free(state);
+                g_free(stack);
+                g_free(edges);
+                return false;
+            }
+            state[child] = 1;
+            stack[depth++] = child;
+        }
+    }
+    g_free(state);
+    g_free(stack);
+    g_free(edges);
+    return true;
+}
+
+static bool decode_model_runtime_spans_valid(const OspreyContext *ctx,
+                                             const OspreyModel *model)
+{
+    uint8_t *seen;
+    uint32_t matching = 0;
+
+    if (ctx == NULL || model == NULL ||
+        (model->raw_span_count != 0 &&
+         (ctx->region_instances == NULL || model->raw_spans == NULL))) {
+        return false;
+    }
+    seen = model->object_count == 0 ? NULL :
+        g_try_malloc0((size_t)model->object_count);
+    if (model->object_count != 0 && seen == NULL) return false;
+    for (uint32_t i = 0; i < model->raw_span_count; i++) {
+        const OspRawSpan *span = &model->raw_spans[i];
+        const OspreyRegionInstance *instance;
+        const OspreyDecodedObject *object;
+        uint32_t first_instance;
+        uint64_t raw_start;
+        uint64_t raw_end;
+        if (span->obj_idx >= model->object_count || seen[span->obj_idx] ||
+            span->source_instance_idx >= ctx->region_instances->len ||
+            span->is_chunk != 1 || span->reserved[0] != 0 ||
+            span->reserved[1] != 0 || span->reserved[2] != 0 ||
+            (i != 0 && (model->raw_spans[i - 1].raw_start > span->raw_start ||
+             (model->raw_spans[i - 1].raw_start == span->raw_start &&
+              (model->raw_spans[i - 1].raw_end > span->raw_end ||
+               (model->raw_spans[i - 1].raw_end == span->raw_end &&
+                decode_chunk_compare(
+                    &model->objects[model->raw_spans[i - 1].obj_idx].chunk,
+                    &model->objects[span->obj_idx].chunk) >= 0)))))) {
+            g_free(seen);
+            return false;
+        }
+        object = &model->objects[span->obj_idx];
+        instance = &g_array_index(ctx->region_instances,
+                                  OspreyRegionInstance,
+                                  span->source_instance_idx);
+        if (decode_region_compare(&instance->region,
+                                  &object->chunk.address.region) != 0 ||
+            instance->raw_min > instance->raw_max ||
+            decode_first_runtime_instance(ctx, &object->chunk.address.region,
+                                           &first_instance) == NULL ||
+            first_instance != span->source_instance_idx ||
+            !decode_signed_raw_add(instance->raw_base,
+                                   object->chunk.address.offset, &raw_start) ||
+            raw_start > UINT64_MAX - object->chunk.size ||
+            (raw_end = raw_start + object->chunk.size) <= raw_start ||
+            raw_start != span->raw_start || raw_end != span->raw_end ||
+            raw_start < instance->raw_min || raw_end > instance->raw_max ||
+            span->raw_end - span->raw_start != object->chunk.size) {
+            g_free(seen);
+            return false;
+        }
+        seen[span->obj_idx] = 1;
+    }
+    for (uint32_t i = 0; i < model->object_count; i++) {
+        uint32_t instance_ordinal;
+        bool has_instance = decode_first_runtime_instance(
+            ctx, &model->objects[i].chunk.address.region,
+            &instance_ordinal) != NULL;
+        if (has_instance) {
+            matching++;
+            if (!seen[i]) {
+                g_free(seen);
+                return false;
+            }
+        } else if (seen[i]) {
+            g_free(seen);
+            return false;
+        }
+    }
+    g_free(seen);
+    return matching == model->raw_span_count;
+}
+
+OspreyStatus osprey_model_validate(
+    const OspreyContext *ctx, const OspreyModel *model,
+    OspreyModelValidationError *error_out)
+{
+    if (error_out != NULL) *error_out = OSPREY_MODEL_VALIDATION_NONE;
+    if (model == NULL || model->version != OSPREY_MODEL_VERSION) {
+        return decode_model_invalid(error_out, OSPREY_MODEL_VALIDATION_VERSION);
+    }
+    if (!decode_model_ledger_valid(model)) {
+        return decode_model_invalid(error_out, OSPREY_MODEL_VALIDATION_LEDGER);
+    }
+    if (!decode_model_type_order_valid(model)) {
+        return decode_model_invalid(error_out, OSPREY_MODEL_VALIDATION_TYPE_ORDER);
+    }
+    for (uint32_t i = 0; i < model->type_count; i++) {
+        if (!decode_model_type_identity_valid(model, i)) {
+            return decode_model_invalid(error_out,
+                                        OSPREY_MODEL_VALIDATION_TYPE_IDENTITY);
+        }
+    }
+    if (!decode_model_type_sizes_valid(ctx, model)) {
+        return decode_model_invalid(error_out, OSPREY_MODEL_VALIDATION_TYPE_SIZE);
+    }
+    if (!decode_model_type_references_valid(model)) {
+        return decode_model_invalid(error_out,
+                                    OSPREY_MODEL_VALIDATION_TYPE_REFERENCE);
+    }
+    if (!decode_model_aggregate_bases_valid(ctx, model)) {
+        return decode_model_invalid(error_out,
+                                    OSPREY_MODEL_VALIDATION_AGGREGATE_BASE);
+    }
+    if (!decode_model_fields_valid(ctx, model)) {
+        return decode_model_invalid(error_out, OSPREY_MODEL_VALIDATION_FIELD);
+    }
+    if (!decode_model_arrays_valid(ctx, model)) {
+        return decode_model_invalid(error_out, OSPREY_MODEL_VALIDATION_ARRAY);
+    }
+    if (!decode_model_objects_order_valid(model)) {
+        return decode_model_invalid(error_out,
+                                    OSPREY_MODEL_VALIDATION_OBJECT_ORDER);
+    }
+    if (!decode_model_objects_identity_valid(ctx, model)) {
+        return decode_model_invalid(error_out,
+                                    OSPREY_MODEL_VALIDATION_OBJECT_IDENTITY);
+    }
+    if (!decode_model_objects_roles_valid(model)) {
+        return decode_model_invalid(error_out,
+                                    OSPREY_MODEL_VALIDATION_OBJECT_ROLE);
+    }
+    if (!decode_model_objects_references_valid(ctx, model)) {
+        return decode_model_invalid(error_out,
+                                    OSPREY_MODEL_VALIDATION_OBJECT_REFERENCE);
+    }
+    if (!decode_model_objects_evidence_valid(ctx, model)) {
+        return decode_model_invalid(error_out,
+                                    OSPREY_MODEL_VALIDATION_OBJECT_EVIDENCE);
+    }
+    if (!decode_model_index_order_valid(model->chunk_index,
+                                        model->chunk_index_count) ||
+        !decode_model_index_order_valid(model->aggregate_index,
+                                        model->aggregate_index_count) ||
+        !decode_model_index_order_valid(model->type_index,
+                                        model->type_index_count)) {
+        return decode_model_invalid(error_out,
+                                    OSPREY_MODEL_VALIDATION_INDEX_ORDER);
+    }
+    if (!decode_model_indexes_content_valid(model)) {
+        return decode_model_invalid(error_out,
+                                    OSPREY_MODEL_VALIDATION_INDEX_CONTENT);
+    }
+    if (!decode_model_by_value_cycles_valid(model)) {
+        return decode_model_invalid(error_out, OSPREY_MODEL_VALIDATION_CYCLE);
+    }
+    if (!decode_model_runtime_spans_valid(ctx, model)) {
+        return decode_model_invalid(error_out,
+                                    OSPREY_MODEL_VALIDATION_RUNTIME_SPAN);
+    }
+    return OSPREY_OK;
+}
+
+static const char *decode_model_type_kind_name(uint8_t kind)
+{
+    switch (kind) {
+    case OSPREY_TYPE_PRIMITIVE: return "primitive";
+    case OSPREY_TYPE_POINTER: return "pointer";
+    case OSPREY_TYPE_ARRAY: return "array";
+    case OSPREY_TYPE_STRUCT: return "struct";
+    default: return "invalid";
+    }
+}
+
+static bool decode_model_dump_address(FILE *out, const char *label,
+                                      const OspreyAddress *address)
+{
+    if (out == NULL || label == NULL || address == NULL) return false;
+    return fprintf(out, "[%s-region %u] [%s-image 0x%016" PRIx64 "] "
+                   "[%s-site 0x%016" PRIx64 "] [%s-offset %" PRId64 "]",
+                   label, address->region.kind, label,
+                   address->region.code_image_id, label,
+                   address->region.site_offset, label, address->offset) >= 0;
+}
+
+static bool decode_model_dump(FILE *out, const OspreyModel *model)
+{
+    if (out == NULL || model == NULL ||
+        (model->object_count != 0 && model->objects == NULL) ||
+        (model->type_count != 0 && model->types == NULL) ||
+        (model->field_count != 0 && model->fields == NULL) ||
+        (model->type_name_count != 0 && model->type_names == NULL) ||
+        (model->raw_span_count != 0 && model->raw_spans == NULL)) return false;
+    if (fprintf(out, "[model-version %u] [objects %u] [types %u] "
+                "[fields %u]\n", model->version, model->object_count,
+                model->type_count, model->field_count) < 0) return false;
+    for (uint32_t i = 0; i < model->type_count; i++) {
+        const OspreyDecodedType *type = &model->types[i];
+        if (fprintf(out, "[type] [id %u] [kind %s] [name %s] [size %" PRIu64
+                    "] [count %" PRIu64 "] [element-size %" PRIu64
+                    "] [element-type %u] [target-void %u] [target-type %u] "
+                    "[field-begin %u] [field-count %u] [evidence %u] "
+                    "[posterior-bits 0x%016" PRIx64 "] [support %" PRIu64
+                    "] [rules 0x%016" PRIx64 "] ", i,
+                    decode_model_type_kind_name(type->kind),
+                    model->type_names[i] != NULL ? model->type_names[i] : "",
+                    type->size, type->element_count, type->element_size,
+                    type->element_type_id, type->target_is_void,
+                    type->target_type_id, type->field_begin, type->field_count,
+                    type->evidence_valid,
+                    decode_model_double_bits(type->posterior),
+                    type->direct_support, type->source_rule_bits) < 0 ||
+            !decode_model_dump_address(out, "base", &type->canonical_base) ||
+            fputc('\n', out) == EOF) return false;
+    }
+    for (uint32_t i = 0; i < model->field_count; i++) {
+        const OspreyDecodedField *field = &model->fields[i];
+        OspreyAddress owner;
+        memset(&owner, 0, sizeof(owner));
+        for (uint32_t j = 0; j < model->type_count; j++) {
+            const OspreyDecodedType *type = &model->types[j];
+            if (type->kind != OSPREY_TYPE_STRUCT ||
+                i < type->field_begin ||
+                i - type->field_begin >= type->field_count) continue;
+            owner = type->canonical_base;
             break;
         }
-        o->type_id = model_add_type_name(m, name);
-    }
-
-    return OSPREY_OK;
-}
-
-/* Free a decoded model and everything it owns (Stage 0/1 ownership). */
-void osprey_model_free(OspreyModel *m) {
-    if (m == NULL) return;
-    if (m->by_chunk != NULL) g_hash_table_destroy(m->by_chunk);
-    if (m->fields_by_base != NULL) g_hash_table_destroy(m->fields_by_base);
-    if (m->ptr_by_chunk != NULL) g_hash_table_destroy(m->ptr_by_chunk);
-    if (m->objects != NULL) g_array_free(m->objects, TRUE);
-    if (m->raw_spans != NULL) g_array_free(m->raw_spans, TRUE);
-    if (m->type_names != NULL) {
-        for (guint i = 0; i < m->type_names->len; i++) {
-            g_free(g_array_index(m->type_names, char *, i));
+        if (fprintf(out, "[field] [id %u] [owner ", i) < 0 ||
+            !decode_model_dump_address(out, "owner", &owner) ||
+            fputs("] [relative ", out) == EOF ||
+            fprintf(out, "%" PRIu64 "] [value-type %u] "
+                    "[posterior-bits 0x%016" PRIx64 "] [support %" PRIu64
+                    "] [rules 0x%016" PRIx64 "] ", field->relative_offset,
+                    field->value_type_id,
+                    decode_model_double_bits(field->posterior), field->support,
+                    field->source_rule_bits) < 0 ||
+            !decode_model_dump_address(out, "chunk", &field->chunk.address) ||
+            fprintf(out, " [size %" PRIu64 "]\n", field->chunk.size) < 0) {
+            return false;
         }
-        g_array_free(m->type_names, TRUE);
     }
-    g_free(m);
+    for (uint32_t i = 0; i < model->type_count; i++) {
+        const OspreyDecodedType *array = &model->types[i];
+        int64_t array_end;
+        if (array->kind != OSPREY_TYPE_ARRAY) continue;
+        if (array->size > (uint64_t)INT64_MAX ||
+            !osprey_check_add(array->canonical_base.offset,
+                              (int64_t)array->size, &array_end)) return false;
+        if (fprintf(out, "[array] [id %u] [lo %" PRId64 "] [hi %" PRId64
+                    "] [size %" PRIu64 "] [stride %" PRIu64 "] [count %" PRIu64
+                    "] [element-type %u] [posterior-bits 0x%016" PRIx64
+                    "] [support %" PRIu64 "] [rules 0x%016" PRIx64 "] [base ",
+                    i, array->canonical_base.offset, array_end, array->size,
+                    array->element_size, array->element_count,
+                    array->element_type_id, decode_model_double_bits(array->posterior),
+                    array->direct_support, array->source_rule_bits) < 0 ||
+            !decode_model_dump_address(out, "base", &array->canonical_base) ||
+            fputs("]\n", out) == EOF) return false;
+    }
+    for (uint32_t i = 0; i < model->object_count; i++) {
+        const OspreyDecodedObject *object = &model->objects[i];
+        if (fprintf(out, "[object] [id %u] [role %s] [value-type %u] "
+                    "[pointer %u] [storage-posterior-bits 0x%016" PRIx64
+                    "] [storage-support %" PRIu64 "] [storage-rules 0x%016"
+                    PRIx64 "] [pointer-posterior-bits 0x%016" PRIx64
+                    "] [pointer-support %" PRIu64 "] [pointer-rules 0x%016"
+                    PRIx64 "] ", i, decode_storage_role_name(
+                        object->storage_role), object->value_type_id,
+                    object->has_pointer_target,
+                    decode_model_double_bits(object->storage_posterior),
+                    object->storage_support, object->storage_source_rule_bits,
+                    decode_model_double_bits(object->pointer_posterior),
+                    object->pointer_support, object->pointer_source_rule_bits) < 0 ||
+            !decode_model_dump_address(out, "chunk", &object->chunk.address) ||
+            fprintf(out, " [size %" PRIu64 "] [owner ", object->chunk.size) < 0 ||
+            !decode_model_dump_address(out, "owner", &object->owner_base) ||
+            fputs("]", out) == EOF) return false;
+        if (object->has_pointer_target) {
+            if (fputs(" [target ", out) == EOF ||
+                !decode_model_dump_address(out, "target", &object->pointer_target) ||
+                fputs("]", out) == EOF) return false;
+        }
+        if (fputc('\n', out) == EOF) return false;
+    }
+    return ferror(out) == 0;
 }
 
-OspreyStatus osprey_decode(OspreyContext *ctx) {
-    if (ctx == NULL || !ctx->config.enabled) return OSPREY_DISABLED;
-    if (ctx->graph == NULL) return OSPREY_INCOMPLETE_FACTS;
-    /* Stage 0: build the new model off to the side.  The committed
-     * model is untouched until the whole transaction is OSPREY_OK and
-     * osprey_tx_install() swaps it in. */
-    OspreyModel *m = model_new();
-    OspreyModel *prev_staged = ctx->staged_model;
-    ctx->staged_model = m;
-    OspreyStatus st = decode_graph(ctx);
-    if (st != OSPREY_OK) {
-        ctx->staged_model = prev_staged;
-        osprey_model_free(m);
-        return st;
+bool osprey_model_dump_file(const OspreyModel *model, FILE *out)
+{
+    if (model == NULL || out == NULL) return false;
+    return decode_model_dump(out, model);
+}
+
+static OspreyStatus decode_model_validate_for_decode(OspreyContext *ctx,
+                                                    const OspreyModel *model)
+{
+    OspreyModelValidationError error = OSPREY_MODEL_VALIDATION_NONE;
+    OspreyStatus status = osprey_model_validate(ctx, model, &error);
+    if (status != OSPREY_OK) {
+        /* osprey_analyze() owns the single transaction rejection row. */
+        ctx->tx_reason = osprey_model_validation_reason(error);
     }
-    log_msg("[osprey] [decode] [objects %u] [types %u] "
-            "[raw-spans %u]\n",
-            m->objects->len, m->type_names->len, m->raw_spans->len);
+    return status;
+}
+
+static void decode_model_emit_summary(const OspreyDecodeInput *input,
+                                      const OspreyDecodePlan *plan,
+                                      const OspreyModel *model)
+{
+    uint32_t primitive = 0;
+    uint32_t scalar = 0;
+    uint32_t fields = 0;
+    uint32_t arrays = 0;
+    uint32_t pointers = 0;
+
+    for (uint32_t i = 0; i < model->object_count; i++) {
+        const OspreyDecodedObject *object = &model->objects[i];
+        switch (object->storage_role) {
+        case OSPREY_STORAGE_PRIMITIVE: primitive++; break;
+        case OSPREY_STORAGE_SCALAR: scalar++; break;
+        case OSPREY_STORAGE_FIELD: fields++; break;
+        default: break;
+        }
+        if (object->value_type_id < model->type_count &&
+            model->types[object->value_type_id].kind == OSPREY_TYPE_POINTER) {
+            pointers++;
+        }
+    }
+    for (uint32_t i = 0; i < model->type_count; i++) {
+        if (model->types[i].kind == OSPREY_TYPE_ARRAY) arrays++;
+    }
+    log_msg("[osprey] [decode] [objects %u] [types %u] [primitive %u] "
+            "[scalar %u] [fields %u] [arrays %u] [pointers %u] "
+            "[discarded-hard-false %" PRIu64 "] [discarded-threshold %" PRIu64
+            "] [discarded-role %u] [discarded-layout %" PRIu64 "]\n",
+            model->object_count, model->type_count, primitive, scalar, fields,
+            arrays, pointers, input->discarded_hard_false,
+            input->discarded_threshold, plan->role_loss_count,
+            plan->discarded_layout);
+}
+
+OspreyStatus osprey_decode(OspreyContext *ctx)
+{
+    OspreyDecodeInput *input = NULL;
+    OspreyDecodePlan *plan = NULL;
+    OspreyModel *model = NULL;
+    OspreyStatus status;
+
+    if (ctx == NULL) return OSPREY_DISABLED;
+    if (!ctx->config.enabled) return OSPREY_DISABLED;
+    status = osprey_decode_input_build(ctx, &input);
+    if (status != OSPREY_OK) goto fail;
+    status = osprey_decode_roles(ctx, input, &plan);
+    if (status != OSPREY_OK) goto fail;
+    status = osprey_decode_select_arrays(ctx, input, plan);
+    if (status != OSPREY_OK) goto fail;
+    status = osprey_model_build(ctx, plan, &model);
+    if (status != OSPREY_OK) goto fail;
+    if (osprey_decode_prevalidate_hook != NULL) {
+        void (*hook)(OspreyModel *) = osprey_decode_prevalidate_hook;
+        osprey_decode_prevalidate_hook = NULL;
+        hook(model);
+    }
+    status = decode_model_validate_for_decode(ctx, model);
+    if (status != OSPREY_OK) goto fail;
+    if (ctx->staged_model != NULL) {
+        status = OSPREY_INVALID_MODEL;
+        goto fail;
+    }
+    ctx->staged_model = model;
+    model = NULL;
+    decode_model_emit_summary(input, plan, ctx->staged_model);
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
     return OSPREY_OK;
+
+fail:
+    osprey_decode_plan_free(plan);
+    osprey_decode_input_free(input);
+    osprey_model_free(model);
+    return status;
 }
 
-/* ------------------------------------------------------------------ */
-/* Consumer lookups (parent side)                                      */
-/* ------------------------------------------------------------------ */
+static int decode_model_lookup_index(const OspreyModelIndexEntry *index,
+                                     uint32_t count, const OspreyKey *key)
+{
+    uint32_t lo = 0;
+    uint32_t hi = count;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        int c = decode_key_compare(&index[mid].key, key);
+        if (c < 0) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo < count && decode_key_compare(&index[lo].key, key) == 0) {
+        return (int)index[lo].ordinal;
+    }
+    return -1;
+}
 
-const OspreyDecodedObject *osprey_lookup_chunk(const OspreyModel *model,
-                                                const OspreyChunk *chunk) {
+const OspreyDecodedObject *osprey_lookup_chunk(
+    const OspreyModel *model, const OspreyChunk *chunk)
+{
+    OspreyKey key;
+    int ordinal;
     if (model == NULL || chunk == NULL) return NULL;
-    OspreyKey k = osprey_chunk_key(chunk);
-    const OspreyDecodedObject *ptr_o = NULL;
-    gpointer pcur = g_hash_table_lookup(model->ptr_by_chunk,
-                                        &k);
-    if (pcur != NULL) {
-        uint32_t pidx = (uint32_t)(uintptr_t)pcur - 1;
-        ptr_o = &g_array_index(model->objects, OspreyDecodedObject, pidx);
-    }
-    gpointer cur = g_hash_table_lookup(model->by_chunk, &k);
-    const OspreyDecodedObject *o = NULL;
-    if (cur != NULL) {
-        uint32_t idx = (uint32_t)(uintptr_t)cur - 1;
-        o = &g_array_index(model->objects, OspreyDecodedObject, idx);
-        if (o->posterior <= 0.0) o = NULL; /* discarded (overlap) */
-    }
-    /* the pointer interpretation wins when it beats the scalar/field */
-    if (ptr_o != NULL && (o == NULL || ptr_o->posterior > o->posterior)) {
-        return ptr_o;
-    }
-    return o;
+    key = osprey_chunk_key(chunk);
+    ordinal = decode_model_lookup_index(model->chunk_index,
+                                        model->chunk_index_count, &key);
+    return ordinal < 0 ? NULL : &model->objects[ordinal];
 }
 
-/* Raw address -> decoded object: most specific span wins (exact chunk
- * beats region-span; smallest covering span first). */
 const OspreyDecodedObject *osprey_lookup_raw(const OspreyModel *model,
-                                              uint64_t raw) {
-    if (model == NULL || model->raw_spans->len == 0) return NULL;
-    const OspRawSpan *best = NULL;
-    uint64_t best_span = UINT64_MAX;
-    double best_plus = -1.0;
-    uint8_t best_ptr = 0;
-    for (guint i = 0; i < model->raw_spans->len; i++) {
-        const OspRawSpan *sp = &g_array_index(model->raw_spans,
-                                              OspRawSpan, i);
-        if (raw < sp->raw_start) continue;
-        if (sp->raw_end > 0 && raw >= sp->raw_end) continue;
-        uint64_t span = sp->raw_end - sp->raw_start;
-        const OspreyDecodedObject *cand = &g_array_index(
-            model->objects, OspreyDecodedObject, sp->obj_idx);
-        uint8_t is_ptr = cand->kind == OSPREY_DECODED_POINTER;
-        if (span < best_span ||
-            (span == best_span && (cand->posterior > best_plus ||
-             (cand->posterior == best_plus && is_ptr && !best_ptr)))) {
-            best_span = span;
-            best_plus = cand->posterior;
-            best_ptr = is_ptr;
-            best = sp;
+                                             uint64_t raw_address)
+{
+    const OspreyDecodedObject *best = NULL;
+    uint64_t best_width = UINT64_MAX;
+    if (model == NULL || model->raw_spans == NULL) return NULL;
+    for (uint32_t i = 0; i < model->raw_span_count; i++) {
+        const OspRawSpan *span = &model->raw_spans[i];
+        uint64_t width;
+        if (span->raw_start >= span->raw_end ||
+            raw_address < span->raw_start || raw_address >= span->raw_end ||
+            span->obj_idx >= model->object_count) continue;
+        width = span->raw_end - span->raw_start;
+        if (best == NULL || width < best_width ||
+            (width == best_width && decode_chunk_compare(
+                &model->objects[span->obj_idx].chunk, &best->chunk) < 0)) {
+            best = &model->objects[span->obj_idx];
+            best_width = width;
         }
     }
-    if (best == NULL) return NULL;
-    const OspreyDecodedObject *o = &g_array_index(
-        model->objects, OspreyDecodedObject, best->obj_idx);
-    if (o->posterior <= 0.0) return NULL;
-    return o;
+    return best;
 }
 
 bool osprey_raw_extent(const OspreyModel *model,
                        const OspreyDecodedObject *obj, uint64_t *raw_out,
-                       uint64_t *extent_out) {
-    if (model == NULL || obj == NULL || raw_out == NULL ||
-        extent_out == NULL) {
-        return false;
-    }
-    for (guint i = 0; i < model->raw_spans->len; i++) {
-        const OspRawSpan *sp = &g_array_index(model->raw_spans,
-                                              OspRawSpan, i);
-        if (sp->obj_idx >= model->objects->len) continue;
-        const OspreyDecodedObject *o = &g_array_index(
-            model->objects, OspreyDecodedObject, sp->obj_idx);
-        if (o != obj) continue;
-        *raw_out = sp->raw_start;
-        *extent_out = sp->raw_end - sp->raw_start;
-        return true;
+                       uint64_t *extent_out)
+{
+    if (model == NULL || obj == NULL || raw_out == NULL || extent_out == NULL ||
+        model->raw_spans == NULL) return false;
+    for (uint32_t i = 0; i < model->raw_span_count; i++) {
+        const OspRawSpan *span = &model->raw_spans[i];
+        if (span->obj_idx < model->object_count &&
+            &model->objects[span->obj_idx] == obj &&
+            span->raw_end > span->raw_start) {
+            *raw_out = span->raw_start;
+            *extent_out = span->raw_end - span->raw_start;
+            return true;
+        }
     }
     return false;
 }

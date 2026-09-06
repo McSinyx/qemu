@@ -793,17 +793,98 @@ bool osprey_check_add(int64_t a, int64_t b, int64_t *out);
 bool osprey_check_mul(uint64_t a, uint64_t b, uint64_t *out);
 bool osprey_check_sub(int64_t a, int64_t b, int64_t *out);
 
-/* Decoded object kinds (osprey.h references OspreyDecodedKind). */
-typedef enum OspreyDecodedKind {
-    OSPREY_DECODED_UNKNOWN = 0,
-    OSPREY_DECODED_PRIMITIVE,   /* width-preserving placeholder */
-    OSPREY_DECODED_SCALAR,      /* Scalar(v) */
-    OSPREY_DECODED_ARRAY,       /* Array(a1,a2,s) */
-    OSPREY_DECODED_STRUCT,      /* field group under a base */
-    OSPREY_DECODED_POINTER,     /* Pointer(v,a) */
-    OSPREY_DECODED_FIELD,       /* FieldOf(v,a): field chunk */
-    OSPREY_DECODED_ARRAY_START, /* ArrayStart(a) */
-} OspreyDecodedKind;
+#define OSPREY_MODEL_VERSION 1u
+
+typedef enum OspreyDecodedTypeKind {
+    OSPREY_TYPE_PRIMITIVE = 1,
+    OSPREY_TYPE_POINTER,
+    OSPREY_TYPE_ARRAY,
+    OSPREY_TYPE_STRUCT,
+} OspreyDecodedTypeKind;
+
+typedef struct OspreyDecodedType {
+    uint32_t id;
+    uint8_t kind;
+    uint8_t target_is_void;
+    uint16_t reserved;
+    uint64_t size;
+    uint64_t element_count;
+    uint64_t element_size;
+    uint32_t element_type_id;
+    uint32_t target_type_id;
+    OspreyAddress canonical_base;
+    uint32_t field_begin;
+    uint32_t field_count;
+    uint8_t evidence_valid;
+    uint8_t reserved2[7];
+    double posterior;
+    uint64_t direct_support;
+    uint64_t source_rule_bits;
+} OspreyDecodedType;
+
+typedef struct OspreyDecodedField {
+    OspreyChunk chunk;
+    uint64_t relative_offset;
+    uint32_t value_type_id;
+    double posterior;
+    uint64_t support;
+    uint64_t source_rule_bits;
+} OspreyDecodedField;
+
+typedef struct OspreyModelIndexEntry {
+    OspreyKey key;
+    uint32_t ordinal;
+} OspreyModelIndexEntry;
+
+typedef enum OspreyModelValidationError {
+    OSPREY_MODEL_VALIDATION_NONE = 0,
+    OSPREY_MODEL_VALIDATION_VERSION,
+    OSPREY_MODEL_VALIDATION_LEDGER,
+    OSPREY_MODEL_VALIDATION_TYPE_ORDER,
+    OSPREY_MODEL_VALIDATION_TYPE_IDENTITY,
+    OSPREY_MODEL_VALIDATION_TYPE_SIZE,
+    OSPREY_MODEL_VALIDATION_TYPE_REFERENCE,
+    OSPREY_MODEL_VALIDATION_AGGREGATE_BASE,
+    OSPREY_MODEL_VALIDATION_FIELD,
+    OSPREY_MODEL_VALIDATION_ARRAY,
+    OSPREY_MODEL_VALIDATION_OBJECT_ORDER,
+    OSPREY_MODEL_VALIDATION_OBJECT_IDENTITY,
+    OSPREY_MODEL_VALIDATION_OBJECT_ROLE,
+    OSPREY_MODEL_VALIDATION_OBJECT_REFERENCE,
+    OSPREY_MODEL_VALIDATION_OBJECT_EVIDENCE,
+    OSPREY_MODEL_VALIDATION_INDEX_ORDER,
+    OSPREY_MODEL_VALIDATION_INDEX_CONTENT,
+    OSPREY_MODEL_VALIDATION_CYCLE,
+    OSPREY_MODEL_VALIDATION_RUNTIME_SPAN,
+} OspreyModelValidationError;
+
+typedef enum OspreyModelDestructorKind {
+    OSPREY_MODEL_DESTRUCTOR_NONE = 0,
+    OSPREY_MODEL_DESTRUCTOR_FREE = 1,
+    OSPREY_MODEL_DESTRUCTOR_NAMES = 2,
+} OspreyModelDestructorKind;
+
+typedef struct OspreyModelAllocation {
+    void *base;
+    uint64_t capacity;
+    uint64_t used;
+    uint64_t bytes;
+    uint64_t element_size;
+    uint8_t destructor_kind;
+    uint8_t reserved[7];
+} OspreyModelAllocation;
+
+typedef enum OspreyModelLedgerSlot {
+    OSPREY_MODEL_LEDGER_OBJECTS = 0,
+    OSPREY_MODEL_LEDGER_TYPES,
+    OSPREY_MODEL_LEDGER_FIELDS,
+    OSPREY_MODEL_LEDGER_CHUNK_INDEX,
+    OSPREY_MODEL_LEDGER_AGGREGATE_INDEX,
+    OSPREY_MODEL_LEDGER_TYPE_INDEX,
+    OSPREY_MODEL_LEDGER_RUNTIME_SPANS,
+    OSPREY_MODEL_LEDGER_NAMES,
+    OSPREY_MODEL_LEDGER_COUNT,
+} OspreyModelLedgerSlot;
 
 /* ------------------------------------------------------------------ */
 /* Stage 3+: predicate interning and factor graph                      */
@@ -1563,25 +1644,43 @@ bool osprey_factor_log_weight(const OspreyFactor *factor,
 bool osprey_graph_dump(const OspreyContext *ctx, const char *path);
 bool osprey_graph_dump_file(const OspreyContext *ctx, FILE *out);
 
-/* One raw-address span mapping back to a decoded object (built at
- * decode time from the merged region instances). */
+/* One raw-address span mapping back to an observed decoded object.  Raw
+ * spans are an auxiliary Stage-7 bridge and never participate in semantic
+ * identity or canonical model output. */
 typedef struct OspRawSpan {
     uint64_t raw_start;
-    uint64_t raw_end;      /* exclusive; == raw_start for point bases */
+    uint64_t raw_end;      /* exclusive */
     uint32_t obj_idx;      /* into model->objects */
-    uint8_t is_chunk;      /* 1 = exact chunk start+size semantics */
+    uint32_t source_instance_idx; /* into ctx->region_instances */
+    uint8_t is_chunk;      /* always one for Stage 6 objects */
     uint8_t reserved[3];
 } OspRawSpan;
 
-/* Decoded model (installed by osprey_decode; parent side). */
+/* Decoded model (installed by osprey_decode; parent side).  Semantic arrays
+ * are immutable after validation; indexes are canonical sorted arrays. */
 struct OspreyModel {
-    GArray *objects;       /* OspreyDecodedObject, insertion order */
-    GHashTable *by_chunk;  /* OspreyKey* -> (index+1) */
-    GArray *type_names;    /* char* type names (type_id = idx) */
-    GArray *raw_spans;     /* OspRawSpan, sorted by raw_start */
-    GHashTable *fields_by_base; /* OspreyKey* -> GArray(uint32 obj idx) */
-    GHashTable *ptr_by_chunk; /* OspreyKey* -> pointer obj (index+1);
-                                 independent of scalar/field exclusivity */
+    uint32_t version;
+    uint32_t object_count;
+    uint32_t type_count;
+    uint32_t field_count;
+    uint32_t chunk_index_count;
+    uint32_t aggregate_index_count;
+    uint32_t type_index_count;
+    uint32_t raw_span_count;
+    uint32_t type_name_count;
+
+    OspreyDecodedObject *objects;
+    OspreyDecodedType *types;
+    OspreyDecodedField *fields;
+    OspreyModelIndexEntry *chunk_index;
+    OspreyModelIndexEntry *aggregate_index;
+    OspreyModelIndexEntry *type_index;
+    OspRawSpan *raw_spans;
+    char **type_names;
+
+    /* Eight fixed ledger families make destruction independent of mutable
+     * semantic counts.  The ledger itself is embedded and immutable. */
+    OspreyModelAllocation ledger[OSPREY_MODEL_LEDGER_COUNT];
 };
 
 /* Stage 6.1: canonical, fully owned projection of final graph beliefs.
@@ -1612,12 +1711,24 @@ bool osprey_decode_score_add(OspreyDecodeScore *score,
 int osprey_decode_score_compare(const OspreyDecodeScore *left,
                                 const OspreyDecodeScore *right);
 
-/* Stage 6 entry (osprey-decode.c): consistent decoding of posterior
- * predicates (§10 of the reference): hard-false/threshold discard,
- * per-chunk exclusivity between scalar/field/pointer/array-element,
- * non-overlapping field layouts per base, weighted interval array
- * selection, one pointer target base, deterministic naming, posterior
- * on every declaration. */
+/* Stage 6.4 immutable model construction and validation. */
+OspreyStatus osprey_model_build(const OspreyContext *ctx,
+                                const OspreyDecodePlan *plan,
+                                OspreyModel **out);
+OspreyStatus osprey_model_validate(
+    const OspreyContext *ctx, const OspreyModel *model,
+    OspreyModelValidationError *error_out);
+const char *osprey_model_validation_reason(
+    OspreyModelValidationError error);
+bool osprey_model_dump_file(const OspreyModel *model, FILE *out);
+
+typedef void (*OspreyDecodePreValidateTestHook)(OspreyModel *model);
+void osprey_decode_test_set_prevalidate_hook(
+    OspreyDecodePreValidateTestHook hook);
+
+/* Stage 6 entry (osprey-decode.c): canonical input, role/array selection,
+ * immutable model construction, independent validation, and atomic staged
+ * publication. */
 OspreyStatus osprey_decode(OspreyContext *ctx);
 
 #endif /* BINRADAR_OSPREY_INTERNAL_H */
