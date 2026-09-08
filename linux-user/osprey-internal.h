@@ -682,6 +682,18 @@ uint32_t osprey_run_prefix_used(const OspreySharedRun *run, int table);
 void osprey_census_rebuild_from_prefix(OspreySharedRun *run);
 
 /* ------------------------------------------------------------------ */
+/* Stage 7.2 parent-owned runtime index                               */
+/* ------------------------------------------------------------------ */
+
+/* The index owns copied baseline region records.  It is immutable after
+ * construction; no entry points into ctx->region_instances are retained. */
+typedef struct OspreyRuntimeIndex OspreyRuntimeIndex;
+
+bool osprey_runtime_index_build(OspreyContext *ctx);
+void osprey_runtime_index_clear(OspreyContext *ctx);
+bool osprey_runtime_index_ready(const OspreyContext *ctx);
+
+/* ------------------------------------------------------------------ */
 /* Context (parent-owned)                                              */
 /* ------------------------------------------------------------------ */
 
@@ -748,6 +760,9 @@ struct OspreyContext {
     /* Region catalog (parent side): runtime instances resolved at
      * collection time. */
     GArray *runtime_regions;   /* OspreyRuntimeRegion */
+    /* Stage 7.2: immutable copied baseline index.  NULL means typed
+     * runtime resolution is unavailable for this baseline. */
+    OspreyRuntimeIndex *runtime_index;
 
     /* Origin shadows, keyed by CPUArchState* (per-thread). */
     GHashTable *cpu_origins;   /* env* -> OspreyCpuOriginState* */

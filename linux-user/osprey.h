@@ -148,6 +148,59 @@ typedef struct OspreyDecodedObject {
     uint64_t pointer_source_rule_bits;
 } OspreyDecodedObject;
 
+/* Stage 7.2: side-effect-free parent-side runtime resolution.  All
+ * non-exact results are typed-unavailable and leave the model and mutation
+ * queue untouched. */
+typedef enum OspreyRuntimeResolveStatus {
+    OSPREY_RUNTIME_RESOLVED = 0,
+    OSPREY_RUNTIME_NO_LOCATOR,
+    OSPREY_RUNTIME_INDEX_UNAVAILABLE,
+    OSPREY_RUNTIME_NO_CELL_OBJECT,
+    OSPREY_RUNTIME_NON_POINTER,
+    OSPREY_RUNTIME_NO_POINTER_TARGET,
+    OSPREY_RUNTIME_VOID_TARGET,
+    OSPREY_RUNTIME_MISSING_TYPE,
+    OSPREY_RUNTIME_MISSING_AGGREGATE,
+    OSPREY_RUNTIME_STALE_INSTANCE,
+    OSPREY_RUNTIME_AMBIGUOUS_INSTANCE,
+    OSPREY_RUNTIME_OUT_OF_BOUNDS,
+    OSPREY_RUNTIME_MALFORMED,
+} OspreyRuntimeResolveStatus;
+
+typedef struct OspreyRuntimeCellResolution {
+    OspreyRuntimeResolveStatus status;
+    uint32_t object_index;       /* UINT32_MAX unless status is RESOLVED */
+    uint8_t instance_valid;      /* copied exact cell locator is valid */
+    uint8_t reserved[3];
+    OspreyRuntimeChunkRef cell;
+    const OspreyDecodedObject *object; /* borrowed from immutable model */
+} OspreyRuntimeCellResolution;
+
+typedef struct OspreyRuntimePointerResolution {
+    OspreyRuntimeResolveStatus status;
+    uint32_t target_type_id;     /* UINT32_MAX when no selected type */
+    uint64_t target_extent;      /* decoded aggregate size */
+    uint8_t has_runtime_target;  /* false for NULL -> fresh */
+    uint8_t target_valid;
+    uint8_t reserved[2];
+    OspreyRuntimeCellResolution cell;
+    OspreyAddress target_base;   /* selected canonical aggregate base */
+    OspreyRuntimeAddressRef target;
+} OspreyRuntimePointerResolution;
+
+/* Read-only parent-side resolver.  The result is exact only when the
+ * returned status is OSPREY_RUNTIME_RESOLVED; all other statuses are
+ * typed-unavailable for the individual access. */
+OspreyRuntimeResolveStatus osprey_runtime_resolve_cell(
+    const OspreyContext *ctx, const OspreyModel *model,
+    const OspreyRuntimeChunkRef *locator,
+    OspreyRuntimeCellResolution *out);
+OspreyRuntimeResolveStatus osprey_runtime_resolve_pointer(
+    const OspreyContext *ctx, const OspreyModel *model,
+    const OspreyRuntimeChunkRef *cell_locator, target_ulong concrete_value,
+    const OspreyRuntimeAddressRef *target_locator,
+    OspreyRuntimePointerResolution *out);
+
 /* Configuration: parse + validate all BINRADAR_OSPREY_* env vars once.
  * Returns false (and logs the offending variable/value) on invalid or
  * overflowing input; callers must fail tracer startup then. */

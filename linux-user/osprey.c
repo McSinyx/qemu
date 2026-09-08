@@ -715,6 +715,7 @@ void osprey_free(OspreyContext *ctx) {
     g_array_free(ctx->alloc_facts, TRUE);
     g_array_free(ctx->mayarray_facts, TRUE);
     g_array_free(ctx->runtime_regions, TRUE);
+    osprey_runtime_index_clear(ctx);
     g_array_free(ctx->region_instances, TRUE);
     g_array_free(ctx->logical_access_facts, TRUE);
     if (ctx->relations != NULL) {

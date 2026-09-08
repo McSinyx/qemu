@@ -3705,8 +3705,10 @@ OspreyStatus osprey_parent_merge_sample(OspreyContext *ctx,
     if (ctx == NULL || run == NULL) return OSPREY_DISABLED;
 
     /* The merge opens the analysis transaction: the status is sticky
-     * from here until the next complete baseline analysis. */
+     * from here until the next complete baseline analysis.  The runtime
+     * index is baseline-owned and must not survive into a new merge. */
     osprey_tx_begin(ctx);
+    osprey_runtime_index_clear(ctx);
 
     /* Validate the whole run before appending anything: a malformed or
      * overflowed sample must not leave a half-merged transaction. */
@@ -3880,6 +3882,13 @@ OspreyStatus osprey_parent_merge_sample(OspreyContext *ctx,
      * can compare runs byte-identically (ASLR invariance). */
     if (ctx->config.dump_file[0] != '\0') {
         osprey_dump_canonical(ctx, ctx->config.dump_file);
+    }
+
+    /* Stage 7.2: freeze a copied, instance-exact parent index only after
+     * the complete validated baseline sample has been merged.  Failure is
+     * intentionally typed-unavailable, not an analysis rejection. */
+    if (!osprey_runtime_index_build(ctx)) {
+        log_msg("[osprey] [runtime] [index-unavailable]\n");
     }
     return OSPREY_OK;
 }
