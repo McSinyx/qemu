@@ -3590,7 +3590,7 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
             memcpy(mem_access.target, addr_h, size);
         }
         if (is_valid_address(addr, true)) {
-            snapshot_read_access(&mem_access);
+            snapshot_read_access(env, &mem_access);
         }
         if (size == sizeof(target_ulong)) {
             memcpy(&val, mem_access.target, size);

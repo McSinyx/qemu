@@ -564,6 +564,21 @@ bool osprey_address_origin_live(const OspreyAddressOrigin *o);
  * destinations, modeled F03, and canonical pointer-cell chunks. */
 bool osprey_chunk_of_interval(CPUArchState *env, target_ulong addr,
                               target_ulong size, OspreyChunk *out);
+
+/* Stage 7.1: read-only runtime locator capture (osprey-facts.c).  Both
+ * mirror osprey_region_of_addr_inner's grow=false semantics (no bound
+ * growth, no fact publication, no origin mutation) and reject anything
+ * that is not exactly representable: zero width, end-address wrap, no
+ * live region, endpoints in different instances, nonconsecutive
+ * canonical offsets, anchor-straddling intervals, ambiguous heap
+ * identity (multiple live instances covering the address), stale or missing
+ * heap provenance, or a heap pair no longer owning the authoritative
+ * live-by-base entry.  Capture failure leaves *out zeroed with valid == 0,
+ * including when collection is disabled. */
+bool osprey_capture_address_ref(CPUArchState *env, target_ulong addr,
+                                OspreyRuntimeAddressRef *out);
+bool osprey_capture_chunk_ref(CPUArchState *env, target_ulong addr,
+                              target_ulong size, OspreyRuntimeChunkRef *out);
 uint64_t osprey_copy_hash(const OspreyCopyFact *f);
 bool osprey_copy_eq(const OspreyCopyFact *a, const OspreyCopyFact *b);
 uint64_t osprey_points_hash(const OspreyPointsToFact *f);

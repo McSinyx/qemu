@@ -164,6 +164,10 @@ typedef struct PrimitiveAccess {
     uintptr_t pc;
     uint64_t access_id;
     Expr *expr;
+    /* Stage 7.1: fixed-layout runtime locator.  valid == 0 when the
+     * canonical identity was not capturable; the record then stays
+     * generic-eligible. */
+    OspreyRuntimeChunkRef cell;
 } PrimitiveAccess;
 
 typedef struct PointerAccess {
@@ -172,6 +176,11 @@ typedef struct PointerAccess {
     uintptr_t pc;
     uint64_t access_id;
     Expr *expr;
+    /* Stage 7.1: locator for the pointer cell and, when the loaded
+     * target is a valid non-zero address, for the target address
+     * itself. */
+    OspreyRuntimeChunkRef cell;
+    OspreyRuntimeAddressRef target_ref;
 } PointerAccess;
 
 typedef struct SharedTraceData {
@@ -179,6 +188,13 @@ typedef struct SharedTraceData {
     uint32_t ptr_idx;
     uint64_t prim_access_cnt;
     uint64_t ptr_access_cnt;
+    /* Stage 7.1: sticky overflow flags.  Set when a record insertion
+     * exceeds the fixed record capacity (or the record array is found
+     * inconsistent); the parent then treats typed consumption as
+     * unavailable and bounds its loops at the capacity.  Never reset in
+     * the child: the parent reads them after waitpid. */
+    uint32_t prim_overflow;
+    uint32_t ptr_overflow;
     SnapshotExitInfo exit_info;
     /* Deferred provenance finding.  Lives in the shared mmap so the
      * parent can read it after waitpid even when the child was killed or
@@ -1010,6 +1026,23 @@ void snapshot_record_guest_crash(CPUArchState *cpu_env, int target_signal, int h
     dump_coverage_edge_log(true);
 }
 
+static bool reserve_read_access_index(uint32_t *counter, uint32_t capacity,
+                                      uint32_t *index_out) {
+    uint32_t current = __atomic_load_n(counter, __ATOMIC_RELAXED);
+    for (;;) {
+        if (current >= capacity) {
+            return false;
+        }
+        uint32_t next = current + 1;
+        if (__atomic_compare_exchange_n(counter, &current, next, false,
+                                        __ATOMIC_RELAXED,
+                                        __ATOMIC_RELAXED)) {
+            *index_out = current;
+            return true;
+        }
+    }
+}
+
 static void remove_read_access_primitive(uintptr_t addr) {
     if (g_read_access_tainted_primitives == NULL) return;
     OrderedMapEntry *entry = ordered_map_lookup(g_read_access_tainted_primitives, addr);
@@ -1017,8 +1050,23 @@ static void remove_read_access_primitive(uintptr_t addr) {
     // Remove from queue
     int idx_to_remove = entry->shared_index;
     g_queue_delete_link(g_read_access_tainted_primitives->queue, entry->node);
-    int last_idx = __atomic_sub_fetch(&shared_trace_data->prim_idx, 1, __ATOMIC_RELAXED);
-    if (idx_to_remove < last_idx) {
+    uint32_t count = __atomic_load_n(&shared_trace_data->prim_idx,
+                                     __ATOMIC_RELAXED);
+    if (idx_to_remove < 0 || count == 0 ||
+        count > MAX_PRIMITIVE_ACCESS || (uint32_t)idx_to_remove >= count) {
+        /* Never underflow the published count or index the fixed array
+         * from inconsistent ordered-map state. */
+        shared_trace_data->prim_overflow = 1;
+        trace_mem("[rpi] ERROR! remove primitive failed! idx %d count %u\n",
+                  idx_to_remove, count);
+        g_hash_table_remove(g_read_access_tainted_primitives->table,
+                            GSIZE_TO_POINTER(addr));
+        return;
+    }
+    uint32_t last_idx = count - 1;
+    __atomic_store_n(&shared_trace_data->prim_idx, last_idx,
+                     __ATOMIC_RELAXED);
+    if ((uint32_t)idx_to_remove < last_idx) {
         PrimitiveAccess *src = &shared_trace_data->primitives[last_idx];
         PrimitiveAccess *dst = &shared_trace_data->primitives[idx_to_remove];
         *dst = *src;
@@ -1028,29 +1076,34 @@ static void remove_read_access_primitive(uintptr_t addr) {
             moved_entry->data = dst;
         }
         memset(src, 0, sizeof(PrimitiveAccess));
-    } else if (idx_to_remove == last_idx) {
-        memset(&shared_trace_data->primitives[idx_to_remove], 0, sizeof(PrimitiveAccess));
     } else {
-        trace_mem("[rpi] ERROR! remove primtive failed! idx %d > last %d\n", idx_to_remove, last_idx);
+        memset(&shared_trace_data->primitives[idx_to_remove], 0,
+               sizeof(PrimitiveAccess));
     }
     g_hash_table_remove(g_read_access_tainted_primitives->table, GSIZE_TO_POINTER(addr));
 }
 
-static void add_read_access_pointer(uintptr_t addr, uintptr_t target, uintptr_t pc) {
+static void add_read_access_pointer(CPUArchState *env, uintptr_t addr,
+                                    uintptr_t target, uintptr_t pc) {
     if (shared_trace_data == NULL) return;
     if (g_read_access_pointers == NULL) g_read_access_pointers = ordered_map_init(MAX_POINTER_ACCESS);
     OrderedMapEntry *entry = ordered_map_insert(g_read_access_pointers, addr, NULL);
     PointerAccess *ptr = NULL;
     if (entry->shared_index < 0) {
-        int new_index = __atomic_fetch_add(&shared_trace_data->ptr_idx, 1, __ATOMIC_RELAXED);
-        entry->shared_index = new_index;
-        if (new_index < MAX_POINTER_ACCESS) {
+        uint32_t new_index;
+        if (reserve_read_access_index(&shared_trace_data->ptr_idx,
+                                      MAX_POINTER_ACCESS, &new_index)) {
+            entry->shared_index = (int)new_index;
             ptr = &shared_trace_data->pointers[new_index];
         }
     } else if (entry->shared_index < MAX_POINTER_ACCESS) {
         ptr = &shared_trace_data->pointers[entry->shared_index];
     }
     if (ptr == NULL) {
+        /* Sticky: typed consumption must not run on an over-cap record
+         * set.  The generic mutation path still exits with the previous
+         * behavior. */
+        shared_trace_data->ptr_overflow = 1;
         trace_mem("[rpo] ptr shared_index error!!! %d\n", entry->shared_index);
         exit_with_status(1);
     }
@@ -1059,12 +1112,27 @@ static void add_read_access_pointer(uintptr_t addr, uintptr_t target, uintptr_t 
     ptr->pc = pc;
     ptr->access_id = __atomic_fetch_add(&shared_trace_data->ptr_access_cnt, 1, __ATOMIC_RELAXED);
     ptr->expr = NULL;
+    /* Stage 7.1: refresh locators on every write so a replaced record
+     * never carries a stale identity.  Capture failure leaves the
+     * locator zeroed (valid == 0); the record stays generic-eligible. */
+    memset(&ptr->cell, 0, sizeof(ptr->cell));
+    memset(&ptr->target_ref, 0, sizeof(ptr->target_ref));
+    if (osprey_collect_enabled && g_osprey_ctx != NULL) {
+        osprey_capture_chunk_ref(env, (target_ulong)addr,
+                                 (target_ulong)sizeof(target_ulong),
+                                 &ptr->cell);
+        if (target != 0) {
+            osprey_capture_address_ref(env, (target_ulong)target,
+                                       &ptr->target_ref);
+        }
+    }
     entry->data = ptr;
     trace_mem("[rpo] [addr %lx] [target %lx] [pc %lx] [index %d] [id %ld]\n",
               addr, target, pc, entry->shared_index, ptr->access_id);
 }
 
-static void add_read_access_primitive(uintptr_t addr, int size, uintptr_t pc) {
+static void add_read_access_primitive(CPUArchState *env, uintptr_t addr,
+                                      int size, uintptr_t pc) {
     if (shared_trace_data == NULL) return;
     if (g_read_access_pointers) {
         uintptr_t aligned_addr = addr & ~(uintptr_t)0x07;
@@ -1078,15 +1146,18 @@ static void add_read_access_primitive(uintptr_t addr, int size, uintptr_t pc) {
     PrimitiveAccess *prim = NULL;
     OrderedMapEntry *entry = ordered_map_insert(g_read_access_tainted_primitives, addr, NULL);
     if (entry->shared_index < 0) {
-        int new_index = __atomic_fetch_add(&shared_trace_data->prim_idx, 1, __ATOMIC_RELAXED);
-        entry->shared_index = new_index;
-        if (new_index < MAX_PRIMITIVE_ACCESS) {
+        uint32_t new_index;
+        if (reserve_read_access_index(&shared_trace_data->prim_idx,
+                                      MAX_PRIMITIVE_ACCESS, &new_index)) {
+            entry->shared_index = (int)new_index;
             prim = &shared_trace_data->primitives[new_index];
         }
     } else if (entry->shared_index < MAX_PRIMITIVE_ACCESS) {
         prim = &shared_trace_data->primitives[entry->shared_index];
     }
     if (prim == NULL) {
+        /* Sticky: see add_read_access_pointer. */
+        shared_trace_data->prim_overflow = 1;
         trace_mem("[rpo] prim shared_index error!!! %d\n", entry->shared_index);
         exit_with_status(1);
     }
@@ -1095,6 +1166,12 @@ static void add_read_access_primitive(uintptr_t addr, int size, uintptr_t pc) {
     prim->pc = pc;
     prim->access_id = __atomic_fetch_add(&shared_trace_data->prim_access_cnt, 1, __ATOMIC_RELAXED);
     prim->expr = NULL;
+    /* Stage 7.1: refresh the cell locator (see add_read_access_pointer). */
+    memset(&prim->cell, 0, sizeof(prim->cell));
+    if (osprey_collect_enabled && g_osprey_ctx != NULL) {
+        osprey_capture_chunk_ref(env, (target_ulong)addr,
+                                 (target_ulong)size, &prim->cell);
+    }
     entry->data = prim;
     trace_mem("[rpi] [addr %lx] [size %d] [pc %lx] [index %d] [id %ld]\n",
               addr, size, pc, entry->shared_index, prim->access_id);
@@ -1964,7 +2041,7 @@ void snapshot_write_access(SnapshotMemAccess *mem_access) {
     trace_mem("[snapshot] [waccess] [mem] [addr %lx] [size %ld]\n", addr, size);
 }
 
-void snapshot_read_access(SnapshotMemAccess *mem_access) {
+void snapshot_read_access(CPUArchState *env, SnapshotMemAccess *mem_access) {
     if (!forkserver_installed) return;
     uintptr_t addr = mem_access->addr;
     uintptr_t size = mem_access->size;
@@ -1976,12 +2053,12 @@ void snapshot_read_access(SnapshotMemAccess *mem_access) {
         memcpy(&target, mem_access->target, sizeof(target_ulong));
         if (is_valid_address(target, true)) {
             // Add to pointer
-            add_read_access_pointer(addr, target, mem_access->pc);
+            add_read_access_pointer(env, addr, target, mem_access->pc);
             is_value_pointer = true;
             trace_mem("[snapshot] [raccess] [pointer] [addr %lx] [target %lx] [pc %lx]\n", addr, target, mem_access->pc);
         } else if (target == 0) {
             // It may be a null pointer
-            add_read_access_primitive(addr, size, mem_access->pc);
+            add_read_access_primitive(env, addr, size, mem_access->pc);
             trace_mem("[snapshot] [raccess] [null-pointer] [addr %lx] [pc %lx]\n", addr, mem_access->pc);
             is_value_pointer = true; // Do not add it twice
         } else {
@@ -1991,7 +2068,7 @@ void snapshot_read_access(SnapshotMemAccess *mem_access) {
     if (!is_value_pointer) {
         if (mem_access->symbolic_value) {
             // Tainted value
-            add_read_access_primitive(addr, size, mem_access->pc);
+            add_read_access_primitive(env, addr, size, mem_access->pc);
         }
     }
     trace_mem("[snapshot] [raccess] [mem] [addr %lx] [size %ld]\n", addr, size);
@@ -2108,7 +2185,7 @@ void snapshot_syscall(CPUArchState *env, uintptr_t syscall_no,
                 void *buf = g2h(syscall_arg1);
                 memcpy(mem_access.target, buf, ret_val);
             }
-            snapshot_read_access(&mem_access);
+            snapshot_read_access(env, &mem_access);
         }
         break;
 #if defined(TARGET_NR_futex)
@@ -2775,9 +2852,37 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
     }
 
     // Analyze shared_trace_data
+    /* Stage 7.1: bound the parent's consumption.  prim_idx/ptr_idx are
+     * child-written counters that normally stay at or below the record
+     * capacity (LRU replacement), but a defensive-path increment or an
+     * inconsistent removal can push them past it; consuming an
+     * out-of-range count would sort and read past the fixed record
+     * arrays.  Snapshot the counts once, clamp, and disable typed
+     * consumption when the counts or the sticky overflow flags say the
+     * record set is not trustworthy. */
+    uint32_t raw_prim_count = shared_trace_data->prim_idx;
+    uint32_t raw_ptr_count = shared_trace_data->ptr_idx;
+    bool prim_count_valid = raw_prim_count <= MAX_PRIMITIVE_ACCESS;
+    bool ptr_count_valid = raw_ptr_count <= MAX_POINTER_ACCESS;
+    bool counts_valid =
+        shared_trace_data->prim_overflow == 0 &&
+        shared_trace_data->ptr_overflow == 0 &&
+        prim_count_valid && ptr_count_valid;
+    /* An over-cap count does not identify a safe initialized prefix: do
+     * not sort or traverse that array.  A sticky writer flag with an
+     * in-range count retains the known bounded prefix for the generic
+     * path, while typed lookup remains disabled for the baseline. */
+    uint32_t prim_count = prim_count_valid ? raw_prim_count : 0;
+    uint32_t ptr_count = ptr_count_valid ? raw_ptr_count : 0;
+    if (!counts_valid) {
+        log_msg("[analyze] [count-clamp] [prim %u->%u] [ptr %u->%u] [prim-ovf %u] [ptr-ovf %u] typed-unavailable\n",
+                raw_prim_count, prim_count, raw_ptr_count, ptr_count,
+                shared_trace_data->prim_overflow,
+                shared_trace_data->ptr_overflow);
+    }
     // Sort by access_id
-    qsort(shared_trace_data->primitives, shared_trace_data->prim_idx, sizeof(PrimitiveAccess), compare_prim_id_desc);
-    qsort(shared_trace_data->pointers, shared_trace_data->ptr_idx, sizeof(PointerAccess), compare_ptr_id_desc);
+    qsort(shared_trace_data->primitives, prim_count, sizeof(PrimitiveAccess), compare_prim_id_desc);
+    qsort(shared_trace_data->pointers, ptr_count, sizeof(PointerAccess), compare_ptr_id_desc);
     GArray *mod_primitive_candidates = g_array_new(FALSE, FALSE, sizeof(MutationCandidate));
     // First run: collect all data
     if (mod_manager == NULL) {
@@ -2816,7 +2921,7 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
         }
         
         // Create modification list
-        for (int i = 0; i < shared_trace_data->prim_idx; i++) {
+        for (uint32_t i = 0; i < prim_count; i++) {
             PrimitiveAccess *prim = &shared_trace_data->primitives[i];
             PrimitiveAccess *prim_data = g_new(PrimitiveAccess, 1);
             memcpy(prim_data, prim, sizeof(PrimitiveAccess));
@@ -2838,8 +2943,10 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
             // Type inference (Stage 4): the decoded model maps raw
             // addresses to objects.  Pointer chunks get pointer-typed
             // candidates; everything else is a generic primitive.
+            // Stage 7.1: skipped when the record set is not
+            // trustworthy (overflow flag or out-of-range counts).
             const OspreyDecodedObject *dobj = NULL;
-            if (g_osprey_ctx != NULL) {
+            if (g_osprey_ctx != NULL && counts_valid) {
                 const OspreyModel *pm = osprey_model(g_osprey_ctx);
                 if (pm != NULL) {
                     dobj = osprey_lookup_raw(pm, (uint64_t)prim->addr);
@@ -2858,7 +2965,7 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
                 add_modification_primitive(mod_manager->modifications, &mod);
             }
         }
-        for (int i = 0; i < shared_trace_data->ptr_idx; i++) {
+        for (uint32_t i = 0; i < ptr_count; i++) {
             PointerAccess *ptr = &shared_trace_data->pointers[i];
             PointerAccess *ptr_data = g_new(PointerAccess, 1);
             memcpy(ptr_data, ptr, sizeof(PointerAccess));
@@ -2878,8 +2985,10 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
             memcpy(mod.value, &actual_value, sizeof(target_ulong));
             // Type inference (Stage 4): pointer-typed objects get the
             // null/valid/oob candidate treatment via the decoded model.
+            // Stage 7.1: skipped when the record set is not
+            // trustworthy (overflow flag or out-of-range counts).
             const OspreyDecodedObject *pobj = NULL;
-            if (g_osprey_ctx != NULL) {
+            if (g_osprey_ctx != NULL && counts_valid) {
                 const OspreyModel *pm = osprey_model(g_osprey_ctx);
                 if (pm != NULL) {
                     pobj = osprey_lookup_raw(pm, (uint64_t)ptr->addr);

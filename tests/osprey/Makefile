@@ -87,17 +87,20 @@ PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))
         unit-stage3-rules unit-stage3-rules-asan \
         unit-stage4-exact unit-stage4-exact-asan \
         unit-stage5-bp unit-stage5-bp-asan \
-        unit-stage6-decode unit-stage6-decode-asan guests plts clean
+        unit-stage6-decode unit-stage6-decode-asan \
+        unit-stage7-mutation unit-stage7-mutation-asan guests plts clean
 check: inventory run unit unit-asan-osprey unit-stage3-relations \
        unit-stage3-relations-asan unit-stage3-graph unit-stage3-graph-asan \
        unit-stage3-rules unit-stage3-rules-asan unit-stage4-exact \
        unit-stage4-exact-asan unit-stage5-bp unit-stage5-bp-asan \
-       unit-stage6-decode unit-stage6-decode-asan
+       unit-stage6-decode unit-stage6-decode-asan \
+       unit-stage7-mutation unit-stage7-mutation-asan
 run unit unit-asan-osprey unit-stage3-relations unit-stage3-relations-asan \
 unit-stage3-graph unit-stage3-graph-asan unit-stage3-rules \
 unit-stage3-rules-asan unit-stage4-exact unit-stage4-exact-asan \
 unit-stage5-bp unit-stage5-bp-asan unit-stage6-decode \
-unit-stage6-decode-asan: inventory
+unit-stage6-decode-asan unit-stage7-mutation \
+unit-stage7-mutation-asan: inventory
 inventory:
 	@python3 $(INVENTORY)
 run: guests plts
@@ -297,3 +300,53 @@ $(WORK):
 
 clean:
 	rm -rf $(WORK)
+
+# Stage 7.1 focused runner: compiles linux-user/snapshot.c into the test
+# translation unit so the child-side record writers and the parent-side
+# analyze_collected_data() are reachable (their state is static in
+# snapshot.c).  snapshot.c provides log_msg/trace_mem/is_valid_address/
+# mr_manager_heap_search_pub, so the shared stage3_test_support.c stubs
+# for those are NOT linked here (duplicate strong definitions would
+# break the link).  The OSPREY objects must be recompiled for ASan
+# (OSPREY_ASAN_OBJS); snapshot.c is compiled by the test itself with
+# the same sanitizer flags.
+MUTATION_UNIT_BIN := $(WORK)/stage7_mutation
+MUTATION_ASAN_BIN := $(WORK)/stage7_mutation_asan
+SBSV_OBJS := $(addprefix $(WORK)/,sbsv.o sbsv_parser.o)
+MUTATION_INCLUDED_SRCS := ../../linux-user/snapshot.c \
+                          ../../linux-user/snapshot.h
+
+unit-stage7-mutation: $(MUTATION_UNIT_BIN)
+	@$(MUTATION_UNIT_BIN)
+
+$(MUTATION_UNIT_BIN): stage7_mutation_test.c $(MUTATION_INCLUDED_SRCS) \
+		$(OSPREY_OBJS) $(SBSV_OBJS) $(OSPREY_HEADERS) | $(WORK)
+	$(CC) $(UNIT_CFLAGS) -o $@ stage7_mutation_test.c $(OSPREY_OBJS) \
+		$(SBSV_OBJS) -lglib-2.0 -lpthread -lm
+
+unit-stage7-mutation-asan: $(MUTATION_ASAN_BIN)
+	@ASAN_OPTIONS=detect_leaks=1 $(MUTATION_ASAN_BIN)
+
+# ASan variant: the test TU (including the included snapshot.c) is
+# compiled with sanitizers, and the OSPREY objects are the dedicated
+# ASan-compiled objects.  sbsv needs ASan-compiled copies too.
+SBSV_ASAN_OBJS := $(addprefix $(WORK)/,sbsv.asan.o sbsv_parser.asan.o)
+
+$(MUTATION_ASAN_BIN): stage7_mutation_test.c $(MUTATION_INCLUDED_SRCS) \
+		$(OSPREY_ASAN_OBJS) $(SBSV_ASAN_OBJS) $(OSPREY_HEADERS) | $(WORK)
+	$(CC) $(ASAN_CFLAGS) -o $@ stage7_mutation_test.c \
+		$(OSPREY_ASAN_OBJS) $(SBSV_ASAN_OBJS) -lglib-2.0 -lpthread -lm
+
+$(WORK)/sbsv.asan.o: ../../linux-user/sbsv.c | $(WORK)
+	$(CC) $(ASAN_CFLAGS) -c -o $@ $<
+
+$(WORK)/sbsv_parser.asan.o: ../../linux-user/sbsv_parser.c | $(WORK)
+	$(CC) $(ASAN_CFLAGS) -c -o $@ $<
+
+# Plain sbsv objects for the non-ASan mutation unit (the test TU already
+# carries the snapshot.c integration, so only the parsers are needed).
+$(WORK)/sbsv.o: ../../linux-user/sbsv.c | $(WORK)
+	$(CC) $(UNIT_CFLAGS) -c -o $@ $<
+
+$(WORK)/sbsv_parser.o: ../../linux-user/sbsv_parser.c | $(WORK)
+	$(CC) $(UNIT_CFLAGS) -c -o $@ $<

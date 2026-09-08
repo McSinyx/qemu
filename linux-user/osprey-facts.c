@@ -924,6 +924,266 @@ bool osprey_chunk_of_interval(CPUArchState *env, target_ulong addr,
     return true;
 }
 
+/* ------------------------------------------------------------------ */
+/* Stage 7.1: runtime locator capture                                  */
+/* ------------------------------------------------------------------ */
+
+static bool osprey_normalize_pc(target_ulong pc, uint64_t *out);
+
+/* Fill a fixed-layout address locator from a validated resolution. */
+static void address_ref_fill(OspreyRuntimeAddressRef *out,
+                             const OspreyRegionId *region, int64_t offset,
+                             target_ulong addr, uint64_t instance_id,
+                             uint64_t prov_object_id,
+                             uint32_t prov_generation) {
+    memset(out, 0, sizeof(*out));
+    out->address.region = *region;
+    out->address.offset = offset;
+    out->raw = (uint64_t)addr;
+    out->instance_id = instance_id;
+    out->prov_object_id = prov_object_id;
+    out->prov_generation = prov_generation;
+    out->valid = 1;
+}
+
+/* Raw <-> canonical translation check: the instance anchor plus the
+ * canonical offset must reconstruct the raw runtime address exactly,
+ * without relying on signed overflow or target-address wrapping. */
+static bool address_ref_roundtrip(target_ulong anchor, int64_t offset,
+                                  target_ulong addr) {
+    uint64_t raw_anchor = (uint64_t)anchor;
+    uint64_t raw_back;
+    if (offset >= 0) {
+        uint64_t delta = (uint64_t)offset;
+        if (raw_anchor > UINT64_MAX - delta) {
+            return false;
+        }
+        raw_back = raw_anchor + delta;
+    } else {
+        uint64_t delta = (uint64_t)(-(offset + 1)) + 1;
+        if (raw_anchor < delta) {
+            return false;
+        }
+        raw_back = raw_anchor - delta;
+    }
+    return raw_back == (uint64_t)addr;
+}
+
+static bool address_ref_signed_offset(target_ulong anchor, target_ulong addr,
+                                      int64_t *out) {
+    if (addr >= anchor) {
+        uint64_t delta = (uint64_t)(addr - anchor);
+        if (delta > INT64_MAX) {
+            return false;
+        }
+        *out = (int64_t)delta;
+        return true;
+    }
+    uint64_t delta = (uint64_t)(anchor - addr);
+    if (delta > (uint64_t)INT64_MAX + 1) {
+        return false;
+    }
+    *out = delta == (uint64_t)INT64_MAX + 1
+               ? INT64_MIN : -(int64_t)delta;
+    return true;
+}
+
+/* Resolve one endpoint into a concrete allocation instance, with the
+ * identity checks the locator contract requires:
+ * - heap: the address is covered by exactly one live instance, its
+ *   provenance pair still resolves to a LIVE object at the same base,
+ *   and the canonical offset reconstructs the raw address;
+ * - global: the merged instance (instance_id 0) over the main-image
+ *   writable ranges;
+ * - stack: the innermost precise live frame whose observed window
+ *   (including the ABI red zone) covers the address.  Mirrors
+ *   osprey_region_of_addr_inner's grow=false semantics: bounds never
+ *   grow, nothing is published, no origin state is touched. */
+static bool capture_endpoint(CPUArchState *env, target_ulong addr,
+                             uint64_t *out_instance_id,
+                             uint64_t *out_prov_object_id,
+                             uint32_t *out_prov_generation,
+                             OspreyRegionId *out_region,
+                             int64_t *out_offset) {
+    (void)env;
+    if (g_heap_instances != NULL) {
+        unsigned hits = 0;
+        HeapInstance *hit = NULL;
+        for (guint i = 0; i < g_heap_instances->len; i++) {
+            HeapInstance *h = &g_array_index(g_heap_instances,
+                                             HeapInstance, i);
+            if (!h->live) {
+                continue;
+            }
+            if (addr >= h->base && (uint64_t)(addr - h->base) < h->size) {
+                hits++;
+                hit = h;
+            }
+        }
+        if (hits > 1) {
+            /* Overlapping live instances make the identity ambiguous:
+             * refuse to guess. */
+            return false;
+        }
+        if (hits == 1) {
+            if (hit->prov_object_id == 0 || hit->prov_generation == 0) {
+                return false;
+            }
+            ProvenanceObject *po = provenance_lookup_object(
+                hit->prov_object_id, hit->prov_generation);
+            ProvenanceObject *live =
+                provenance_lookup_live_by_base(hit->base);
+            uint64_t alloc_site = 0;
+            if (po == NULL || live == NULL || po != live ||
+                po->state != PROV_OBJ_LIVE ||
+                po->object_id != hit->prov_object_id ||
+                po->generation != hit->prov_generation ||
+                po->base != hit->base ||
+                po->requested_size != hit->size ||
+                !osprey_normalize_pc(po->alloc_pc, &alloc_site) ||
+                alloc_site != hit->region.site_offset) {
+                /* The exact pair must also remain the authoritative
+                 * live-by-base object with unchanged geometry/site. */
+                return false;
+            }
+            int64_t offset = (int64_t)(addr - hit->base);
+            if (!address_ref_roundtrip(hit->base, offset, addr)) {
+                return false;
+            }
+            *out_instance_id = hit->instance_id;
+            *out_prov_object_id = hit->prov_object_id;
+            *out_prov_generation = hit->prov_generation;
+            *out_region = hit->region;
+            *out_offset = offset;
+            return true;
+        }
+    }
+
+    /* Main-image global data: merged instance, zero provenance pair. */
+    OspreyRegionId region;
+    int64_t offset = 0;
+    if (osprey_global_of_addr(addr, &region, &offset)) {
+        if (!address_ref_roundtrip(osprey_get_image_base(), offset, addr)) {
+            return false;
+        }
+        *out_instance_id = 0;
+        *out_prov_object_id = 0;
+        *out_prov_generation = 0;
+        *out_region = region;
+        *out_offset = offset;
+        return true;
+    }
+
+    /* Stack frames, innermost first. */
+    if (g_stack_frames != NULL) {
+        for (guint i = g_stack_frames->len; i > 0; i--) {
+            OspreyStackFrame *f = &g_array_index(g_stack_frames,
+                                                 OspreyStackFrame, i - 1);
+            if (f->region.site_offset == OSPREY_STACK_IMPRECISE_SITE) {
+                continue;
+            }
+            if (addr >= f->entry_sp) {
+                continue;
+            }
+            target_ulong red_zone_low =
+                f->current_sp >= OSPREY_STACK_RED_ZONE
+                    ? f->current_sp - OSPREY_STACK_RED_ZONE
+                    : 0;
+            bool in_window = addr >= f->min_sp ||
+                             (addr >= red_zone_low && addr < f->current_sp);
+            if (!in_window) {
+                continue;
+            }
+            int64_t soff = 0;
+            if (!address_ref_signed_offset(f->entry_sp, addr, &soff) ||
+                !address_ref_roundtrip(f->entry_sp, soff, addr)) {
+                return false;
+            }
+            *out_instance_id = f->instance_id;
+            *out_prov_object_id = 0;
+            *out_prov_generation = 0;
+            *out_region = f->region;
+            *out_offset = soff;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool osprey_capture_address_ref(CPUArchState *env, target_ulong addr,
+                                OspreyRuntimeAddressRef *out) {
+    if (out == NULL) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!osprey_collect_enabled) {
+        return false;
+    }
+    uint64_t instance_id = 0;
+    uint64_t prov_object_id = 0;
+    uint32_t prov_generation = 0;
+    OspreyRegionId region;
+    int64_t offset = 0;
+    if (!capture_endpoint(env, addr, &instance_id, &prov_object_id,
+                          &prov_generation, &region, &offset)) {
+        return false;
+    }
+    address_ref_fill(out, &region, offset, addr, instance_id,
+                     prov_object_id, prov_generation);
+    return true;
+}
+
+bool osprey_capture_chunk_ref(CPUArchState *env, target_ulong addr,
+                              target_ulong size,
+                              OspreyRuntimeChunkRef *out) {
+    if (out == NULL) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!osprey_collect_enabled) {
+        return false;
+    }
+    if (size == 0) {
+        return false;
+    }
+    target_ulong delta = size - 1;
+    if (delta > (target_ulong)-1 - addr || delta > INT64_MAX) {
+        return false;
+    }
+    target_ulong end = addr + delta;
+    uint64_t inst_start = 0, inst_end = 0;
+    uint64_t prov_start = 0, prov_end = 0;
+    uint32_t gen_start = 0, gen_end = 0;
+    OspreyRegionId rstart, rend;
+    int64_t ostart = 0, oend = 0;
+    if (!capture_endpoint(env, addr, &inst_start, &prov_start, &gen_start,
+                          &rstart, &ostart)) {
+        return false;
+    }
+    if (!capture_endpoint(env, end, &inst_end, &prov_end, &gen_end,
+                          &rend, &oend)) {
+        return false;
+    }
+    if (!eq_region(&rstart, &rend) || inst_start != inst_end ||
+        prov_start != prov_end || gen_start != gen_end) {
+        /* Endpoints outside one instance, or a mixed-sign anchor
+         * straddle would make the interval non-contiguous. */
+        return false;
+    }
+    int64_t expected_end = 0;
+    if (!osprey_check_add(ostart, (int64_t)delta, &expected_end) ||
+        oend != expected_end) {
+        return false;
+    }
+    if (ostart < 0 && oend >= 0) {
+        return false;
+    }
+    address_ref_fill(&out->start, &rstart, ostart, addr, inst_start,
+                     prov_start, gen_start);
+    out->size = size;
+    return true;
+}
+
 /* Main-image normalization: map a runtime PC to an image-relative
  * offset, or return false when the PC is outside the image. */
 static bool osprey_normalize_pc(target_ulong pc, uint64_t *out) {

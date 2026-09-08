@@ -59,6 +59,35 @@ typedef struct OspreyChunk {
 } OspreyChunk;
 
 /* ------------------------------------------------------------------ */
+/* Stage 7.1: fixed-layout runtime access locators                     */
+/* ------------------------------------------------------------------ */
+
+/* Fixed-layout, pointer-free locator for one runtime address: the
+ * canonical identity (region + signed offset), the raw runtime address,
+ * and the allocation-instance identity that made the canonical mapping
+ * unique at capture time.  Lives inside SharedTraceData records, so the
+ * layout must never change (shared mmap between parent and child).
+ * valid == 0 means "no locator": the record stays generic-eligible. */
+typedef struct OspreyRuntimeAddressRef {
+    OspreyAddress address;
+    uint64_t raw;             /* raw runtime guest address */
+    uint64_t instance_id;     /* 0 for the merged global instance */
+    uint64_t prov_object_id;  /* heap only; 0 otherwise */
+    uint32_t prov_generation; /* heap only; 0 otherwise */
+    uint8_t valid;
+    uint8_t reserved[3];
+} OspreyRuntimeAddressRef;
+
+/* Fixed-layout locator for a contiguous access interval: the start
+ * address locator plus the exact width.  A chunk is captured only when
+ * every byte resolves into one allocation instance with consecutive
+ * canonical offsets (same contract as osprey_chunk_of_interval). */
+typedef struct OspreyRuntimeChunkRef {
+    OspreyRuntimeAddressRef start;
+    uint64_t size;
+} OspreyRuntimeChunkRef;
+
+/* ------------------------------------------------------------------ */
 /* Configuration                                                       */
 /* ------------------------------------------------------------------ */
 

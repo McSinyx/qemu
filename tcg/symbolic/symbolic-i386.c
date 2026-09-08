@@ -612,7 +612,7 @@ static inline void qemu_memmove(CPUArchState *cpu_env, uintptr_t src, uintptr_t 
             memcpy(mem_access.target, addr_h, size);
         }
         if (is_valid_address(src, true)) {
-            snapshot_read_access(&mem_access);
+            snapshot_read_access(cpu_env, &mem_access);
         }
     }
     // static char buf[4096];
