@@ -4212,40 +4212,6 @@ static bool decode_plan_model_shape_valid(const OspreyContext *ctx,
     return true;
 }
 
-static bool decode_signed_raw_add(uint64_t base, int64_t offset,
-                                  uint64_t *out)
-{
-    uint64_t magnitude;
-    if (out == NULL) return false;
-    if (offset < 0) {
-        magnitude = 0 - (uint64_t)offset;
-        if (base < magnitude) return false;
-        *out = base - magnitude;
-    } else {
-        magnitude = (uint64_t)offset;
-        if (base > UINT64_MAX - magnitude) return false;
-        *out = base + magnitude;
-    }
-    return true;
-}
-
-static const OspreyRegionInstance *decode_first_runtime_instance(
-    const OspreyContext *ctx, const OspreyRegionId *region,
-    uint32_t *ordinal_out)
-{
-    if (ctx == NULL || region == NULL || ordinal_out == NULL ||
-        ctx->region_instances == NULL) return NULL;
-    for (guint i = 0; i < ctx->region_instances->len; i++) {
-        const OspreyRegionInstance *instance = &g_array_index(
-            ctx->region_instances, OspreyRegionInstance, i);
-        if (decode_region_compare(&instance->region, region) == 0) {
-            *ordinal_out = i;
-            return instance;
-        }
-    }
-    return NULL;
-}
-
 static void model_ledger_set(OspreyModel *model, uint32_t slot,
                              void *base, uint64_t capacity, uint64_t used,
                              uint64_t bytes, uint64_t element_size,
@@ -4537,7 +4503,6 @@ OspreyStatus osprey_model_build(const OspreyContext *ctx,
     uint32_t max_types = 0;
     uint32_t type_count = 0;
     uint32_t field_total = 0;
-    uint32_t raw_count = 0;
     uint32_t aggregate_count;
 
     if (out == NULL) return OSPREY_INVALID_MODEL;
@@ -4895,66 +4860,6 @@ OspreyStatus osprey_model_build(const OspreyContext *ctx,
                                sizeof(*model->type_index),
                                decode_model_index_compare);
 
-    for (uint32_t i = 0; i < model->object_count; i++) {
-        uint32_t instance_ordinal;
-        if (decode_first_runtime_instance(ctx,
-                                           &model->objects[i].chunk.address.region,
-                                           &instance_ordinal) != NULL) {
-            if (raw_count == UINT32_MAX) goto failure;
-            raw_count++;
-        }
-    }
-    model->raw_span_count = raw_count;
-    model->raw_spans = model_alloc_family(&allocator, model,
-        OSPREY_MODEL_LEDGER_RUNTIME_SPANS, raw_count, sizeof(*model->raw_spans),
-        OSPREY_MODEL_DESTRUCTOR_FREE);
-    if (raw_count != 0 && model->raw_spans == NULL) goto failure;
-    uint32_t raw_position = 0;
-    for (uint32_t i = 0; i < model->object_count; i++) {
-        uint32_t instance_ordinal;
-        const OspreyRegionInstance *instance =
-            decode_first_runtime_instance(ctx,
-                &model->objects[i].chunk.address.region, &instance_ordinal);
-        if (instance == NULL) continue;
-        uint64_t raw_start;
-        uint64_t raw_end;
-        if (instance->raw_min > instance->raw_max ||
-            !decode_signed_raw_add(instance->raw_base,
-                                   model->objects[i].chunk.address.offset,
-                                   &raw_start) ||
-            raw_start > UINT64_MAX - model->objects[i].chunk.size ||
-            (raw_end = raw_start + model->objects[i].chunk.size) <= raw_start ||
-            raw_start < instance->raw_min || raw_end > instance->raw_max) {
-            goto failure;
-        }
-        if (raw_position == raw_count) goto failure;
-        model->raw_spans[raw_position++] = (OspRawSpan){
-            .raw_start = raw_start,
-            .raw_end = raw_end,
-            .obj_idx = i,
-            .source_instance_idx = instance_ordinal,
-            .is_chunk = 1,
-        };
-    }
-    if (raw_position != raw_count) goto failure;
-    for (uint32_t i = 1; i < raw_count; i++) {
-        OspRawSpan value = model->raw_spans[i];
-        uint32_t j = i;
-        while (j != 0) {
-            const OspRawSpan *previous = &model->raw_spans[j - 1];
-            const OspRawSpan *current = &value;
-            int c = decode_cmp_u64(previous->raw_start, current->raw_start);
-            if (c == 0) c = decode_cmp_u64(previous->raw_end,
-                                            current->raw_end);
-            if (c == 0) c = decode_chunk_compare(
-                &model->objects[previous->obj_idx].chunk,
-                &model->objects[current->obj_idx].chunk);
-            if (c <= 0) break;
-            model->raw_spans[j] = model->raw_spans[j - 1];
-            j--;
-        }
-        model->raw_spans[j] = value;
-    }
     *out = model;
     return OSPREY_OK;
 
@@ -4985,7 +4890,6 @@ static const char *const decode_validation_reasons[] = {
     [OSPREY_MODEL_VALIDATION_INDEX_ORDER] = "index-order",
     [OSPREY_MODEL_VALIDATION_INDEX_CONTENT] = "index-content",
     [OSPREY_MODEL_VALIDATION_CYCLE] = "by-value-cycle",
-    [OSPREY_MODEL_VALIDATION_RUNTIME_SPAN] = "runtime-span",
 };
 
 const char *osprey_model_validation_reason(
@@ -5054,10 +4958,6 @@ static bool decode_model_ledger_valid(const OspreyModel *model)
         !decode_model_ledger_slot_valid(model, OSPREY_MODEL_LEDGER_TYPE_INDEX,
             model->type_index, model->type_index_count,
             sizeof(*model->type_index), OSPREY_MODEL_DESTRUCTOR_FREE) ||
-        !decode_model_ledger_slot_valid(model,
-            OSPREY_MODEL_LEDGER_RUNTIME_SPANS, model->raw_spans,
-            model->raw_span_count, sizeof(*model->raw_spans),
-            OSPREY_MODEL_DESTRUCTOR_FREE) ||
         model->type_name_count != model->type_count ||
         !decode_model_ledger_slot_valid(model, OSPREY_MODEL_LEDGER_NAMES,
             model->type_names, model->type_name_count,
@@ -6151,83 +6051,6 @@ bool osprey_decode_test_by_value_cycles_valid(const OspreyModel *model)
     return decode_model_by_value_cycles_valid(model);
 }
 
-static bool decode_model_runtime_spans_valid(const OspreyContext *ctx,
-                                             const OspreyModel *model)
-{
-    uint8_t *seen;
-    uint32_t matching = 0;
-
-    if (ctx == NULL || model == NULL ||
-        (model->raw_span_count != 0 &&
-         (ctx->region_instances == NULL || model->raw_spans == NULL))) {
-        return false;
-    }
-    seen = model->object_count == 0 ? NULL :
-        g_try_malloc0((size_t)model->object_count);
-    if (model->object_count != 0 && seen == NULL) return false;
-    for (uint32_t i = 0; i < model->raw_span_count; i++) {
-        const OspRawSpan *span = &model->raw_spans[i];
-        const OspreyRegionInstance *instance;
-        const OspreyDecodedObject *object;
-        uint32_t first_instance;
-        uint64_t raw_start;
-        uint64_t raw_end;
-        if (span->obj_idx >= model->object_count || seen[span->obj_idx] ||
-            span->source_instance_idx >= ctx->region_instances->len ||
-            span->is_chunk != 1 || span->reserved[0] != 0 ||
-            span->reserved[1] != 0 || span->reserved[2] != 0 ||
-            (i != 0 && (model->raw_spans[i - 1].raw_start > span->raw_start ||
-             (model->raw_spans[i - 1].raw_start == span->raw_start &&
-              (model->raw_spans[i - 1].raw_end > span->raw_end ||
-               (model->raw_spans[i - 1].raw_end == span->raw_end &&
-                decode_chunk_compare(
-                    &model->objects[model->raw_spans[i - 1].obj_idx].chunk,
-                    &model->objects[span->obj_idx].chunk) >= 0)))))) {
-            g_free(seen);
-            return false;
-        }
-        object = &model->objects[span->obj_idx];
-        instance = &g_array_index(ctx->region_instances,
-                                  OspreyRegionInstance,
-                                  span->source_instance_idx);
-        if (decode_region_compare(&instance->region,
-                                  &object->chunk.address.region) != 0 ||
-            instance->raw_min > instance->raw_max ||
-            decode_first_runtime_instance(ctx, &object->chunk.address.region,
-                                           &first_instance) == NULL ||
-            first_instance != span->source_instance_idx ||
-            !decode_signed_raw_add(instance->raw_base,
-                                   object->chunk.address.offset, &raw_start) ||
-            raw_start > UINT64_MAX - object->chunk.size ||
-            (raw_end = raw_start + object->chunk.size) <= raw_start ||
-            raw_start != span->raw_start || raw_end != span->raw_end ||
-            raw_start < instance->raw_min || raw_end > instance->raw_max ||
-            span->raw_end - span->raw_start != object->chunk.size) {
-            g_free(seen);
-            return false;
-        }
-        seen[span->obj_idx] = 1;
-    }
-    for (uint32_t i = 0; i < model->object_count; i++) {
-        uint32_t instance_ordinal;
-        bool has_instance = decode_first_runtime_instance(
-            ctx, &model->objects[i].chunk.address.region,
-            &instance_ordinal) != NULL;
-        if (has_instance) {
-            matching++;
-            if (!seen[i]) {
-                g_free(seen);
-                return false;
-            }
-        } else if (seen[i]) {
-            g_free(seen);
-            return false;
-        }
-    }
-    g_free(seen);
-    return matching == model->raw_span_count;
-}
-
 OspreyStatus osprey_model_validate(
     const OspreyContext *ctx, const OspreyModel *model,
     OspreyModelValidationError *error_out)
@@ -6301,10 +6124,6 @@ OspreyStatus osprey_model_validate(
     if (!decode_model_by_value_cycles_valid(model)) {
         return decode_model_invalid(error_out, OSPREY_MODEL_VALIDATION_CYCLE);
     }
-    if (!decode_model_runtime_spans_valid(ctx, model)) {
-        return decode_model_invalid(error_out,
-                                    OSPREY_MODEL_VALIDATION_RUNTIME_SPAN);
-    }
     return OSPREY_OK;
 }
 
@@ -6336,8 +6155,7 @@ static bool decode_model_dump(FILE *out, const OspreyModel *model)
         (model->object_count != 0 && model->objects == NULL) ||
         (model->type_count != 0 && model->types == NULL) ||
         (model->field_count != 0 && model->fields == NULL) ||
-        (model->type_name_count != 0 && model->type_names == NULL) ||
-        (model->raw_span_count != 0 && model->raw_spans == NULL)) return false;
+        (model->type_name_count != 0 && model->type_names == NULL)) return false;
     if (fprintf(out, "[model-version %u] [objects %u] [types %u] "
                 "[fields %u]\n", model->version, model->object_count,
                 model->type_count, model->field_count) < 0) return false;
@@ -6562,46 +6380,4 @@ const OspreyDecodedObject *osprey_lookup_chunk(
     ordinal = decode_model_lookup_index(model->chunk_index,
                                         model->chunk_index_count, &key);
     return ordinal < 0 ? NULL : &model->objects[ordinal];
-}
-
-const OspreyDecodedObject *osprey_lookup_raw(const OspreyModel *model,
-                                             uint64_t raw_address)
-{
-    const OspreyDecodedObject *best = NULL;
-    uint64_t best_width = UINT64_MAX;
-    if (model == NULL || model->raw_spans == NULL) return NULL;
-    for (uint32_t i = 0; i < model->raw_span_count; i++) {
-        const OspRawSpan *span = &model->raw_spans[i];
-        uint64_t width;
-        if (span->raw_start >= span->raw_end ||
-            raw_address < span->raw_start || raw_address >= span->raw_end ||
-            span->obj_idx >= model->object_count) continue;
-        width = span->raw_end - span->raw_start;
-        if (best == NULL || width < best_width ||
-            (width == best_width && decode_chunk_compare(
-                &model->objects[span->obj_idx].chunk, &best->chunk) < 0)) {
-            best = &model->objects[span->obj_idx];
-            best_width = width;
-        }
-    }
-    return best;
-}
-
-bool osprey_raw_extent(const OspreyModel *model,
-                       const OspreyDecodedObject *obj, uint64_t *raw_out,
-                       uint64_t *extent_out)
-{
-    if (model == NULL || obj == NULL || raw_out == NULL || extent_out == NULL ||
-        model->raw_spans == NULL) return false;
-    for (uint32_t i = 0; i < model->raw_span_count; i++) {
-        const OspRawSpan *span = &model->raw_spans[i];
-        if (span->obj_idx < model->object_count &&
-            &model->objects[span->obj_idx] == obj &&
-            span->raw_end > span->raw_start) {
-            *raw_out = span->raw_start;
-            *extent_out = span->raw_end - span->raw_start;
-            return true;
-        }
-    }
-    return false;
 }

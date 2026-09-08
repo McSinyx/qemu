@@ -885,7 +885,6 @@ typedef enum OspreyModelValidationError {
     OSPREY_MODEL_VALIDATION_INDEX_ORDER,
     OSPREY_MODEL_VALIDATION_INDEX_CONTENT,
     OSPREY_MODEL_VALIDATION_CYCLE,
-    OSPREY_MODEL_VALIDATION_RUNTIME_SPAN,
 } OspreyModelValidationError;
 
 typedef enum OspreyModelDestructorKind {
@@ -911,7 +910,6 @@ typedef enum OspreyModelLedgerSlot {
     OSPREY_MODEL_LEDGER_CHUNK_INDEX,
     OSPREY_MODEL_LEDGER_AGGREGATE_INDEX,
     OSPREY_MODEL_LEDGER_TYPE_INDEX,
-    OSPREY_MODEL_LEDGER_RUNTIME_SPANS,
     OSPREY_MODEL_LEDGER_NAMES,
     OSPREY_MODEL_LEDGER_COUNT,
 } OspreyModelLedgerSlot;
@@ -1674,18 +1672,6 @@ bool osprey_factor_log_weight(const OspreyFactor *factor,
 bool osprey_graph_dump(const OspreyContext *ctx, const char *path);
 bool osprey_graph_dump_file(const OspreyContext *ctx, FILE *out);
 
-/* One raw-address span mapping back to an observed decoded object.  Raw
- * spans are an auxiliary Stage-7 bridge and never participate in semantic
- * identity or canonical model output. */
-typedef struct OspRawSpan {
-    uint64_t raw_start;
-    uint64_t raw_end;      /* exclusive */
-    uint32_t obj_idx;      /* into model->objects */
-    uint32_t source_instance_idx; /* into ctx->region_instances */
-    uint8_t is_chunk;      /* always one for Stage 6 objects */
-    uint8_t reserved[3];
-} OspRawSpan;
-
 /* Decoded model (installed by osprey_decode; parent side).  Semantic arrays
  * are immutable after validation; indexes are canonical sorted arrays. */
 struct OspreyModel {
@@ -1696,7 +1682,6 @@ struct OspreyModel {
     uint32_t chunk_index_count;
     uint32_t aggregate_index_count;
     uint32_t type_index_count;
-    uint32_t raw_span_count;
     uint32_t type_name_count;
 
     OspreyDecodedObject *objects;
@@ -1705,10 +1690,9 @@ struct OspreyModel {
     OspreyModelIndexEntry *chunk_index;
     OspreyModelIndexEntry *aggregate_index;
     OspreyModelIndexEntry *type_index;
-    OspRawSpan *raw_spans;
     char **type_names;
 
-    /* Eight fixed ledger families make destruction independent of mutable
+    /* Seven fixed ledger families make destruction independent of mutable
      * semantic counts.  The ledger itself is embedded and immutable. */
     OspreyModelAllocation ledger[OSPREY_MODEL_LEDGER_COUNT];
 };

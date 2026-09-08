@@ -1,6 +1,6 @@
 /*
- * OSPREY Stage 7.1 and 7.3 focused tests: baseline access identity and
- * immutable mutation-plan ownership.
+ * OSPREY Stage 7.1, 7.3, and 7.4 focused tests: baseline access identity,
+ * immutable mutation-plan ownership, and typed pointer application.
  *
  * Three layers:
  *
@@ -28,9 +28,11 @@
  *    records and first-over-cap sticky flag handling, and parent
  *    sort/traversal using only the validated count.
  *
- *  - Owned-plan groups: exact legacy generic descriptors, untyped-pointer
- *    fallback, independent fresh payloads, allocation rollback, private
- *    child application, FIFO transitions, and total manager teardown.
+ *  - Owned-plan groups: exact legacy generic descriptors, resolver-backed
+ *    NULL/fresh and non-NULL/NULL/OOB batches, typed-unavailable fallback,
+ *    independent exact-size payloads, checked OOB arithmetic, allocation
+ *    rollback, target-first child application, FIFO transitions, and total
+ *    manager teardown.
  *
  * Build: see tests/osprey/Makefile (targets unit-stage7-mutation and
  * unit-stage7-mutation-asan).
@@ -71,10 +73,15 @@ uint64_t last_translation_block = 0;
  * record-level groups exercise the access-record paths only, not page
  * management or forkserver transport. */
 void memcheck_init(void) {}
+static abi_long test_mmap_result = -1;
+static abi_ulong test_mmap_length;
+static uint32_t test_mmap_calls;
 abi_long target_mmap(abi_ulong start, abi_ulong len, int prot, int flags,
                      int fd, abi_ulong offset) {
-    (void)start; (void)len; (void)prot; (void)flags; (void)fd; (void)offset;
-    return (abi_long)-1;
+    (void)start; (void)prot; (void)flags; (void)fd; (void)offset;
+    test_mmap_calls++;
+    test_mmap_length = len;
+    return test_mmap_result;
 }
 int page_get_flags(target_ulong address) { (void)address; return 0; }
 int walk_memory_regions(void *priv, walk_memory_regions_fn fn) {
@@ -950,6 +957,157 @@ static void free_plan_queue(GQueue *queue)
     }
 }
 
+typedef struct MutationTypedFixture {
+    OspreyContext *ctx;
+    OspreyContext *previous_ctx;
+    OspreyModel model;
+    OspreyDecodedObject object;
+    OspreyDecodedType types[2];
+    OspreyModelIndexEntry chunk_index;
+    OspreyRuntimeChunkRef cell;
+    OspreyRuntimeAddressRef target;
+    OspreyRegionId global_region;
+    OspreyRegionId target_region;
+} MutationTypedFixture;
+
+static OspreyRegionId mutation_region(OspreyRegionKind kind, uint64_t site)
+{
+    OspreyRegionId region;
+    memset(&region, 0, sizeof(region));
+    region.kind = kind;
+    region.site_offset = site;
+    return region;
+}
+
+static OspreyAddress mutation_address(OspreyRegionId region, int64_t offset)
+{
+    OspreyAddress address;
+    memset(&address, 0, sizeof(address));
+    address.region = region;
+    address.offset = offset;
+    return address;
+}
+
+static OspreyChunk mutation_chunk(OspreyRegionId region, int64_t offset,
+                                  uint64_t size)
+{
+    OspreyChunk chunk;
+    memset(&chunk, 0, sizeof(chunk));
+    chunk.address = mutation_address(region, offset);
+    chunk.size = size;
+    return chunk;
+}
+
+static void mutation_append_instance(OspreyContext *ctx,
+                                     OspreyRegionId region,
+                                     uint64_t instance_id,
+                                     uint64_t raw_base, uint64_t raw_min,
+                                     uint64_t raw_max, uint64_t object_id,
+                                     uint32_t generation)
+{
+    OspreyRegionInstance instance;
+    memset(&instance, 0, sizeof(instance));
+    instance.region = region;
+    instance.instance_id = instance_id;
+    instance.raw_base = raw_base;
+    instance.raw_min = raw_min;
+    instance.raw_max = raw_max;
+    instance.prov_object_id = object_id;
+    instance.prov_generation = generation;
+    instance.sample_support = 1;
+    g_array_append_val(ctx->region_instances, instance);
+}
+
+static void mutation_typed_fixture_init(MutationTypedFixture *fixture,
+                                        uint64_t extent)
+{
+    OspreyConfig config;
+    memset(&config, 0, sizeof(config));
+    config.enabled = true;
+    config.shared_bytes = 1u << 20;
+    config.max_facts = 1024;
+    config.max_chunks_per_region = 128;
+    config.max_candidates_per_kind_region = 4096;
+    config.max_variables = 1024;
+    config.max_factors = 4096;
+    config.max_exact_clique_vars = 20;
+    config.max_exact_table_bytes = 1u << 20;
+    config.max_bp_table_bytes = 1u << 20;
+    config.report_threshold = 0.6;
+
+    memset(fixture, 0, sizeof(*fixture));
+    fixture->previous_ctx = g_osprey_ctx;
+    fixture->ctx = osprey_new(&config);
+    fixture->global_region = mutation_region(OSPREY_REGION_GLOBAL, 0);
+    fixture->target_region = mutation_region(OSPREY_REGION_HEAP_SITE, 0x400);
+
+    mutation_append_instance(fixture->ctx, fixture->global_region, 0,
+                             TEST_GUEST_BASE, TEST_GUEST_BASE,
+                             TEST_GUEST_BASE + TEST_GUEST_SPAN, 0, 0);
+    mutation_append_instance(fixture->ctx, fixture->target_region, 7,
+                             TEST_GUEST_BASE + 0x5000,
+                             TEST_GUEST_BASE + 0x5000,
+                             TEST_GUEST_BASE + 0x6000, 0xabc, 3);
+
+    fixture->object.chunk = mutation_chunk(fixture->global_region, 0xb000,
+                                           sizeof(target_ulong));
+    fixture->object.has_pointer_target = 1;
+    fixture->object.value_type_id = 0;
+    fixture->object.pointer_target = mutation_address(fixture->target_region,
+                                                      0);
+    fixture->types[0].id = 0;
+    fixture->types[0].kind = OSPREY_TYPE_POINTER;
+    fixture->types[0].size = sizeof(target_ulong);
+    fixture->types[0].target_type_id = 1;
+    fixture->types[0].canonical_base = fixture->object.pointer_target;
+    fixture->types[1].id = 1;
+    fixture->types[1].kind = OSPREY_TYPE_STRUCT;
+    fixture->types[1].size = extent;
+    fixture->types[1].canonical_base = fixture->object.pointer_target;
+    fixture->chunk_index.key = osprey_chunk_key(&fixture->object.chunk);
+    fixture->chunk_index.ordinal = 0;
+
+    fixture->model.version = OSPREY_MODEL_VERSION;
+    fixture->model.object_count = 1;
+    fixture->model.type_count = 2;
+    fixture->model.chunk_index_count = 1;
+    fixture->model.objects = &fixture->object;
+    fixture->model.types = fixture->types;
+    fixture->model.chunk_index = &fixture->chunk_index;
+
+    fixture->cell.start.address = fixture->object.chunk.address;
+    fixture->cell.start.raw = TEST_GUEST_BASE + 0xb000;
+    fixture->cell.start.instance_id = 0;
+    fixture->cell.start.valid = 1;
+    fixture->cell.size = sizeof(target_ulong);
+
+    fixture->target.address = fixture->object.pointer_target;
+    fixture->target.raw = TEST_GUEST_BASE + 0x5000;
+    fixture->target.instance_id = 7;
+    fixture->target.prov_object_id = 0xabc;
+    fixture->target.prov_generation = 3;
+    fixture->target.valid = 1;
+
+    fixture->ctx->model = &fixture->model;
+    fixture->ctx->tx_status = OSPREY_OK;
+    fixture->ctx->tx_model_ready = true;
+    g_osprey_ctx = fixture->ctx;
+    CHECK(osprey_runtime_index_build(fixture->ctx),
+          "typed mutation runtime index builds");
+}
+
+static void mutation_typed_fixture_free(MutationTypedFixture *fixture)
+{
+    if (fixture->ctx == NULL) return;
+    fixture->ctx->model = NULL;
+    fixture->ctx->tx_model_ready = false;
+    osprey_free(fixture->ctx);
+    fixture->ctx = NULL;
+    g_osprey_ctx = fixture->previous_ctx;
+    osprey_ctx_ref_set(fixture->previous_ctx);
+    fixture->previous_ctx = NULL;
+}
+
 static void test_owned_generic_plan_parity(void)
 {
     static const uint32_t widths[] = {1, 2, 3, 4, 8};
@@ -1155,6 +1313,325 @@ static void test_owned_fresh_payloads(void)
               "fresh cell bytes remain immutable placeholders");
     }
     free_plan_queue(queue);
+}
+
+static bool bytes_equal_value(const uint8_t *bytes, uint64_t size,
+                              uint8_t value)
+{
+    for (uint64_t i = 0; i < size; i++) {
+        if (bytes[i] != value) return false;
+    }
+    return true;
+}
+
+static void test_typed_pointer_plans_and_fallback(void)
+{
+    MutationTypedFixture fixture;
+    mutation_typed_fixture_init(&fixture, 13);
+
+    MutationCandidate source;
+    memset(&source, 0, sizeof(source));
+    source.addr = fixture.cell.start.raw;
+    source.size = sizeof(target_ulong);
+    source.expr = (Expr *)(uintptr_t)0x7654;
+    MutationCandidate before = source;
+
+    static const uint8_t fills[] = {0x00, 0x01, 0xff};
+    for (uint32_t source_kind = SNAPSHOT_POINTER_FROM_PRIMITIVE;
+         source_kind <= SNAPSHOT_POINTER_FROM_ACCESS; source_kind++) {
+        GQueue *queue = g_queue_new();
+        CHECK(add_pointer_typed_candidate(
+                  queue, &source, &fixture.cell, NULL, true,
+                  (SnapshotPointerSource)source_kind),
+              "NULL typed pointer batch queues");
+        CHECK(g_queue_get_length(queue) == 3,
+              "NULL typed pointer has exactly three variants");
+        for (uint32_t i = 0; i < G_N_ELEMENTS(fills); i++) {
+            Modification *modification = g_queue_peek_nth(queue, i);
+            SnapshotMutationWrite *write = &modification->mods[0];
+            CHECK(write->kind == SNAPSHOT_MUTATION_POINTER_FRESH &&
+                  write->size == sizeof(target_ulong) &&
+                  write->target.extent == 13 &&
+                  write->target.bytes != NULL &&
+                  bytes_equal_value(write->target.bytes, 13, fills[i]),
+                  "NULL typed pointer owns the exact fill variant");
+            CHECK(memcmp(write->value, source.value,
+                         sizeof(write->value)) == 0,
+                  "fresh pointer cell retains an immutable placeholder");
+            if (i != 0) {
+                Modification *previous = g_queue_peek_nth(queue, i - 1);
+                CHECK(write->target.bytes != previous->mods[0].target.bytes,
+                      "fresh pointer payloads are independently owned");
+            }
+        }
+        CHECK(memcmp(&source, &before, sizeof(source)) == 0,
+              "NULL typed planning leaves its source immutable");
+        free_plan_queue(queue);
+    }
+
+    static const uint64_t other_extents[] = {
+        1, sizeof(target_ulong), SNAPSHOT_PAGE_SIZE,
+    };
+    for (uint32_t i = 0; i < G_N_ELEMENTS(other_extents); i++) {
+        fixture.types[1].size = other_extents[i];
+        GQueue *queue = g_queue_new();
+        CHECK(add_pointer_typed_candidate(
+                  queue, &source, &fixture.cell, NULL, true,
+                  SNAPSHOT_POINTER_FROM_ACCESS),
+              "fresh extent boundary batch queues");
+        CHECK(g_queue_get_length(queue) == 3,
+              "fresh extent boundary retains three variants");
+        for (uint32_t variant = 0; variant < G_N_ELEMENTS(fills); variant++) {
+            Modification *modification = g_queue_peek_nth(queue, variant);
+            CHECK(modification->mods[0].target.extent == other_extents[i] &&
+                  bytes_equal_value(modification->mods[0].target.bytes,
+                                    other_extents[i], fills[variant]),
+                  "fresh extent boundary owns complete fill bytes");
+        }
+        free_plan_queue(queue);
+    }
+    fixture.types[1].size = 13;
+
+    target_ulong concrete = fixture.target.raw;
+    memcpy(source.value, &concrete, sizeof(concrete));
+    before = source;
+    GQueue *queue = g_queue_new();
+    CHECK(add_pointer_typed_candidate(
+              queue, &source, &fixture.cell, &fixture.target, true,
+              SNAPSHOT_POINTER_FROM_ACCESS),
+          "non-NULL typed pointer batch queues");
+    CHECK(g_queue_get_length(queue) == 2,
+          "non-NULL typed pointer has exactly NULL and OOB variants");
+    if (g_queue_get_length(queue) == 2) {
+        Modification *null_mod = g_queue_peek_nth(queue, 0);
+        Modification *oob_mod = g_queue_peek_nth(queue, 1);
+        target_ulong null_value = UINT64_MAX;
+        target_ulong oob_value = 0;
+        memcpy(&null_value, null_mod->mods[0].value, sizeof(null_value));
+        memcpy(&oob_value, oob_mod->mods[0].value, sizeof(oob_value));
+        CHECK(null_mod->mods[0].kind == SNAPSHOT_MUTATION_POINTER_NULL &&
+              null_value == 0 && null_mod->mods[0].target.bytes == NULL,
+              "non-NULL typed NULL descriptor is exact");
+        CHECK(oob_mod->mods[0].kind == SNAPSHOT_MUTATION_POINTER_OOB &&
+              oob_value == concrete + 13 + 0x10 &&
+              oob_mod->mods[0].target.bytes == NULL,
+              "non-NULL typed OOB descriptor uses checked target end");
+    }
+    CHECK(memcmp(&source, &before, sizeof(source)) == 0,
+          "non-NULL typed planning leaves its source immutable");
+    free_plan_queue(queue);
+
+    memset(source.value, 0, sizeof(source.value));
+    queue = g_queue_new();
+    CHECK(add_pointer_typed_candidate(
+              queue, &source, &fixture.cell, NULL, false,
+              SNAPSHOT_POINTER_FROM_PRIMITIVE),
+          "untrusted primitive record falls back generically");
+    CHECK(g_queue_get_length(queue) == 2 &&
+          ((Modification *)g_queue_peek_head(queue))->mods[0].kind ==
+              SNAPSHOT_MUTATION_BYTES,
+          "sticky record failure disables typed primitive planning");
+    free_plan_queue(queue);
+
+    queue = g_queue_new();
+    CHECK(add_pointer_typed_candidate(
+              queue, &source, &fixture.cell, NULL, false,
+              SNAPSHOT_POINTER_FROM_ACCESS),
+          "untrusted pointer record falls back generically");
+    CHECK(g_queue_get_length(queue) == 1 &&
+          ((Modification *)g_queue_peek_head(queue))->mods[0].kind ==
+              SNAPSHOT_MUTATION_POINTER_NULL,
+          "sticky record failure preserves untyped pointer behavior");
+    free_plan_queue(queue);
+
+    MutationCandidate mismatched = source;
+    mismatched.addr++;
+    queue = g_queue_new();
+    CHECK(add_pointer_typed_candidate(
+              queue, &mismatched, &fixture.cell, NULL, true,
+              SNAPSHOT_POINTER_FROM_ACCESS),
+          "mismatched cell locator falls back generically");
+    CHECK(g_queue_get_length(queue) == 1 &&
+          ((Modification *)g_queue_peek_head(queue))->mods[0].kind ==
+              SNAPSHOT_MUTATION_POINTER_NULL,
+          "typed planning binds the locator to the mutation address");
+    free_plan_queue(queue);
+
+    fixture.types[1].size = 0;
+    queue = g_queue_new();
+    CHECK(add_pointer_typed_candidate(
+              queue, &source, &fixture.cell, NULL, true,
+              SNAPSHOT_POINTER_FROM_ACCESS),
+          "zero-size target falls back generically");
+    CHECK(g_queue_get_length(queue) == 1 &&
+          ((Modification *)g_queue_peek_head(queue))->mods[0].kind ==
+              SNAPSHOT_MUTATION_POINTER_NULL,
+          "zero-size target preserves one untyped pointer plan");
+    free_plan_queue(queue);
+
+    fixture.types[1].size = SNAPSHOT_PAGE_SIZE + 1;
+    queue = g_queue_new();
+    CHECK(add_pointer_typed_candidate(
+              queue, &source, &fixture.cell, NULL, true,
+              SNAPSHOT_POINTER_FROM_ACCESS),
+          "oversized target falls back generically");
+    CHECK(g_queue_get_length(queue) == 1 &&
+          ((Modification *)g_queue_peek_head(queue))->mods[0].kind ==
+              SNAPSHOT_MUTATION_POINTER_NULL,
+          "fresh target cap preserves one untyped pointer plan");
+    free_plan_queue(queue);
+
+    mutation_append_instance(fixture.ctx, fixture.target_region, 8,
+                             UINT64_MAX - 31, UINT64_MAX - 31, UINT64_MAX,
+                             0xdef, 4);
+    CHECK(osprey_runtime_index_build(fixture.ctx),
+          "near-limit target instance enters the runtime index");
+    fixture.target.raw = UINT64_MAX - 31;
+    fixture.target.instance_id = 8;
+    fixture.target.prov_object_id = 0xdef;
+    fixture.target.prov_generation = 4;
+    fixture.types[1].size = 16;
+    concrete = (target_ulong)fixture.target.raw;
+    memcpy(source.value, &concrete, sizeof(concrete));
+    queue = g_queue_new();
+    CHECK(add_pointer_typed_candidate(
+              queue, &source, &fixture.cell, &fixture.target, true,
+              SNAPSHOT_POINTER_FROM_ACCESS),
+          "OOB delta overflow falls back generically");
+    CHECK(g_queue_get_length(queue) == 1 &&
+          ((Modification *)g_queue_peek_head(queue))->mods[0].kind ==
+              SNAPSHOT_MUTATION_POINTER_NULL,
+          "OOB overflow publishes no partial typed prefix");
+    free_plan_queue(queue);
+
+    memset(source.value, 0, sizeof(source.value));
+    fixture.types[1].size = 13;
+    bool saw_success = false;
+    for (int64_t fail_after = 0; fail_after < 32; fail_after++) {
+        queue = g_queue_new();
+        snapshot_mutation_test_set_alloc_fail_after(-1);
+        Modification *sentinel = snapshot_mutation_new(
+            &source, SNAPSHOT_MUTATION_BYTES, source.value, source.size,
+            0, NULL);
+        CHECK(sentinel != NULL &&
+              snapshot_mutation_enqueue_one(queue, sentinel),
+              "typed allocation sweep sentinel queues");
+        snapshot_mutation_test_set_alloc_fail_after(fail_after);
+        bool queued = add_pointer_typed_candidate(
+            queue, &source, &fixture.cell, NULL, true,
+            SNAPSHOT_POINTER_FROM_ACCESS);
+        snapshot_mutation_test_set_alloc_fail_after(-1);
+        if (queued) {
+            CHECK(g_queue_get_length(queue) == 4,
+                  "typed allocation sweep publishes the complete batch");
+            saw_success = true;
+            free_plan_queue(queue);
+            break;
+        }
+        CHECK(g_queue_get_length(queue) == 1,
+              "typed allocation failure publishes no partial batch");
+        free_plan_queue(queue);
+    }
+    CHECK(saw_success, "typed allocation sweep reaches complete success");
+
+    mutation_typed_fixture_free(&fixture);
+}
+
+static void test_fresh_pointer_application(void)
+{
+    CPUArchState *env = g_malloc0(sizeof(*env));
+    MutationCandidate source;
+    uint8_t payload[13];
+    memset(&source, 0, sizeof(source));
+    memset(payload, 0x5a, sizeof(payload));
+    source.addr = TEST_GUEST_BASE + 0xb100;
+    source.size = sizeof(target_ulong);
+    source.expr = (Expr *)(uintptr_t)0x9876;
+    target_ulong target = TEST_GUEST_BASE + 0xc000;
+    memset(g2h(source.addr), 0xcc, sizeof(target_ulong));
+    memset(g2h(target), 0xa5, sizeof(payload) + 1);
+
+    Modification *plan = snapshot_mutation_new(
+        &source, SNAPSHOT_MUTATION_POINTER_FRESH, source.value, source.size,
+        sizeof(payload), payload);
+    CHECK(plan != NULL, "fresh application plan allocates");
+    if (plan != NULL) {
+        uint8_t value_before[sizeof(plan->mods[0].value)];
+        uint8_t payload_before[sizeof(payload)];
+        memcpy(value_before, plan->mods[0].value, sizeof(value_before));
+        memcpy(payload_before, plan->mods[0].target.bytes,
+               sizeof(payload_before));
+        test_mmap_result = (abi_long)target;
+        test_mmap_length = 0;
+        test_mmap_calls = 0;
+        mod_manager = g_new0(ModificationManager, 1);
+        mod_manager->modifications = g_queue_new();
+        mod_manager->current = plan;
+        mutation_analysis_started = true;
+        snapshot_modify_memory(env);
+
+        target_ulong applied = 0;
+        memcpy(&applied, g2h(source.addr), sizeof(applied));
+        CHECK(test_mmap_calls == 1 && test_mmap_length == sizeof(payload),
+              "fresh mapping requests the exact decoded extent");
+        CHECK(bytes_equal_value(g2h(target), sizeof(payload), 0x5a) &&
+              ((uint8_t *)g2h(target))[sizeof(payload)] == 0xa5,
+              "fresh application initializes exactly the owned extent");
+        CHECK(applied == target,
+              "fresh application publishes the mapped pointer cell");
+        CHECK(memcmp(plan->mods[0].value, value_before,
+                     sizeof(value_before)) == 0 &&
+              memcmp(plan->mods[0].target.bytes, payload_before,
+                     sizeof(payload_before)) == 0,
+              "fresh application leaves the parent plan immutable");
+        snapshot_modification_manager_reset(false);
+    }
+
+    void *shared = mmap(NULL, SNAPSHOT_PAGE_SIZE,
+                        PROT_READ | PROT_WRITE,
+                        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    CHECK(shared != MAP_FAILED, "shared failure probe maps");
+    if (shared != MAP_FAILED) {
+        unsigned long saved_guest_base = guest_base;
+        target_ulong cell = TEST_GUEST_BASE + 0x100;
+        guest_base = (unsigned long)shared - TEST_GUEST_BASE;
+        target_ulong sentinel = 0x1122334455667788ULL;
+        memcpy(g2h(cell), &sentinel, sizeof(sentinel));
+        source.addr = cell;
+        plan = snapshot_mutation_new(
+            &source, SNAPSHOT_MUTATION_POINTER_FRESH, source.value,
+            source.size, sizeof(payload), payload);
+        CHECK(plan != NULL, "fresh failure plan allocates");
+        if (plan != NULL) {
+            mod_manager = g_new0(ModificationManager, 1);
+            mod_manager->modifications = g_queue_new();
+            mod_manager->current = plan;
+            mutation_analysis_started = true;
+            test_mmap_result = -1;
+            pid_t pid = fork();
+            if (pid == 0) {
+                if (g_osprey_ctx != NULL) {
+                    osprey_free(g_osprey_ctx);
+                    g_osprey_ctx = NULL;
+                }
+                snapshot_modify_memory(env);
+                _exit(0);
+            }
+            int status = 0;
+            CHECK(pid > 0 && waitpid(pid, &status, 0) == pid &&
+                  WIFEXITED(status) && WEXITSTATUS(status) == 1,
+                  "fresh mapping failure terminates the child");
+            target_ulong after = 0;
+            memcpy(&after, g2h(cell), sizeof(after));
+            CHECK(after == sentinel,
+                  "fresh mapping failure leaves the pointer cell unchanged");
+            snapshot_modification_manager_reset(false);
+        }
+        guest_base = saved_guest_base;
+        munmap(shared, SNAPSHOT_PAGE_SIZE);
+    }
+    test_mmap_result = -1;
+    g_free(env);
 }
 
 static void test_atomic_plan_enqueue_failures(void)
@@ -1413,6 +1890,8 @@ int main(void)
     test_owned_generic_boundary_parity();
     test_owned_untyped_pointer_parity();
     test_owned_fresh_payloads();
+    test_typed_pointer_plans_and_fallback();
+    test_fresh_pointer_application();
     test_atomic_plan_enqueue_failures();
     test_nested_payload_failures();
     test_owned_plan_validation();

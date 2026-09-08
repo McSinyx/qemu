@@ -2782,7 +2782,7 @@ static bool expect_model_rejected(OspreyContext *ctx, OspreyModel *model,
     const char *reason = osprey_model_validation_reason(error);
     bool passed = status == OSPREY_INVALID_MODEL &&
                   error > OSPREY_MODEL_VALIDATION_NONE &&
-                  error <= OSPREY_MODEL_VALIDATION_RUNTIME_SPAN &&
+                  error <= OSPREY_MODEL_VALIDATION_CYCLE &&
                   reason != NULL && strcmp(reason, "none") != 0;
     CHECK(passed, message);
     return passed;
@@ -2804,10 +2804,8 @@ static void test_stage64_immutable_model_and_validation(void)
               "model owns canonical type and chunk indexes");
         char *dump_before = dump_model(model);
         CHECK(dump_before != NULL && strstr(dump_before, "[model-version 1]") != NULL &&
-                  strstr(dump_before, "[posterior-bits") != NULL &&
-                  strstr(dump_before, "raw-span") == NULL &&
-                  strstr(dump_before, "raw-spans") == NULL,
-              "model dump contains semantic rows but no runtime spans");
+                  strstr(dump_before, "[posterior-bits") != NULL,
+              "model dump contains semantic rows");
         if (model->object_count != 0) {
             uint32_t saved_type = model->objects[0].value_type_id;
             model->objects[0].value_type_id = UINT32_MAX;
@@ -2861,8 +2859,6 @@ static void test_stage64_ledger_corruption_matrix(void)
           corrupt_model_ledger_aggregate_index_base },
         { "type-index", OSPREY_MODEL_LEDGER_TYPE_INDEX, true,
           corrupt_model_ledger_type_index_used },
-        { "runtime-spans", OSPREY_MODEL_LEDGER_RUNTIME_SPANS, true,
-          NULL },
         { "names", OSPREY_MODEL_LEDGER_NAMES, true,
           corrupt_model_ledger_names_destructor },
     };
@@ -2941,7 +2937,7 @@ static void test_stage64_header_count_matrix(void)
 {
     OspreyContext *ctx = make_projection_context(0);
     OspreyModel *model = NULL;
-    uint32_t *counts[8];
+    uint32_t *counts[7];
     size_t count;
 
     if (ctx == NULL || !build_model_fixture(ctx, &model)) {
@@ -2961,8 +2957,7 @@ static void test_stage64_header_count_matrix(void)
     counts[3] = &model->chunk_index_count;
     counts[4] = &model->aggregate_index_count;
     counts[5] = &model->type_index_count;
-    counts[6] = &model->raw_span_count;
-    counts[7] = &model->type_name_count;
+    counts[6] = &model->type_name_count;
     for (count = 0; count < G_N_ELEMENTS(counts); count++) {
         uint32_t saved = *counts[count];
         *counts[count] = saved + 1;
@@ -3643,110 +3638,6 @@ static void test_stage64_recursive_pointer_is_legal(void)
     osprey_free(ctx);
 }
 
-static void test_stage64_runtime_span_bridge(void)
-{
-    OspreyContext *ctx = make_projection_context(0);
-    OspreyRegionInstance instance;
-    OspreyModel *model = NULL;
-    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x101, 0x500);
-    memset(&instance, 0, sizeof(instance));
-    instance.region = region;
-    instance.instance_id = 7;
-    instance.raw_base = UINT64_C(0x1000);
-    instance.raw_min = UINT64_C(0x1000);
-    instance.raw_max = UINT64_C(0x1100);
-    CHECK(ctx != NULL, "runtime span fixture context allocated");
-    if (ctx != NULL) g_array_append_val(ctx->region_instances, instance);
-    if (ctx != NULL && build_model_fixture(ctx, &model)) {
-        OspreyModelValidationError error = OSPREY_MODEL_VALIDATION_NONE;
-        const OspreyDecodedObject *scalar = osprey_lookup_raw(model, 0x1000);
-        const OspreyDecodedObject *primitive = osprey_lookup_raw(model, 0x1020);
-        uint64_t raw = 0;
-        uint64_t extent = 0;
-        CHECK(osprey_model_validate(ctx, model, &error) == OSPREY_OK &&
-                  model->raw_span_count == 3 && scalar != NULL &&
-                  primitive != NULL && scalar != primitive &&
-                  osprey_raw_extent(model, primitive, &raw, &extent) &&
-                  raw == 0x1020 && extent == 8,
-              "runtime spans retain checked chunk lookup bridge");
-        /* Corrupt each span-identity dimension in turn: ordinal, source
-         * instance, raw start, raw end, and canonical ordering. */
-        OspRawSpan *span = &model->raw_spans[0];
-        uint32_t saved_obj = span->obj_idx;
-        span->obj_idx = model->object_count;
-        CHECK(osprey_model_validate(ctx, model, &error) ==
-                  OSPREY_INVALID_MODEL &&
-                  error == OSPREY_MODEL_VALIDATION_RUNTIME_SPAN,
-              "out-of-range span object ordinal rejects");
-        span->obj_idx = saved_obj;
-        uint32_t saved_instance = span->source_instance_idx;
-        span->source_instance_idx = (uint32_t)ctx->region_instances->len + 1;
-        CHECK(osprey_model_validate(ctx, model, &error) ==
-                  OSPREY_INVALID_MODEL &&
-                  error == OSPREY_MODEL_VALIDATION_RUNTIME_SPAN,
-              "out-of-range span instance ordinal rejects");
-        span->source_instance_idx = saved_instance;
-        uint64_t saved_start = span->raw_start;
-        span->raw_start = span->raw_end;
-        CHECK(osprey_model_validate(ctx, model, &error) ==
-                  OSPREY_INVALID_MODEL,
-              "empty span interval rejects");
-        if (saved_start > instance.raw_min) {
-            span->raw_start = saved_start - 1;
-            CHECK(osprey_model_validate(ctx, model, &error) ==
-                      OSPREY_INVALID_MODEL,
-                  "span below the instance raw minimum rejects");
-        }
-        span->raw_start = saved_start;
-        span->raw_start = saved_start + 1;
-        CHECK(osprey_model_validate(ctx, model, &error) ==
-                  OSPREY_INVALID_MODEL,
-              "span start mismatch rejects");
-        span->raw_start = saved_start;
-        if (model->raw_span_count > 1) {
-            uint32_t saved_second_obj = model->raw_spans[1].obj_idx;
-            model->raw_spans[1].obj_idx = span->obj_idx;
-            CHECK(osprey_model_validate(ctx, model, &error) ==
-                      OSPREY_INVALID_MODEL &&
-                      error == OSPREY_MODEL_VALIDATION_RUNTIME_SPAN,
-                  "duplicate span object rejects");
-            model->raw_spans[1].obj_idx = saved_second_obj;
-        }
-        uint64_t saved_end = span->raw_end;
-        span->raw_end = span->raw_start - 1;
-        CHECK(osprey_model_validate(ctx, model, &error) ==
-                  OSPREY_INVALID_MODEL,
-              "span end below its start rejects");
-        if (saved_end + 1 <= instance.raw_max) {
-            /* Widening any span by one byte must reject: the raw end must
-             * equal the checked chunk width for every span. */
-            span->raw_end = saved_end + 1;
-            CHECK(osprey_model_validate(ctx, model, &error) ==
-                      OSPREY_INVALID_MODEL,
-                  "span width beyond the chunk rejects");
-            span->raw_end = saved_end;
-        }
-        span->is_chunk = 0;
-        CHECK(osprey_model_validate(ctx, model, &error) ==
-                  OSPREY_INVALID_MODEL,
-              "non-chunk span class rejects");
-        span->is_chunk = 1;
-        OspRawSpan first = model->raw_spans[0];
-        OspRawSpan second = model->raw_spans[1];
-        model->raw_spans[0] = second;
-        model->raw_spans[1] = first;
-        CHECK(osprey_model_validate(ctx, model, &error) ==
-                  OSPREY_INVALID_MODEL,
-              "unsorted span ordering rejects");
-        model->raw_spans[0] = first;
-        model->raw_spans[1] = second;
-        CHECK(osprey_model_validate(ctx, model, &error) == OSPREY_OK,
-              "restored spans validate again");
-    }
-    osprey_model_free(model);
-    osprey_free(ctx);
-}
-
 static void test_stage64_canonical_runtime_histories(void)
 {
     OspreyRegionId global = make_region(OSPREY_REGION_GLOBAL, 0x101, 0x500);
@@ -4115,31 +4006,6 @@ static void test_stage65_semantic_field_matrix(void)
         indexes[family][0] = saved;
     }
 
-    if (model->raw_span_count != 0) {
-        OspRawSpan *span = &model->raw_spans[0];
-        OspRawSpan saved = *span;
-        span->raw_start++;
-        expect_model_rejected(ctx, model, "runtime span start rejects");
-        *span = saved;
-        span->raw_end++;
-        expect_model_rejected(ctx, model, "runtime span end rejects");
-        *span = saved;
-        span->obj_idx = UINT32_MAX;
-        expect_model_rejected(ctx, model, "runtime span object rejects");
-        *span = saved;
-        span->source_instance_idx = UINT32_MAX;
-        expect_model_rejected(ctx, model, "runtime span instance rejects");
-        *span = saved;
-        span->is_chunk = 0;
-        expect_model_rejected(ctx, model, "runtime span kind rejects");
-        *span = saved;
-        for (size_t i = 0; i < G_N_ELEMENTS(span->reserved); i++) {
-            span->reserved[i] = 1;
-            expect_model_rejected(ctx, model,
-                                  "each runtime span reserved byte rejects");
-            *span = saved;
-        }
-    }
     expect_model_valid(ctx, model,
                        "complete semantic-field matrix restores base model");
     osprey_model_free(model);
@@ -4941,7 +4807,6 @@ int main(void)
     RUN(test_stage64_by_value_cycle_rejection);
     RUN(test_stage64_later_field_by_value_cycle_rejection);
     RUN(test_stage64_recursive_pointer_is_legal);
-    RUN(test_stage64_runtime_span_bridge);
     RUN(test_stage64_canonical_runtime_histories);
     RUN(test_stage64_model_allocation_atomicity);
     RUN(test_stage64_atomic_coordinator);

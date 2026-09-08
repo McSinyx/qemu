@@ -2175,8 +2175,7 @@ bool osprey_reference_model_equal(const OspreyReferenceResult *reference,
         reference->field_count != model->field_count ||
         reference->chunk_index_count != model->chunk_index_count ||
         reference->aggregate_index_count != model->aggregate_index_count ||
-        reference->type_index_count != model->type_index_count ||
-        model->raw_span_count != 0) return false;
+        reference->type_index_count != model->type_index_count) return false;
     for (uint32_t i = 0; i < reference->object_count; i++) {
         if (!ref_object_equal(&reference->objects[i], &model->objects[i])) return false;
     }

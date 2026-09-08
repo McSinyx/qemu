@@ -250,20 +250,6 @@ const OspreyModel *osprey_model(const OspreyContext *ctx);
 const OspreyDecodedObject *osprey_lookup_chunk(const OspreyModel *model,
                                                 const OspreyChunk *chunk);
 
-/* Stage 7 consumer API (parent side): map a raw guest address back to the
- * narrowest observed decoded chunk covering it.  Aggregate definitions have
- * no synthetic objects or raw spans.  Returns NULL when the address is outside
- * every modeled observed chunk. */
-const OspreyDecodedObject *osprey_lookup_raw(const OspreyModel *model,
-                                              uint64_t raw);
-
-/* Raw extent of a decoded object's observed chunk span.  Stage 6 retains
- * this chunk-exact bridge until Stage 7 replaces instance lookup.
- * Returns false when no runtime instance resolves. */
-bool osprey_raw_extent(const OspreyModel *model,
-                       const OspreyDecodedObject *obj, uint64_t *raw_out,
-                       uint64_t *extent_out);
-
 /* ------------------------------------------------------------------ */
 /* Runtime collection hooks (called from translated code / models)     */
 /* ------------------------------------------------------------------ */

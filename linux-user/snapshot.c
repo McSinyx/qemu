@@ -2503,46 +2503,57 @@ void snapshot_fork_setup(void) {
     log_msg("[forkserver] [setup]\n");
 }
 
-/* Stage 7.4 owns fresh-target mapping/application.  Keep the complete
- * class-carrying helpers out of the Stage 7.3 execution path so the
- * producer inventory remains stable without allowing a fresh plan through
- * snapshot_modify_memory(). */
-static abi_ulong snapshot_alloc_pointer_page(CPUArchState *env)
+/* Stage 7.4 owns fresh-target mapping/application.  The mapping request is
+ * exactly the decoded aggregate extent; only the accepted payload interval
+ * receives an OSPREY overwrite event. */
+static target_ulong snapshot_alloc_pointer_target(CPUArchState *env,
+                                                  uint64_t extent)
     G_GNUC_UNUSED;
-static abi_ulong snapshot_alloc_pointer_page(CPUArchState *env)
+static target_ulong snapshot_alloc_pointer_target(CPUArchState *env,
+                                                  uint64_t extent)
 {
-    abi_long mapped = target_mmap(0, SNAPSHOT_PAGE_SIZE,
-                                  PROT_READ | PROT_WRITE,
-                                  MAP_PRIVATE | MAP_ANONYMOUS,
-                                  -1, 0);
+    abi_long mapped;
+    target_ulong target;
+
+    (void)env;
+    if (extent == 0 || extent > SNAPSHOT_PAGE_SIZE) {
+        return (target_ulong)-1;
+    }
+    mapped = target_mmap(0, (abi_ulong)extent,
+                         PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS,
+                         -1, 0);
     if (mapped == -1) {
         log_msg("[mod-pointer] [alloc-error] target_mmap failed\n");
-        return (abi_ulong)-1;
+        return (target_ulong)-1;
     }
-
-    memset(g2h((target_ulong)mapped), 0, SNAPSHOT_PAGE_SIZE);
-    sem_mem_overwrite(env, (target_ulong)mapped, SNAPSHOT_PAGE_SIZE,
-                      SEM_OP_SNAPSHOT);
-    log_msg("[mod-pointer] [alloc] [addr %lx] [size %x]\n",
-            (target_ulong)mapped, SNAPSHOT_PAGE_SIZE);
-    return (abi_ulong)mapped;
+    target = (target_ulong)(abi_ulong)mapped;
+    if (target == 0 || (uint64_t)(abi_ulong)target != (uint64_t)(abi_ulong)mapped) {
+        log_msg("[mod-pointer] [alloc-error] target address is not representable\n");
+        return (target_ulong)-1;
+    }
+    log_msg("[mod-pointer] [alloc] [addr %lx] [size %llu]\n",
+            target, (unsigned long long)extent);
+    return target;
 }
 
-static void snapshot_apply_fresh_target(CPUArchState *env,
+static bool snapshot_apply_fresh_target(CPUArchState *env,
                                         target_ulong target,
                                         const uint8_t *bytes,
                                         uint64_t extent) G_GNUC_UNUSED;
-static void snapshot_apply_fresh_target(CPUArchState *env,
+static bool snapshot_apply_fresh_target(CPUArchState *env,
                                         target_ulong target,
                                         const uint8_t *bytes,
                                         uint64_t extent)
 {
-    if (bytes == NULL || extent == 0 || extent > SNAPSHOT_PAGE_SIZE) {
-        return;
+    if (env == NULL || target == 0 || bytes == NULL || extent == 0 ||
+        extent > SNAPSHOT_PAGE_SIZE) {
+        return false;
     }
     memcpy(g2h(target), bytes, (size_t)extent);
     sem_mem_overwrite(env, target, (target_ulong)extent,
                       SEM_OP_SNAPSHOT);
+    return true;
 }
 
 static Modification *snapshot_mutation_new(const MutationCandidate *candidate,
@@ -2573,8 +2584,8 @@ static Modification *snapshot_mutation_new(const MutationCandidate *candidate,
         return NULL;
     }
     if (kind == SNAPSHOT_MUTATION_POINTER_FRESH) {
-        if (target_extent == 0 || target_bytes == NULL ||
-            target_extent > SIZE_MAX) {
+        if (target_extent == 0 || target_extent > SNAPSHOT_PAGE_SIZE ||
+            target_bytes == NULL || target_extent > SIZE_MAX) {
             return NULL;
         }
     } else if (target_extent != 0 || target_bytes != NULL) {
@@ -2720,17 +2731,26 @@ static void snapshot_modify_memory(CPUArchState *cpu_env)
         const SnapshotMutationWrite *write = &mod->mods[i];
         SnapshotMutationWrite local = *write;
 
-        if (write->kind == SNAPSHOT_MUTATION_POINTER_FRESH) {
-            /* Fresh-target mapping/application is Stage 7.4.  Never
-             * reinterpret a future plan as a partial byte write here. */
-            log_msg("ERROR: fresh mutation before Stage 7.4\n");
-            exit_with_status(1);
-        }
         if (write->kind != SNAPSHOT_MUTATION_BYTES &&
             write->kind != SNAPSHOT_MUTATION_POINTER_NULL &&
-            write->kind != SNAPSHOT_MUTATION_POINTER_OOB) {
+            write->kind != SNAPSHOT_MUTATION_POINTER_OOB &&
+            write->kind != SNAPSHOT_MUTATION_POINTER_FRESH) {
             log_msg("ERROR: invalid mutation kind\n");
             exit_with_status(1);
+        }
+        if (write->kind == SNAPSHOT_MUTATION_POINTER_FRESH) {
+            target_ulong target = snapshot_alloc_pointer_target(
+                cpu_env, write->target.extent);
+            if (target == (target_ulong)-1 ||
+                !snapshot_apply_fresh_target(cpu_env, target,
+                                             write->target.bytes,
+                                             write->target.extent)) {
+                log_msg("[mod-pointer] [apply-error] fresh target failed\n");
+                exit_with_status(1);
+            }
+            /* The target is fully initialized and its metadata is published
+             * before the child-local pointer cell is changed. */
+            memcpy(local.value, &target, sizeof(target));
         }
 
         if (local.size == 0 ||
@@ -2913,6 +2933,114 @@ static bool add_untyped_pointer_candidate(GQueue *modifications,
     return snapshot_mutation_enqueue_one(modifications, mod);
 }
 
+typedef enum SnapshotPointerSource {
+    SNAPSHOT_POINTER_FROM_PRIMITIVE = 0,
+    SNAPSHOT_POINTER_FROM_ACCESS = 1,
+} SnapshotPointerSource;
+
+/* Resolve one baseline pointer access and enqueue its complete typed batch.
+ * typed_allowed is the parent-wide Stage 7.1 record-integrity gate; a sticky
+ * overflow or corrupt count disables typed planning for both record families.
+ * A resolver/planning/queue failure is typed-unavailable for this access, so
+ * the unchanged source candidate is sent through its original generic path.
+ * The helper never exposes a partially built typed batch. */
+static bool add_pointer_typed_candidate(
+    GQueue *modifications, const MutationCandidate *source,
+    const OspreyRuntimeChunkRef *cell,
+    const OspreyRuntimeAddressRef *target_ref, bool typed_allowed,
+    SnapshotPointerSource source_kind)
+{
+    const OspreyModel *model = NULL;
+    OspreyRuntimePointerResolution resolution;
+    OspreyRuntimeResolveStatus status;
+    uint8_t zero_value[sizeof(target_ulong)] = {0};
+    target_ulong concrete_value;
+    uint32_t count = 0;
+    Modification *batch[3] = {NULL, NULL, NULL};
+
+    if (!typed_allowed || source == NULL ||
+        source->size != sizeof(target_ulong) || cell == NULL ||
+        cell->start.valid != 1 || cell->size != source->size ||
+        cell->start.raw != (uint64_t)source->addr || g_osprey_ctx == NULL ||
+        !g_osprey_ctx->config.enabled || !osprey_collect_enabled) {
+        goto generic;
+    }
+    model = osprey_model(g_osprey_ctx);
+    if (model == NULL) goto generic;
+    memcpy(&concrete_value, source->value, sizeof(concrete_value));
+    status = osprey_runtime_resolve_pointer(
+        g_osprey_ctx, model, cell, concrete_value, target_ref,
+        &resolution);
+    if (status != OSPREY_RUNTIME_RESOLVED || resolution.target_extent == 0 ||
+        resolution.target_extent > SNAPSHOT_PAGE_SIZE) {
+        goto generic;
+    }
+
+    if (concrete_value == 0) {
+        uint8_t fills[3][SNAPSHOT_PAGE_SIZE];
+        memset(fills[0], 0, sizeof(fills[0]));
+        memset(fills[1], 1, sizeof(fills[1]));
+        memset(fills[2], 0xff, sizeof(fills[2]));
+        for (uint32_t i = 0; i < G_N_ELEMENTS(fills); i++) {
+            batch[count++] = snapshot_mutation_new(
+                source, SNAPSHOT_MUTATION_POINTER_FRESH, zero_value,
+                sizeof(target_ulong), resolution.target_extent,
+                fills[i]);
+            if (batch[count - 1] == NULL) {
+                snapshot_mutation_free_batch(batch, count);
+                goto generic;
+            }
+        }
+    } else {
+        uint64_t target_raw;
+        uint64_t target_end;
+        uint64_t oob;
+        target_ulong oob_value;
+        uint8_t oob_bytes[sizeof(target_ulong)];
+
+        if (!resolution.has_runtime_target || !resolution.target_valid ||
+            target_ref == NULL) {
+            goto generic;
+        }
+        target_raw = resolution.target.raw;
+        if (target_raw > UINT64_MAX - resolution.target_extent) {
+            goto generic;
+        }
+        target_end = target_raw + resolution.target_extent;
+        if (target_end <= target_raw || target_end > UINT64_MAX - 0x10u) {
+            goto generic;
+        }
+        oob = target_end + 0x10u;
+        if (oob < target_end ||
+            (oob >= target_raw && oob < target_end)) {
+            goto generic;
+        }
+        oob_value = (target_ulong)oob;
+        if ((uint64_t)oob_value != oob) goto generic;
+        memcpy(oob_bytes, &oob_value, sizeof(oob_value));
+
+        batch[count++] = snapshot_mutation_new(
+            source, SNAPSHOT_MUTATION_POINTER_NULL, zero_value,
+            sizeof(target_ulong), 0, NULL);
+        batch[count++] = snapshot_mutation_new(
+            source, SNAPSHOT_MUTATION_POINTER_OOB, oob_bytes,
+            sizeof(target_ulong), 0, NULL);
+        if (batch[0] == NULL || batch[1] == NULL) {
+            snapshot_mutation_free_batch(batch, count);
+            goto generic;
+        }
+    }
+    if (snapshot_mutation_enqueue_batch(modifications, batch, count)) {
+        return true;
+    }
+
+generic:
+    if (source_kind == SNAPSHOT_POINTER_FROM_ACCESS) {
+        return add_untyped_pointer_candidate(modifications, source);
+    }
+    return add_modification_primitive(modifications, source);
+}
+
 static bool binradar_manager_check_addr(target_ulong addr) {
     if (snapshot_addr_is_protected(addr)) {
         log_msg("[binradar] [check-addr] [addr %lx] [hit]\n", addr);
@@ -3059,17 +3187,19 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
                 .expr = prim->expr,
                 .value = {0}
             };
+            if (binradar_manager_check_addr(mod.addr)) {
+                log_msg("[binradar] [skip-mod] [addr %lx]\n", mod.addr);
+                continue;
+            }
             // Get actual value
             if (prim->size <= 8) {
                 void *ptr_h = g2h(prim->addr);
                 memcpy(mod.value, ptr_h, prim->size);
             }
-            /* Stage 7.3 keeps typed pointer variants disabled.  The
-             * accepted model remains available to the later exact-resolver
-             * cutover; this package queues the unchanged generic plan. */
             if (mod.size > 0 && mod.size <= sizeof(mod.value) &&
-                !add_modification_primitive(mod_manager->modifications,
-                                            &mod)) {
+                !add_pointer_typed_candidate(
+                    mod_manager->modifications, &mod, &prim->cell, NULL,
+                    counts_valid, SNAPSHOT_POINTER_FROM_PRIMITIVE)) {
                 log_msg("[analyze] [mutation-error] primitive plan allocation failed\n");
                 exit_with_status(1);
             }
@@ -3088,14 +3218,18 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
                 .expr = ptr->expr,
                 .value = {0}
             };
+            if (binradar_manager_check_addr(mod.addr)) {
+                log_msg("[binradar] [skip-mod] [addr %lx]\n", mod.addr);
+                continue;
+            }
             // Get actual value
             target_ulong actual_value;
             memcpy(&actual_value, g2h(ptr->addr), sizeof(target_ulong));
             memcpy(mod.value, &actual_value, sizeof(target_ulong));
-            /* Stage 7.3 preserves the existing untyped pointer fallback;
-             * exact typed variants are introduced only by Stage 7.4. */
-            if (!add_untyped_pointer_candidate(mod_manager->modifications,
-                                                &mod)) {
+            if (!add_pointer_typed_candidate(
+                    mod_manager->modifications, &mod, &ptr->cell,
+                    &ptr->target_ref, counts_valid,
+                    SNAPSHOT_POINTER_FROM_ACCESS)) {
                 log_msg("[analyze] [mutation-error] pointer plan allocation failed\n");
                 exit_with_status(1);
             }
