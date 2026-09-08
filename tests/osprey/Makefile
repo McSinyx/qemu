@@ -78,7 +78,7 @@ CC        ?= gcc
 CFLAGS    := -O0 -g -fno-pie -no-pie -fno-stack-protector -U_FORTIFY_SOURCE -fno-builtin
 LDFLAGS   := -no-pie
 
-TESTS := osprey_deref t01_regions t01_clone t02_chunk_widths t04_mpx t05_enter_fault t06_control_reject t07_legacy_width_reject t08_bound_reject t09_address_origins t10_value_origins t11_modeled_copies t12_allocator_facts t13_rule_graph t14_typed_mutation
+TESTS := osprey_deref t01_regions t01_clone t02_chunk_widths t04_mpx t05_enter_fault t06_control_reject t07_legacy_width_reject t08_bound_reject t09_address_origins t10_value_origins t11_modeled_copies t12_allocator_facts t13_rule_graph t14_typed_mutation t15_huft_build
 
 GUEST_BINS := $(addprefix $(WORK)/,$(TESTS))
 PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))
@@ -178,6 +178,15 @@ $(WORK)/t13_rule_graph: $(GUESTS)/t13_rule_graph.c | $(WORK)
 $(WORK)/t14_typed_mutation: $(GUESTS)/t14_typed_mutation.c | $(WORK)
 	$(CC) -O0 -g -fPIE -pie -fno-omit-frame-pointer -fno-stack-protector \
 		-U_FORTIFY_SOURCE -fno-builtin -o $@ $<
+
+# t15_huft_build: Stage-9 ranking fixture.  The debug twin and stripped PIE
+# are produced from the same source and compiler flags; the tracer executes
+# the stripped file while evaluation reads DWARF from the twin.
+$(WORK)/t15_huft_build: $(GUESTS)/t15_huft_build.c | $(WORK)
+	$(CC) -O0 -g -fPIE -pie -fomit-frame-pointer -fno-stack-protector \
+		-U_FORTIFY_SOURCE -fno-builtin -o $@.debug $<
+	cp $@.debug $@
+	strip --strip-all $@
 
 $(WORK)/%.plt: $(WORK)/% $(GEN_PLT)
 	python3 $(GEN_PLT) -o $@ $<

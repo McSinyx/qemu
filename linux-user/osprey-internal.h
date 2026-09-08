@@ -1599,6 +1599,9 @@ bool osprey_logaddexp(double left, double right, double *out);
 bool osprey_log_product_add(double left, double right, double *out);
 bool osprey_log_normalize(double *table, size_t count,
                           double *log_norm);
+/* Convert one normalized log pair while preserving finite soft support as an
+ * interior posterior, including at binary64 rounding/underflow boundaries. */
+bool osprey_bp_probability_from_log_pair(const double pair[2], double *out);
 
 /* Stages 4/5 inference (osprey-infer.c): Stage 4 topology followed by the
  * still-untrusted secondary BP path. */

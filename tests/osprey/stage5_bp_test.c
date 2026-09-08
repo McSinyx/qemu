@@ -1803,6 +1803,37 @@ static void dump_fixed_solver_failure(unsigned sample,
     }
 }
 
+static void test_probability_conversion_near_boundary(void)
+{
+    const double finite_tail = -0x1.1f2eda4fbde76p+5;
+    double probability = NAN;
+
+    CHECK(osprey_bp_probability_from_log_pair(
+              (double[2]){ finite_tail, 0.0 }, &probability) &&
+              probability == -expm1(finite_tail) && probability < 1.0,
+          "finite false support keeps the true posterior below one");
+    CHECK(osprey_bp_probability_from_log_pair(
+              (double[2]){ 0.0, finite_tail }, &probability) &&
+              probability == exp(finite_tail) && probability > 0.0,
+          "finite true support keeps the posterior above zero");
+    CHECK(osprey_bp_probability_from_log_pair(
+              (double[2]){ -0x1.2e80f1b2dcfe9p+5, 0.0 }, &probability) &&
+              probability == nextafter(1.0, 0.0),
+          "rounded finite false support projects below one");
+    CHECK(osprey_bp_probability_from_log_pair(
+              (double[2]){ 0.0, -0x1p+10 }, &probability) &&
+              probability == nextafter(0.0, 1.0),
+          "underflowed finite true support projects above zero");
+    CHECK(osprey_bp_probability_from_log_pair(
+              (double[2]){ 0.0, -INFINITY }, &probability) &&
+              probability == 0.0,
+          "hard false support remains exact");
+    CHECK(osprey_bp_probability_from_log_pair(
+              (double[2]){ -INFINITY, 0.0 }, &probability) &&
+              probability == 1.0,
+          "hard true support remains exact");
+}
+
 static void test_fixed_damping(void)
 {
     double current[2];
@@ -7075,6 +7106,7 @@ int main(void)
     RUN(test_workspace_boundaries);
     RUN(test_allocation_failures);
     RUN(test_rebuild_after_failure);
+    RUN(test_probability_conversion_near_boundary);
     RUN(test_fixed_damping);
     RUN(test_fixed_round_damping);
     RUN(test_fixed_graph_solver);

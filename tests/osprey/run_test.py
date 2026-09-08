@@ -936,6 +936,39 @@ TESTS = [
         applied_assert=True,
         timeout=120,
     ),
+    dict(
+        name="t15_huft_build",
+        mode="dump_compare",
+        entrypoint_symbol="huft_build",
+        entrypoint_symbol_binary_suffix=".debug",
+        memcheck=0,
+        dump_stem="t15_dump",
+        expected=None,
+        graph_dump=True,
+        graph_dump_stem="t15_huft_build_graph",
+        model_dump=True,
+        model_dump_stem="t15_huft_build_model",
+        rc=(2,),
+        dump_assert={
+            "access_widths_min": {8: 4, 16: 1},
+            "huft_structural_evidence": True,
+        },
+        model_assert={
+            "struct_fields": [(1, [0, 8], [8, 8])],
+            "pointer_target_kind": 1,
+            "strict_storage_ranking": True,
+            "strict_pointer_ranking": True,
+        },
+        expect_rows=[
+            ("facts", "[access 41] [base 26] [copy 5] [points 4]"),
+            ("graph", "[stage secondary] [vars 90] [factors 223]"),
+            ("infer", "[secondary-fixed] [versions 1] [closure-rounds 0]"),
+            ("decode", "[objects 18] [types 4]"),
+            ("done", "[status 0]"),
+        ],
+        expect_inferred=0,
+        timeout=120,
+    ),
 ]
 
 
@@ -1082,7 +1115,11 @@ def run_binradar(test, guest, qemu, solver_bin, workdir):
     env.update(BASE_ENV)
     env.update(test.get("env", {}))
     env["BINRADAR_FORKSERVER_ENABLE"] = "1"
-    env["BINRADAR_ENTRYPOINT"] = resolve_entrypoint(guest)
+    entrypoint_symbol = test.get("entrypoint_symbol", "main")
+    entrypoint_symbol_binary = guest + test.get(
+        "entrypoint_symbol_binary_suffix", "")
+    env["BINRADAR_ENTRYPOINT"] = hex(resolve_symbol(
+        entrypoint_symbol_binary, entrypoint_symbol))
     for env_name, symbol in test.get("test_symbol_offsets", {}).items():
         env[env_name] = hex(resolve_dump_symbol(guest, symbol)[2])
     env["PLT_INFO_FILE"] = guest + ".plt"
@@ -1241,11 +1278,27 @@ def run_dump_compare(test, workdir, qemu, solver):
                         f"{graph_expected_path}")
         with open(graph_expected_path, "r", errors="replace") as f:
             graph_expected = f.read()
+    graph_dump_requested = graph_expected is not None or test.get("graph_dump")
+    model_expected = None
+    model_expected_name = test.get("model_expected")
+    if model_expected_name is not None:
+        model_expected_path = os.path.join(os.path.dirname(__file__),
+                                           model_expected_name)
+        if not os.path.isfile(model_expected_path):
+            return (None, f"expected model dump missing: "
+                          f"{model_expected_path}")
+        with open(model_expected_path, "r", errors="replace") as f:
+            model_expected = f.read()
+    model_dump_absent = test.get("model_dump_absent", False)
+    model_dump_requested = (model_expected is not None or
+                            test.get("model_dump") or model_dump_absent)
     biases = test.get("biases", [None, "0x4100000000", "0x4200000000"])
     dump_stem = test.get("dump_stem", "t01_dump")
     graph_dump_stem = test.get("graph_dump_stem", "t01_graph_dump")
+    model_dump_stem = test.get("model_dump_stem", "t01_model_dump")
     dumps = []
     graph_dumps = []
+    model_dumps = []
     outs = []
     rcs = []
     observed_biases = []
@@ -1253,7 +1306,9 @@ def run_dump_compare(test, workdir, qemu, solver):
         dump_path = os.path.join(workdir, f"{dump_stem}_{i}.txt")
         graph_dump_path = os.path.join(workdir,
                                        f"{graph_dump_stem}_{i}.txt")
-        for path in (dump_path, graph_dump_path):
+        model_dump_path = os.path.join(workdir,
+                                       f"{model_dump_stem}_{i}.txt")
+        for path in (dump_path, graph_dump_path, model_dump_path):
             try:
                 os.unlink(path)
             except OSError:
@@ -1261,9 +1316,12 @@ def run_dump_compare(test, workdir, qemu, solver):
         spec = dict(test)
         spec["env"] = dict(test.get("env", {}))
         spec["env"]["BINRADAR_OSPREY_DUMP_FILE"] = dump_path
-        if graph_expected is not None:
+        if graph_dump_requested:
             spec["env"]["BINRADAR_OSPREY_GRAPH_DUMP_FILE"] = \
                 graph_dump_path
+        if model_dump_requested:
+            spec["env"]["BINRADAR_OSPREY_MODEL_DUMP_FILE"] = \
+                model_dump_path
         if bias is not None:
             spec["env"]["BINRADAR_MMAP_START"] = bias
         rc, out = run_binradar(spec, guest, qemu, solver, workdir)
@@ -1286,12 +1344,22 @@ def run_dump_compare(test, workdir, qemu, solver):
             return (None, out + f"\nmissing dump file: {dump_path}")
         with open(dump_path, "r", errors="replace") as f:
             dumps.append(f.read())
-        if graph_expected is not None:
+        if graph_dump_requested:
             if not os.path.isfile(graph_dump_path):
                 return (None, out +
                         f"\nmissing graph dump file: {graph_dump_path}")
             with open(graph_dump_path, "r", errors="replace") as f:
                 graph_dumps.append(f.read())
+        if model_dump_absent:
+            if os.path.exists(model_dump_path):
+                return (None, out +
+                        f"\nrejected analysis wrote model: {model_dump_path}")
+        elif model_dump_requested:
+            if not os.path.isfile(model_dump_path):
+                return (None, out +
+                        f"\nmissing model dump file: {model_dump_path}")
+            with open(model_dump_path, "r", errors="replace") as f:
+                model_dumps.append(f.read())
     if test.get("compare_biases", True):
         for i in range(1, len(dumps)):
             if dumps[i] != dumps[0]:
@@ -1302,6 +1370,11 @@ def run_dump_compare(test, workdir, qemu, solver):
                 return (None, outs[0] +
                         f"\nGRAPH DUMP MISMATCH between bias runs "
                         f"{0} and {i}")
+        for i in range(1, len(model_dumps)):
+            if model_dumps[i] != model_dumps[0]:
+                return (None, outs[0] +
+                        f"\nMODEL DUMP MISMATCH between bias runs "
+                        f"{0} and {i}")
         if len(set(observed_biases)) != len(observed_biases):
             return (None, outs[0] +
                     f"\nPIE load biases were not distinct: {observed_biases}")
@@ -1310,13 +1383,20 @@ def run_dump_compare(test, workdir, qemu, solver):
     if graph_expected is not None and graph_dumps[0] != graph_expected:
         return (None, outs[0] +
                 "\nGRAPH DUMP MISMATCH vs checked-in expected")
+    if model_expected is not None and model_dumps[0] != model_expected:
+        return (None, outs[0] +
+                "\nMODEL DUMP MISMATCH vs checked-in expected")
     problems = check_dump(test, dumps[0], guest)
     if problems:
         return (None, outs[0] + "\n" + "\n".join(problems))
-    if graph_expected is not None:
+    if graph_dump_requested:
         graph_problems = check_graph_dump(test, graph_dumps[0])
         if graph_problems:
             return (None, outs[0] + "\n" + "\n".join(graph_problems))
+    if model_expected is not None or test.get("model_dump"):
+        model_problems = check_model_dump(test, model_dumps[0])
+        if model_problems:
+            return (None, outs[0] + "\n" + "\n".join(model_problems))
     if len(set(rcs)) != 1:
         return (rcs[-1], outs[0] +
                 f"\ntracer return codes differ: {rcs}")
@@ -1488,6 +1568,60 @@ def parse_canonical_dump(dump):
     return records, problems
 
 
+def check_huft_structural_evidence(parsed):
+    """Require one exact two-field stack-to-heap layout witness.
+
+    The invariant is address-independent: a unique 16-byte allocation owns
+    offsets 0 and 8; two 8-byte copies map adjacent stack chunks to those
+    fields; both layouts have overlapping 16-byte accesses; and a pointer
+    fact targets the heap base.
+    """
+    problems = []
+    allocations = [row["values"][0] for row in parsed["alloc"]
+                   if row["values"][1] == 16]
+    if len(allocations) != 1:
+        return [f"huft fixture has {len(allocations)} 16-byte allocations"]
+    heap_site = allocations[0]
+    copies = [row["values"] for row in parsed["copy"]]
+    accesses = {(row["values"][2], row["values"][3], row["values"][4],
+                 row["values"][5]) for row in parsed["access"]}
+    points = [row["values"] for row in parsed["points"]]
+    mask = (1 << 64) - 1
+
+    layouts = []
+    for first in copies:
+        if first[0] != 2 or first[3] != 8 or first[4:8] != (
+                1, heap_site, 0, 8):
+            continue
+        for second in copies:
+            if second[0] != 2 or second[1] != first[1] or second[3] != 8:
+                continue
+            if second[2] != (first[2] + 8) & mask:
+                continue
+            if second[4:8] != (1, heap_site, 8, 8):
+                continue
+            layouts.append((first[1], first[2]))
+    if len(layouts) != 1:
+        return [f"huft fixture has {len(layouts)} exact two-field copy layouts"]
+
+    stack_site, stack_offset = layouts[0]
+    required_chunks = {
+        (2, stack_site, stack_offset, 8),
+        (2, stack_site, (stack_offset + 8) & mask, 8),
+        (2, stack_site, stack_offset, 16),
+        (1, heap_site, 0, 8),
+        (1, heap_site, 8, 8),
+        (1, heap_site, 0, 16),
+    }
+    missing = sorted(required_chunks - accesses)
+    if missing:
+        problems.append(f"huft fixture missing structural accesses {missing}")
+    if not any(row[3] == 8 and row[4:7] == (1, heap_site, 0)
+               for row in points):
+        problems.append("huft fixture lacks an 8-byte pointer to the heap base")
+    return problems
+
+
 def check_dump(test, dump, guest):
     """Structural assertions on the canonical dump."""
     _parsed, parse_problems = parse_canonical_dump(dump)
@@ -1495,6 +1629,8 @@ def check_dump(test, dump, guest):
         return parse_problems
     want = test.get("dump_assert", {})
     problems = []
+    if want.get("huft_structural_evidence"):
+        problems.extend(check_huft_structural_evidence(_parsed))
 
     # Stage 2.5 exact allocator assertions.  The canonical parser above
     # already owns schemas, ordering, uniqueness, support bounds, and F06
@@ -1536,6 +1672,8 @@ def check_dump(test, dump, guest):
     heap_rows = [r for r in regions if r[1] == "1"]
     stack_rows = [r for r in regions if r[1] == "2"]
 
+    if "heap_rows_min" in want and len(heap_rows) < want["heap_rows_min"]:
+        problems.append(f"heap rows {len(heap_rows)} < {want['heap_rows_min']}")
     for site, extent in want.get("heap_extents_expected", []):
         if not any(int(row[2], 16) == site and int(row[5], 16) == extent
                    for row in heap_rows):
@@ -1808,6 +1946,10 @@ def check_dump(test, dump, guest):
     # <target-offset-hex> <support> <weak-numeric>`.
     points_rows = [ln.split() for ln in dump.splitlines()
                    if ln.startswith("points ")]
+    if "copy_rows_min" in want and len(copy_rows) < want["copy_rows_min"]:
+        problems.append(f"copy rows {len(copy_rows)} < {want['copy_rows_min']}")
+    if "points_rows_min" in want and len(points_rows) < want["points_rows_min"]:
+        problems.append(f"points rows {len(points_rows)} < {want['points_rows_min']}")
     for row in points_rows:
         if len(row) != 10:
             problems.append(f"malformed points row: {' '.join(row)}")
@@ -1933,6 +2075,199 @@ def check_dump(test, dump, guest):
         if present:
             problems.append(
                 f"points {cell_sym} -> {target_sym} unexpectedly present")
+    return problems
+
+
+def _model_tokens(line):
+    return dict(re.findall(r"\[([^\[\]\s]+) ([^\[\]]*)\]", line))
+
+
+def _model_address(tokens, prefix):
+    return (int(tokens[f"{prefix}-region"]),
+            int(tokens[f"{prefix}-image"], 16),
+            int(tokens[f"{prefix}-site"], 16),
+            int(tokens[f"{prefix}-offset"]))
+
+
+def parse_model_dump(dump):
+    """Parse the validated canonical model serialization independently."""
+    problems = []
+    parsed = {"types": [], "fields": [], "arrays": [], "objects": []}
+    lines = [line for line in dump.splitlines() if line.strip()]
+    if not lines or not lines[0].startswith("[model-version "):
+        return parsed, ["model dump is missing its header"]
+    try:
+        header = _model_tokens(lines[0])
+        if int(header["model-version"]) != 1:
+            problems.append("unsupported model version")
+        expected_counts = {
+            "types": int(header["types"]),
+            "fields": int(header["fields"]),
+            "objects": int(header["objects"]),
+        }
+    except (KeyError, ValueError) as exc:
+        return parsed, [f"malformed model header: {exc}"]
+
+    kind_values = {"primitive": 1, "pointer": 2, "array": 3, "struct": 4}
+    for line_no, line in enumerate(lines[1:], 2):
+        try:
+            tokens = _model_tokens(line)
+            if line.startswith("[type]"):
+                row = {
+                    "id": int(tokens["id"]),
+                    "kind": kind_values.get(tokens["kind"], 0),
+                    "name": tokens["name"],
+                    "size": int(tokens["size"]),
+                    "count": int(tokens["count"]),
+                    "element_size": int(tokens["element-size"]),
+                    "element_type": int(tokens["element-type"]),
+                    "target_void": int(tokens["target-void"]),
+                    "target_type": int(tokens["target-type"]),
+                    "field_begin": int(tokens["field-begin"]),
+                    "field_count": int(tokens["field-count"]),
+                    "evidence": int(tokens["evidence"]),
+                    "posterior_bits": int(tokens["posterior-bits"], 16),
+                    "support": int(tokens["support"]),
+                    "rules": int(tokens["rules"], 16),
+                    "base": _model_address(tokens, "base"),
+                }
+                if row["kind"] == 0:
+                    problems.append(f"line {line_no}: unknown type kind")
+                parsed["types"].append(row)
+            elif line.startswith("[field]"):
+                parsed["fields"].append({
+                    "id": int(tokens["id"]),
+                    "owner": _model_address(tokens, "owner"),
+                    "relative": int(tokens["relative"]),
+                    "value_type": int(tokens["value-type"]),
+                    "posterior_bits": int(tokens["posterior-bits"], 16),
+                    "support": int(tokens["support"]),
+                    "rules": int(tokens["rules"], 16),
+                    "chunk": _model_address(tokens, "chunk"),
+                    "size": int(tokens["size"]),
+                })
+            elif line.startswith("[array]"):
+                parsed["arrays"].append({
+                    "id": int(tokens["id"]),
+                    "lo": int(tokens["lo"]),
+                    "hi": int(tokens["hi"]),
+                    "size": int(tokens["size"]),
+                    "stride": int(tokens["stride"]),
+                    "count": int(tokens["count"]),
+                    "element_type": int(tokens["element-type"]),
+                    "posterior_bits": int(tokens["posterior-bits"], 16),
+                    "support": int(tokens["support"]),
+                    "rules": int(tokens["rules"], 16),
+                    "base": _model_address(tokens, "base"),
+                })
+            elif line.startswith("[object]"):
+                row = {
+                    "id": int(tokens["id"]),
+                    "role": tokens["role"],
+                    "value_type": int(tokens["value-type"]),
+                    "pointer": int(tokens["pointer"]),
+                    "storage_bits": int(tokens["storage-posterior-bits"], 16),
+                    "storage_support": int(tokens["storage-support"]),
+                    "storage_rules": int(tokens["storage-rules"], 16),
+                    "pointer_bits": int(tokens["pointer-posterior-bits"], 16),
+                    "pointer_support": int(tokens["pointer-support"]),
+                    "pointer_rules": int(tokens["pointer-rules"], 16),
+                    "chunk": _model_address(tokens, "chunk"),
+                    "size": int(tokens["size"]),
+                    "owner": _model_address(tokens, "owner"),
+                }
+                if "target-region" in tokens:
+                    row["target"] = _model_address(tokens, "target")
+                parsed["objects"].append(row)
+            else:
+                problems.append(f"line {line_no}: unknown model row")
+        except (KeyError, ValueError) as exc:
+            problems.append(f"line {line_no}: malformed model row: {exc}")
+
+    for key, expected in expected_counts.items():
+        if len(parsed[key]) != expected:
+            problems.append(f"model {key} count {len(parsed[key])} != {expected}")
+    for key in ("types", "fields", "objects"):
+        ids = [row["id"] for row in parsed[key]]
+        if ids != list(range(len(ids))):
+            problems.append(f"model {key} ids are not canonical")
+    return parsed, problems
+
+
+def _model_bits_to_float(bits):
+    return struct.unpack("<d", struct.pack("<Q", bits))[0]
+
+
+def check_model_dump(test, dump):
+    parsed, problems = parse_model_dump(dump)
+    if problems:
+        return problems
+    want = test.get("model_assert", {})
+    types = parsed["types"]
+    fields = parsed["fields"]
+    objects = parsed["objects"]
+    required = want.get("struct_fields", [])
+    for region_kind, offsets, widths in required:
+        found = False
+        for type_row in types:
+            if type_row["kind"] != 4 or type_row["base"][0] != region_kind:
+                continue
+            begin = type_row["field_begin"]
+            end = begin + type_row["field_count"]
+            owned = [row for row in fields if begin <= row["id"] < end]
+            if ([row["relative"] for row in owned] == offsets and
+                    [row["size"] for row in owned] == widths):
+                found = True
+                break
+        if not found:
+            problems.append(
+                f"missing struct region {region_kind} fields "
+                f"offsets={offsets} widths={widths}")
+    if "pointer_target_kind" in want:
+        target_kind = want["pointer_target_kind"]
+        pointer_objects = [row for row in objects
+                           if row["pointer"] and "target" in row]
+        if not any(row["target"][0] == target_kind for row in pointer_objects):
+            problems.append(f"no pointer target in region kind {target_kind}")
+    if want.get("strict_storage_ranking"):
+        ranked_structs = 0
+        for type_row in types:
+            if type_row["kind"] != 4:
+                continue
+            field_objects = [row for row in objects
+                             if row["role"] == "field" and
+                             row["owner"] == type_row["base"]]
+            monolithic = [row for row in objects
+                          if row["role"] in ("primitive", "scalar") and
+                          row["chunk"] == type_row["base"] and
+                          row["size"] == type_row["size"]]
+            if not field_objects or not monolithic:
+                continue
+            ranked_structs += 1
+            monolithic_score = max(
+                _model_bits_to_float(row["storage_bits"]) for row in monolithic)
+            for row in field_objects:
+                score = _model_bits_to_float(row["storage_bits"])
+                if not score > monolithic_score:
+                    problems.append(
+                        f"field object {row['id']} posterior does not strictly "
+                        "beat its directly conflicting monolithic primitive")
+        if ranked_structs == 0:
+            problems.append("no structure with directly competing storage to rank")
+    if want.get("strict_pointer_ranking"):
+        target_kind = want.get("pointer_target_kind")
+        pointer_objects = [row for row in objects
+                           if row["pointer"] and "target" in row and
+                           (target_kind is None or
+                            row["target"][0] == target_kind)]
+        if not pointer_objects:
+            problems.append("no selected pointer objects to rank")
+        for row in pointer_objects:
+            score = _model_bits_to_float(row["pointer_bits"])
+            if not score > 1.0 - score:
+                problems.append(
+                    f"pointer object {row['id']} posterior does not strictly "
+                    "beat its scalar alternative")
     return problems
 
 

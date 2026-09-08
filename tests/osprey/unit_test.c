@@ -1079,6 +1079,92 @@ static void test_stack_frames_and_rsp_origin(void)
     g_free(env);
 }
 
+/* Model output is installed only after validation and transaction commit. */
+static void test_model_dump_output_contract(void)
+{
+    const char *path = "/tmp/osprey_model_dump_test.txt";
+    const char *bad_path = "/proc/self/osprey-model-dump-test.txt";
+    OspreyConfig c = test_config();
+    OspreyContext *ctx;
+    OspreySharedRun *run;
+    OspreySharedRun *bad;
+    gchar *before = NULL;
+    gchar *after = NULL;
+    gsize before_len = 0;
+    gsize after_len = 0;
+
+    reset_log();
+    snprintf(c.model_dump_file, sizeof(c.model_dump_file), "%s", path);
+    unlink(path);
+    FILE *stale = fopen(path, "w");
+    CHECK(stale != NULL, "model dump stale file opens");
+    if (stale != NULL) {
+        fputs("stale\n", stale);
+        fclose(stale);
+    }
+    ctx = osprey_new(&c);
+    run = new_run(&c);
+    fill_two_access_facts(run);
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK,
+          "model dump merge succeeds");
+    CHECK(osprey_analyze(ctx) == OSPREY_OK,
+          "model dump analysis succeeds");
+    CHECK(g_file_get_contents(path, &before, &before_len, NULL),
+          "model dump output exists");
+    CHECK(before != NULL && g_str_has_prefix(before, "[model-version "),
+          "model dump replaced stale content");
+
+    bad = new_run(&c);
+    bad->overflow = 1;
+    CHECK(osprey_parent_merge_sample(ctx, bad) == OSPREY_INCOMPLETE_FACTS,
+          "rejected transaction leaves model dump untouched");
+    CHECK(g_file_get_contents(path, &after, &after_len, NULL) &&
+              before != NULL && after != NULL && before_len == after_len &&
+              memcmp(before, after, before_len) == 0,
+          "rejection preserves prior model dump bytes");
+
+    g_free(after);
+    after = NULL;
+    g_free(before);
+    before = NULL;
+    osprey_free(ctx);
+    g_free(run);
+    g_free(bad);
+    unlink(path);
+
+    reset_log();
+    c = test_config();
+    snprintf(c.model_dump_file, sizeof(c.model_dump_file), "%s", bad_path);
+    ctx = osprey_new(&c);
+    run = new_run(&c);
+    fill_two_access_facts(run);
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK,
+          "model dump write-failure merge succeeds");
+    CHECK(osprey_analyze(ctx) == OSPREY_OK && osprey_model(ctx) != NULL,
+          "model remains installed after dump write failure");
+    CHECK(strstr(g_test_log,
+                 "[osprey] [model-dump] [error]") != NULL,
+          "dump write failure emits stable diagnostic");
+    osprey_free(ctx);
+    g_free(run);
+
+    const char *path_var = "BINRADAR_OSPREY_MODEL_DUMP_FILE";
+    gchar *saved_path = g_strdup(g_getenv(path_var));
+    char too_long[sizeof(c.model_dump_file) + 1];
+    memset(too_long, 'x', sizeof(too_long) - 1);
+    too_long[sizeof(too_long) - 1] = '\0';
+    g_setenv(path_var, too_long, TRUE);
+    OspreyConfig parsed;
+    CHECK(!osprey_config_from_env(&parsed),
+          "model dump path rejects truncation");
+    if (saved_path != NULL) {
+        g_setenv(path_var, saved_path, TRUE);
+    } else {
+        g_unsetenv(path_var);
+    }
+    g_free(saved_path);
+}
+
 /* Canonical dump: written after a successful merge, sorted rows. */
 static void test_canonical_dump(void)
 {
@@ -2661,6 +2747,7 @@ int main(void)
     test_calloc_geometry_f06();
     test_allocator_transport_support_and_limits();
     test_complete_f01_f06_dump_contract();
+    test_model_dump_output_contract();
     test_canonical_dump();
     test_sem_manifest_integrity();
     test_sem_overwrite_fail_closed();
@@ -2679,7 +2766,7 @@ int main(void)
         fprintf(stderr, "%d unit test check(s) FAILED\n", failures);
         return 1;
     }
-    printf("PASS osprey_unit (50/50)\n");
+    printf("PASS osprey_unit (51/51)\n");
     return 0;
 }
 

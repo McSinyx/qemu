@@ -108,6 +108,8 @@ typedef struct OspreyConfig {
                                  * successful merge (empty = off) */
     char graph_dump_file[512];  /* BINRADAR_OSPREY_GRAPH_DUMP_FILE:
                                  * canonical Stage-3 graph dump (empty = off) */
+    char model_dump_file[512];  /* BINRADAR_OSPREY_MODEL_DUMP_FILE:
+                                 * validated canonical model (empty = off) */
 } OspreyConfig;
 
 /* ------------------------------------------------------------------ */

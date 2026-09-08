@@ -82,6 +82,26 @@ static bool osprey_parse_u64(const char *name, uint64_t *out) {
     return true;
 }
 
+static bool osprey_parse_dump_path(const char *name, char *out,
+                                   size_t out_size)
+{
+    const char *value;
+    size_t length;
+
+    if (name == NULL || out == NULL || out_size == 0) return false;
+    value = getenv(name);
+    if (value == NULL || value[0] == '\0') return true;
+    length = strlen(value);
+    if (length >= out_size) {
+        fprintf(stderr,
+                "[osprey] [config] [invalid] [var %s] [reason path-too-long]\n",
+                name);
+        return false;
+    }
+    memcpy(out, value, length + 1);
+    return true;
+}
+
 bool osprey_config_from_env(OspreyConfig *config) {
     if (config == NULL) return false;
     memset(config, 0, sizeof(*config));
@@ -188,13 +208,16 @@ bool osprey_config_from_env(OspreyConfig *config) {
         config->report_threshold = d;
     }
 
-    v = getenv("BINRADAR_OSPREY_DUMP_FILE");
-    if (v != NULL && v[0] != '\0') {
-        snprintf(config->dump_file, sizeof(config->dump_file), "%s", v);
-    }
-    v = getenv("BINRADAR_OSPREY_GRAPH_DUMP_FILE");
-    if (v != NULL && v[0] != '\0') {
-        snprintf(config->graph_dump_file, sizeof(config->graph_dump_file), "%s", v);
+    if (!osprey_parse_dump_path("BINRADAR_OSPREY_DUMP_FILE",
+                                config->dump_file,
+                                sizeof(config->dump_file)) ||
+        !osprey_parse_dump_path("BINRADAR_OSPREY_GRAPH_DUMP_FILE",
+                                config->graph_dump_file,
+                                sizeof(config->graph_dump_file)) ||
+        !osprey_parse_dump_path("BINRADAR_OSPREY_MODEL_DUMP_FILE",
+                                config->model_dump_file,
+                                sizeof(config->model_dump_file))) {
+        return false;
     }
     return true;
 }

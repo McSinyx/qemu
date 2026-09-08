@@ -4187,6 +4187,40 @@ void osprey_dump_canonical(OspreyContext *ctx, const char *path) {
     fclose(f);
 }
 
+/* Write the validated model through a sibling temporary.  The destination
+ * remains unchanged until the complete canonical serialization has been
+ * flushed and closed; a failed write never leaves a partial output. */
+static bool osprey_model_dump_atomic(const OspreyModel *model,
+                                     const char *path)
+{
+    if (model == NULL || path == NULL || path[0] == '\0') return false;
+
+    gchar *tmp = g_strdup_printf("%s.tmp.XXXXXX", path);
+    if (tmp == NULL) return false;
+    int fd = g_mkstemp(tmp);
+    if (fd < 0) {
+        g_free(tmp);
+        return false;
+    }
+    FILE *out = fdopen(fd, "w");
+    if (out == NULL) {
+        close(fd);
+        unlink(tmp);
+        g_free(tmp);
+        return false;
+    }
+    bool ok = osprey_model_dump_file(model, out);
+    if (ok && fflush(out) != 0) ok = false;
+    if (fclose(out) != 0) ok = false;
+    if (ok && rename(tmp, path) == 0) {
+        g_free(tmp);
+        return true;
+    }
+    unlink(tmp);
+    g_free(tmp);
+    return false;
+}
+
 /* Analyze entry: Stage 3 deterministic construction, then (later stages)
  * inference and decoding. */
 OspreyStatus osprey_analyze(OspreyContext *ctx) {
@@ -4264,6 +4298,11 @@ OspreyStatus osprey_analyze(OspreyContext *ctx) {
         goto fail;
     }
     osprey_tx_install(ctx);
+    if (ctx->config.model_dump_file[0] != '\0' &&
+        !osprey_model_dump_atomic(ctx->model, ctx->config.model_dump_file)) {
+        log_msg("[osprey] [model-dump] [error] [path %s]\n",
+                ctx->config.model_dump_file);
+    }
     log_msg("[osprey] [done] [status %d] [stages relations+base+secondary+infer+decode]\n",
             (int)st);
     return st;

@@ -5182,7 +5182,7 @@ OspreyStatus osprey_bp_compute_round_damped(
 /* Stage 5.3: fixed-graph damping, convergence, and publication        */
 /* ------------------------------------------------------------------ */
 
-static bool bp_probability_from_log_pair(const double pair[2], double *out)
+bool osprey_bp_probability_from_log_pair(const double pair[2], double *out)
 {
     double probability;
 
@@ -5197,11 +5197,20 @@ static bool bp_probability_from_log_pair(const double pair[2], double *out)
         *out = 1.0;
         return true;
     }
-    probability = exp(pair[1]);
-    /* A finite log weight must not become an exact support zero or one while
-     * converting the normalized pair to the public binary marginal. */
-    if (!isfinite(probability) || !(probability > 0.0) ||
-        !(probability < 1.0)) return false;
+    /* exp(log P(true)) rounds to 1 once the false state is sufficiently
+     * unlikely, even while both states still have finite support.  Use the
+     * complementary state in that half of the simplex and project a rounded
+     * endpoint to the nearest interior double so soft evidence does not become
+     * hard support through cancellation or underflow. */
+    probability = pair[1] <= pair[0] ? exp(pair[1]) : -expm1(pair[0]);
+    if (!isfinite(probability)) return false;
+    if (probability == 0.0) {
+        probability = nextafter(0.0, 1.0);
+    } else if (probability == 1.0) {
+        probability = nextafter(1.0, 0.0);
+    } else if (!(probability > 0.0) || !(probability < 1.0)) {
+        return false;
+    }
     *out = probability;
     return true;
 }
@@ -5293,7 +5302,7 @@ static OspreyStatus bp_belief_from_buffer(const OspreyBpGraph *graph,
         !isfinite(log_norm)) {
         return OSPREY_INVALID_GRAPH;
     }
-    if (!bp_probability_from_log_pair(pair, out)) {
+    if (!osprey_bp_probability_from_log_pair(pair, out)) {
         return OSPREY_INVALID_GRAPH;
     }
     return OSPREY_OK;
