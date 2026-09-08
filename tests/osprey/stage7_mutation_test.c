@@ -1,7 +1,8 @@
 /*
- * OSPREY Stage 7.1 focused tests: baseline access identity.
+ * OSPREY Stage 7.1 and 7.3 focused tests: baseline access identity and
+ * immutable mutation-plan ownership.
  *
- * Two layers:
+ * Three layers:
  *
  *  - Locator capture matrix (drives the OSPREY runtime catalogs
  *    directly through the public hooks and checks
@@ -26,6 +27,10 @@
  *    replacement with moved-array back-reference repair, exact-at-cap
  *    records and first-over-cap sticky flag handling, and parent
  *    sort/traversal using only the validated count.
+ *
+ *  - Owned-plan groups: exact legacy generic descriptors, untyped-pointer
+ *    fallback, independent fresh payloads, allocation rollback, private
+ *    child application, FIFO transitions, and total manager teardown.
  *
  * Build: see tests/osprey/Makefile (targets unit-stage7-mutation and
  * unit-stage7-mutation-asan).
@@ -602,16 +607,6 @@ static void record_access(CPUArchState *env, uintptr_t addr,
 
 /* Reset the child-side record state (statics of snapshot.c are directly
  * reachable in this translation unit). */
-static void free_modification(gpointer p)
-{
-    Modification *m = p;
-    if (m == NULL) {
-        return;
-    }
-    g_free(m->mods);
-    g_free(m);
-}
-
 static void reset_shared_records(void)
 {
     if (shared_trace_data != NULL) {
@@ -631,25 +626,7 @@ static void reset_shared_records(void)
         g_free(g_read_access_tainted_primitives);
         g_read_access_tainted_primitives = NULL;
     }
-    if (mod_manager != NULL) {
-        g_queue_free_full(mod_manager->modifications, free_modification);
-        /* 'done' holds the Modification structs already consumed by
-         * select_next_modification; 'current' is the popped head. */
-        for (guint i = 0; mod_manager->done != NULL &&
-             i < mod_manager->done->len; i++) {
-            free_modification(g_array_index(mod_manager->done,
-                                            Modification *, i));
-        }
-        if (mod_manager->done != NULL) {
-            g_array_free(mod_manager->done, TRUE);
-        }
-        free_modification(mod_manager->current);
-        if (mod_manager->mod_maps != NULL) {
-            g_hash_table_destroy(mod_manager->mod_maps);
-        }
-        g_free(mod_manager);
-        mod_manager = NULL;
-    }
+    snapshot_modification_manager_reset(false);
 }
 
 /* Group 9: record replacement at one raw cell with a different width.
@@ -913,9 +890,9 @@ static void test_generic_without_locator(void)
     CHECK(mod_manager != NULL && mod_manager->current != NULL,
           "generic-only record selects a candidate");
     if (mod_manager != NULL && mod_manager->current != NULL) {
-        MutationCandidate *candidate = &mod_manager->current->mods[0];
+        SnapshotMutationWrite *candidate = &mod_manager->current->mods[0];
         CHECK(candidate->addr == cell && candidate->size == 8 &&
-              candidate->kind == 0,
+              candidate->kind == SNAPSHOT_MUTATION_BYTES,
               "generic-only descriptor unchanged");
         CHECK(g_queue_get_length(mod_manager->modifications) == 1 &&
               remaining == 2,
@@ -952,18 +929,454 @@ static void test_parent_count_clamp(void)
     ArgumentInfo arg_info[1] = {{0, "rax", 0, NULL}};
     int remaining = analyze_collected_data(arg_info, 0);
 
-    CHECK(mod_manager != NULL, "mod manager initialized");
-    if (mod_manager != NULL) {
-        CHECK(g_queue_is_empty(mod_manager->modifications),
-              "corrupt count produces no generic candidates");
-        CHECK(mod_manager->current == NULL,
-              "corrupt count selects no current candidate");
-        CHECK(remaining == 0, "corrupt count reports no remaining work");
-    }
+    CHECK(mod_manager == NULL && mutation_analysis_started,
+          "empty corrupt input destroys the exhausted manager");
+    CHECK(remaining == 0, "corrupt count reports no remaining work");
     CHECK(g_hash_table_size(g_read_access_tainted_primitives_all) == 0,
           "corrupt count traverses no primitive records");
 
     reset_shared_records();
+    g_free(env);
+}
+
+/* ------------------------------------------------------------------ */
+/* Stage 7.3 owned-plan groups                                         */
+/* ------------------------------------------------------------------ */
+
+static void free_plan_queue(GQueue *queue)
+{
+    if (queue != NULL) {
+        g_queue_free_full(queue, (GDestroyNotify)snapshot_mutation_free);
+    }
+}
+
+static void test_owned_generic_plan_parity(void)
+{
+    static const uint32_t widths[] = {1, 2, 3, 4, 8};
+    for (size_t wi = 0; wi < G_N_ELEMENTS(widths); wi++) {
+        MutationCandidate source;
+        memset(&source, 0x5a, sizeof(source));
+        source.addr = wi == 0 ? 3 : TEST_GUEST_BASE + 0xa800 + wi * 8;
+        source.size = widths[wi];
+        source.kind = 0;
+        source.expr = (Expr *)(uintptr_t)0x1234;
+        MutationCandidate before = source;
+        GQueue *queue = g_queue_new();
+
+        snapshot_mutation_test_set_alloc_fail_after(-1);
+        bool queued = add_modification_primitive(queue, &source);
+        CHECK(queued, "generic plan batch queued");
+        CHECK(memcmp(&source, &before, sizeof(source)) == 0,
+              "generic planning leaves source unchanged");
+        CHECK(g_queue_get_length(queue) == (widths[wi] == 3 ? 1 : 3),
+              "generic plan count matches legacy order");
+
+        uint32_t ordinal = 0;
+        for (GList *node = queue->head; node != NULL; node = node->next) {
+            Modification *modification = node->data;
+            CHECK(modification->num_mods == 1,
+                  "generic queue entries have one owned write");
+            SnapshotMutationWrite *write = &modification->mods[0];
+            CHECK(write->kind == SNAPSHOT_MUTATION_BYTES &&
+                  write->addr == source.addr && write->size == source.size &&
+                  write->expr == source.expr && write->target.bytes == NULL &&
+                  write->target.extent == 0,
+                  "generic plan descriptor is private and inactive-target clean");
+            if (source.size == 3) {
+                uint8_t expected[sizeof(source.value)];
+                memcpy(expected, source.value, sizeof(expected));
+                flip_bits(expected, source.size);
+                CHECK(memcmp(write->value, expected, sizeof(expected)) == 0,
+                      "default-width plan preserves bit-flip bytes");
+            } else if (ordinal == 0) {
+                uint8_t expected[sizeof(source.value)];
+                memcpy(expected, source.value, sizeof(expected));
+                memset(expected, 0, source.size);
+                CHECK(memcmp(write->value, expected, sizeof(expected)) == 0,
+                      "zero plan bytes match source width");
+            } else if (ordinal == 1) {
+                uint8_t expected[sizeof(source.value)];
+                memcpy(expected, source.value, sizeof(expected));
+                memset(expected, 0, source.size);
+                expected[0] = 1;
+                CHECK(memcmp(write->value, expected, sizeof(expected)) == 0,
+                      "one plan bytes match source width");
+            } else {
+                uint8_t expected[sizeof(source.value)];
+                memcpy(expected, source.value, sizeof(expected));
+                /* Preserve the legacy descriptors, not the intended
+                 * algorithm: the old one-byte path flipped a zeroed
+                 * working value, and the old two-byte path flipped the
+                 * value after replacing it with one. */
+                if (source.size == 1) {
+                    expected[0] = 0;
+                } else if (source.size == 2) {
+                    expected[0] = 1;
+                    expected[1] = 0;
+                }
+                flip_bits(expected, source.size);
+                CHECK(memcmp(write->value, expected, sizeof(expected)) == 0,
+                      "bit-flip plan preserves legacy descriptor");
+            }
+            ordinal++;
+        }
+        free_plan_queue(queue);
+    }
+}
+
+static void test_owned_generic_boundary_parity(void)
+{
+    static const struct {
+        uint32_t size;
+        uint64_t original;
+        uint32_t count;
+        uint64_t expected[3];
+    } cases[] = {
+        {1, 0, 2, {1, UINT8_MAX}},
+        {1, 1, 2, {0, UINT8_MAX}},
+        {2, 0, 2, {1, UINT16_MAX - 1}},
+        {2, 1, 2, {0, UINT16_MAX - 1}},
+        {3, 0x030201, 1, {0xfcfdfe}},
+        {4, 0, 2, {1, UINT32_MAX}},
+        {4, 1, 2, {0, UINT32_MAX - 1}},
+        {8, 0, 2, {1, UINT64_MAX}},
+        {8, 1, 2, {0, UINT64_MAX - 1}},
+    };
+
+    for (size_t ci = 0; ci < G_N_ELEMENTS(cases); ci++) {
+        MutationCandidate source = {0};
+        source.addr = TEST_GUEST_BASE + 0xaa00 + ci * 8;
+        source.size = cases[ci].size;
+        source.expr = (Expr *)(uintptr_t)(0x2000 + ci);
+        memcpy(source.value, &cases[ci].original, source.size);
+        MutationCandidate before = source;
+        GQueue *queue = g_queue_new();
+
+        CHECK(add_modification_primitive(queue, &source),
+              "boundary generic batch queued");
+        CHECK(memcmp(&source, &before, sizeof(source)) == 0,
+              "boundary generic source remains immutable");
+        CHECK(g_queue_get_length(queue) == cases[ci].count,
+              "boundary generic plan count matches legacy");
+
+        uint32_t ordinal = 0;
+        for (GList *node = queue->head; node != NULL; node = node->next) {
+            Modification *modification = node->data;
+            uint8_t expected[sizeof(target_ulong)] = {0};
+            memcpy(expected, &cases[ci].expected[ordinal], source.size);
+            CHECK(modification->num_mods == 1 &&
+                  modification->mods[0].kind == SNAPSHOT_MUTATION_BYTES &&
+                  modification->mods[0].size == source.size &&
+                  memcmp(modification->mods[0].value, expected,
+                         source.size) == 0,
+                  "boundary generic descriptor matches legacy oracle");
+            ordinal++;
+        }
+        free_plan_queue(queue);
+    }
+}
+
+static void test_owned_untyped_pointer_parity(void)
+{
+    MutationCandidate source = {0};
+    source.addr = TEST_GUEST_BASE + 0xaac0;
+    source.size = sizeof(target_ulong);
+    source.kind = 1;
+    source.expr = (Expr *)(uintptr_t)0x4567;
+    target_ulong original = TEST_GUEST_BASE + 0x100;
+    memcpy(source.value, &original, sizeof(original));
+    MutationCandidate before = source;
+    GQueue *queue = g_queue_new();
+
+    CHECK(add_untyped_pointer_candidate(queue, &source),
+          "untyped pointer plan queued");
+    CHECK(memcmp(&source, &before, sizeof(source)) == 0,
+          "untyped pointer source remains immutable");
+    CHECK(g_queue_get_length(queue) == 1,
+          "untyped pointer keeps one legacy null plan");
+    if (!g_queue_is_empty(queue)) {
+        Modification *modification = g_queue_peek_head(queue);
+        target_ulong value = UINT64_MAX;
+        memcpy(&value, modification->mods[0].value, sizeof(value));
+        CHECK(modification->num_mods == 1 &&
+              modification->mods[0].kind == SNAPSHOT_MUTATION_POINTER_NULL &&
+              modification->mods[0].addr == source.addr &&
+              modification->mods[0].size == sizeof(target_ulong) &&
+              modification->mods[0].expr == source.expr && value == 0 &&
+              modification->mods[0].target.bytes == NULL &&
+              modification->mods[0].target.extent == 0,
+              "untyped pointer descriptor preserves null fallback");
+    }
+    free_plan_queue(queue);
+
+    queue = g_queue_new();
+    snapshot_mutation_test_set_alloc_fail_after(0);
+    CHECK(!add_untyped_pointer_candidate(queue, &source),
+          "untyped pointer allocation failure is reported");
+    snapshot_mutation_test_set_alloc_fail_after(-1);
+    CHECK(g_queue_is_empty(queue) &&
+          memcmp(&source, &before, sizeof(source)) == 0,
+          "untyped pointer failure leaves queue and source unchanged");
+    free_plan_queue(queue);
+}
+
+static void test_owned_fresh_payloads(void)
+{
+    MutationCandidate source;
+    memset(&source, 0, sizeof(source));
+    source.addr = TEST_GUEST_BASE + 0xab00;
+    source.size = sizeof(target_ulong);
+    source.kind = 1;
+    source.expr = (Expr *)(uintptr_t)0x5678;
+    uint8_t zero[sizeof(target_ulong)] = {0};
+    uint8_t ones[sizeof(target_ulong)];
+    memset(ones, 1, sizeof(ones));
+    Modification *batch[2] = {
+        snapshot_mutation_new(&source, SNAPSHOT_MUTATION_POINTER_FRESH,
+                              zero, source.size, sizeof(zero), zero),
+        snapshot_mutation_new(&source, SNAPSHOT_MUTATION_POINTER_FRESH,
+                              zero, source.size, sizeof(ones), ones),
+    };
+    GQueue *queue = g_queue_new();
+    CHECK(batch[0] != NULL && batch[1] != NULL,
+          "fresh plans allocate independently");
+    CHECK(snapshot_mutation_enqueue_batch(queue, batch, 2),
+          "fresh plan batch enqueues atomically");
+    if (g_queue_get_length(queue) == 2) {
+        Modification *first = g_queue_peek_nth(queue, 0);
+        Modification *second = g_queue_peek_nth(queue, 1);
+        CHECK(first->mods[0].target.bytes != second->mods[0].target.bytes,
+              "fresh target payloads do not alias");
+        CHECK(memcmp(first->mods[0].target.bytes, zero, sizeof(zero)) == 0 &&
+              memcmp(second->mods[0].target.bytes, ones, sizeof(ones)) == 0,
+              "fresh target payloads retain independent fills");
+        CHECK(first->mods[0].value[0] == 0 &&
+              second->mods[0].value[0] == 0,
+              "fresh cell bytes remain immutable placeholders");
+    }
+    free_plan_queue(queue);
+}
+
+static void test_atomic_plan_enqueue_failures(void)
+{
+    bool saw_success = false;
+    MutationCandidate source;
+    memset(&source, 0x5a, sizeof(source));
+    source.addr = TEST_GUEST_BASE + 0xac00;
+    source.size = sizeof(target_ulong);
+    source.expr = (Expr *)(uintptr_t)0x9abc;
+
+    for (int64_t fail_after = 0; fail_after < 64; fail_after++) {
+        GQueue *queue = g_queue_new();
+        snapshot_mutation_test_set_alloc_fail_after(-1);
+        Modification *sentinel = snapshot_mutation_new(
+            &source, SNAPSHOT_MUTATION_BYTES, source.value, source.size,
+            0, NULL);
+        CHECK(sentinel != NULL, "sentinel plan allocates");
+        CHECK(snapshot_mutation_enqueue_one(queue, sentinel),
+              "sentinel plan enqueues");
+        MutationCandidate before = source;
+
+        snapshot_mutation_test_set_alloc_fail_after(fail_after);
+        bool queued = add_modification_primitive(queue, &source);
+        snapshot_mutation_test_set_alloc_fail_after(-1);
+        if (queued) {
+            CHECK(g_queue_get_length(queue) == 4,
+                  "successful batch appends all plans");
+            CHECK(memcmp(&source, &before, sizeof(source)) == 0,
+                  "successful batch leaves source unchanged");
+            saw_success = true;
+            free_plan_queue(queue);
+            break;
+        }
+        CHECK(g_queue_get_length(queue) == 1,
+              "failed batch leaves queue byte-count unchanged");
+        CHECK(memcmp(&source, &before, sizeof(source)) == 0,
+              "failed batch leaves source unchanged");
+        free_plan_queue(queue);
+    }
+    CHECK(saw_success, "allocation-failure sweep reaches queue success");
+}
+
+static void test_nested_payload_failures(void)
+{
+    bool saw_success = false;
+    MutationCandidate source;
+    memset(&source, 0, sizeof(source));
+    source.addr = TEST_GUEST_BASE + 0xac80;
+    source.size = sizeof(target_ulong);
+    uint8_t zero[sizeof(target_ulong)] = {0};
+    uint8_t ones[sizeof(target_ulong)];
+    memset(ones, 1, sizeof(ones));
+
+    for (int64_t fail_after = 0; fail_after < 32; fail_after++) {
+        GQueue *queue = g_queue_new();
+        snapshot_mutation_test_set_alloc_fail_after(-1);
+        Modification *sentinel = snapshot_mutation_new(
+            &source, SNAPSHOT_MUTATION_BYTES, source.value, source.size,
+            0, NULL);
+        CHECK(sentinel != NULL, "nested-failure sentinel allocates");
+        CHECK(snapshot_mutation_enqueue_one(queue, sentinel),
+              "nested-failure sentinel enqueues");
+
+        Modification *batch[2] = {NULL, NULL};
+        snapshot_mutation_test_set_alloc_fail_after(fail_after);
+        batch[0] = snapshot_mutation_new(
+            &source, SNAPSHOT_MUTATION_POINTER_FRESH, zero, source.size,
+            sizeof(zero), zero);
+        batch[1] = snapshot_mutation_new(
+            &source, SNAPSHOT_MUTATION_POINTER_FRESH, zero, source.size,
+            sizeof(ones), ones);
+        bool queued = false;
+        if (batch[0] != NULL && batch[1] != NULL) {
+            queued = snapshot_mutation_enqueue_batch(queue, batch, 2);
+        } else {
+            snapshot_mutation_free_batch(batch, 2);
+        }
+        snapshot_mutation_test_set_alloc_fail_after(-1);
+
+        if (queued) {
+            CHECK(g_queue_get_length(queue) == 3,
+                  "nested-failure success appends both plans");
+            saw_success = true;
+            free_plan_queue(queue);
+            break;
+        }
+        CHECK(g_queue_get_length(queue) == 1,
+              "nested-failure batch leaves queue unchanged");
+        free_plan_queue(queue);
+    }
+    CHECK(saw_success, "nested allocation-failure sweep reaches success");
+}
+
+static void test_owned_plan_validation(void)
+{
+    MutationCandidate source = {0};
+    source.addr = CPU_NB_REGS;
+    source.size = sizeof(target_ulong);
+    CHECK(snapshot_mutation_new(&source, SNAPSHOT_MUTATION_BYTES,
+                                source.value, source.size, 0, NULL) == NULL,
+          "invalid register selector is rejected");
+
+    source.addr = TEST_GUEST_BASE + 0xacc0;
+    CHECK(snapshot_mutation_new(&source, (SnapshotMutationKind)-1,
+                                source.value, source.size, 0, NULL) == NULL,
+          "invalid mutation kind is rejected");
+    CHECK(snapshot_mutation_new(&source, SNAPSHOT_MUTATION_POINTER_NULL,
+                                source.value, 4, 0, NULL) == NULL,
+          "non-native pointer width is rejected");
+}
+
+static void test_manager_fifo_and_cleanup(void)
+{
+    reset_shared_records();
+    SnapshotExitInfo exit_info = {0};
+    mod_manager_init(&exit_info);
+    CHECK(mod_manager != NULL && mutation_analysis_started,
+          "manager initialization owns analysis state");
+
+    MutationCandidate source = {0};
+    source.addr = TEST_GUEST_BASE + 0xace0;
+    source.size = sizeof(target_ulong);
+    Modification *batch[3] = {NULL, NULL, NULL};
+    for (uint32_t i = 0; i < G_N_ELEMENTS(batch); i++) {
+        source.value[0] = (uint8_t)(0x11 * (i + 1));
+        batch[i] = snapshot_mutation_new(
+            &source, SNAPSHOT_MUTATION_BYTES, source.value, source.size,
+            0, NULL);
+    }
+    CHECK(snapshot_mutation_enqueue_batch(mod_manager->modifications,
+                                          batch, G_N_ELEMENTS(batch)),
+          "manager FIFO batch queued");
+
+    for (uint32_t i = 0; i < 3; i++) {
+        int remaining = select_next_modification(&exit_info);
+        CHECK(mod_manager != NULL && mod_manager->current != NULL &&
+              mod_manager->current->mods[0].value[0] ==
+                  (uint8_t)(0x11 * (i + 1)),
+              "manager selects plans in FIFO order");
+        CHECK(remaining == (int)(3 - i),
+              "manager reports current plus queued count");
+    }
+    CHECK(select_next_modification(&exit_info) == 0,
+          "manager reports exhausted queue");
+    CHECK(mod_manager == NULL && mutation_analysis_started,
+          "exhaustion destroys manager without reopening analysis");
+    CHECK(select_next_modification(&exit_info) == 0,
+          "exhausted manager remains terminal");
+    snapshot_modification_manager_reset(false);
+
+    for (uint32_t iteration = 0; iteration < 32; iteration++) {
+        mod_manager_init(&exit_info);
+        source.value[0] = (uint8_t)iteration;
+        mod_manager->current = snapshot_mutation_new(
+            &source, SNAPSHOT_MUTATION_BYTES, source.value, source.size,
+            0, NULL);
+        Modification *queued = snapshot_mutation_new(
+            &source, SNAPSHOT_MUTATION_BYTES, source.value, source.size,
+            0, NULL);
+        CHECK(mod_manager->current != NULL && queued != NULL &&
+              snapshot_mutation_enqueue_one(mod_manager->modifications,
+                                            queued),
+              "manager cleanup cycle owns current and queued plans");
+        snapshot_modification_manager_reset(false);
+        CHECK(mod_manager == NULL && !mutation_analysis_started,
+              "manager cleanup cycle releases all ownership");
+    }
+}
+
+static void test_child_application_does_not_mutate_plan(void)
+{
+    reset_shared_records();
+    CPUArchState *env = g_malloc0(sizeof(CPUArchState));
+    MutationCandidate source;
+    memset(&source, 0, sizeof(source));
+    source.addr = TEST_GUEST_BASE + 0xad00;
+    source.size = sizeof(target_ulong);
+    source.expr = (Expr *)(uintptr_t)0xdef0;
+    target_ulong value = 0x1122334455667788ULL;
+    memcpy(source.value, &value, sizeof(value));
+
+    Modification *plan = snapshot_mutation_new(
+        &source, SNAPSHOT_MUTATION_BYTES, source.value, source.size, 0, NULL);
+    CHECK(plan != NULL, "application plan allocates");
+    if (plan != NULL) {
+        uint8_t before[sizeof(plan->mods[0].value)];
+        memcpy(before, plan->mods[0].value, sizeof(before));
+        mod_manager = g_new0(ModificationManager, 1);
+        mod_manager->modifications = g_queue_new();
+        mod_manager->current = plan;
+        snapshot_modify_memory(env);
+        CHECK(memcmp(plan->mods[0].value, before, sizeof(before)) == 0,
+              "child application preserves queued plan bytes");
+        target_ulong applied = 0;
+        memcpy(&applied, g2h(source.addr), sizeof(applied));
+        CHECK(applied == value, "child application writes private value");
+        snapshot_modification_manager_reset(false);
+    }
+
+    memset(&source, 0, sizeof(source));
+    source.addr = R_EAX;
+    source.size = sizeof(target_ulong);
+    value = 0x8877665544332211ULL;
+    memcpy(source.value, &value, sizeof(value));
+    plan = snapshot_mutation_new(
+        &source, SNAPSHOT_MUTATION_BYTES, source.value, source.size, 0, NULL);
+    CHECK(plan != NULL, "register application plan allocates");
+    if (plan != NULL) {
+        uint8_t before[sizeof(plan->mods[0].value)];
+        memcpy(before, plan->mods[0].value, sizeof(before));
+        mod_manager = g_new0(ModificationManager, 1);
+        mod_manager->modifications = g_queue_new();
+        mod_manager->current = plan;
+        mutation_analysis_started = true;
+        snapshot_modify_memory(env);
+        CHECK(env->regs[R_EAX] == value,
+              "register destination uses the legacy selector contract");
+        CHECK(memcmp(plan->mods[0].value, before, sizeof(before)) == 0,
+              "register application preserves queued plan bytes");
+        snapshot_modification_manager_reset(false);
+    }
     g_free(env);
 }
 
@@ -996,32 +1409,21 @@ int main(void)
     test_at_cap_sticky();
     test_generic_without_locator();
     test_parent_count_clamp();
+    test_owned_generic_plan_parity();
+    test_owned_generic_boundary_parity();
+    test_owned_untyped_pointer_parity();
+    test_owned_fresh_payloads();
+    test_atomic_plan_enqueue_failures();
+    test_nested_payload_failures();
+    test_owned_plan_validation();
+    test_manager_fifo_and_cleanup();
+    test_child_application_does_not_mutate_plan();
 
     osprey_free_runtime_regions();
     teardown_guest_memory();
-    /* Free the analyze-produced modification queue.  Each Modification
-     * and its mods array are g_new'd by the parent; the Modification
-     * structs that moved through select_next_modification live in
-     * manager->done.  snapshot.c has no teardown of its own: in the
-     * real parent this state lives until process exit. */
+    /* Free queued and current plans through the production destructor. */
     if (mod_manager != NULL) {
-        for (GList *node = mod_manager->modifications->head; node != NULL;
-             node = node->next) {
-            Modification *m = node->data;
-            g_free(m->mods);
-            g_free(m);
-        }
-        g_queue_free(mod_manager->modifications);
-        for (guint i = 0; i < mod_manager->done->len; i++) {
-            Modification *m = g_array_index(mod_manager->done,
-                                            Modification *, i);
-            g_free(m->mods);
-            g_free(m);
-        }
-        g_array_free(mod_manager->done, TRUE);
-        g_hash_table_destroy(mod_manager->mod_maps);
-        g_free(mod_manager);
-        mod_manager = NULL;
+        snapshot_modification_manager_reset(false);
     }
     /* The analyze copies (prim_data/ptr_data) live in the original/all
      * hash tables with NULL value destroy.  The 'original' and 'all'
