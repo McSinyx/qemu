@@ -45,6 +45,7 @@
 #include "provenance.h"
 #include "qemu/thread.h"
 #include "tcg/symbolic/symbolic-struct.h"
+#include "stage7_mutation_reference.h"
 
 #include <stdio.h>
 #include <unistd.h>
@@ -1537,6 +1538,138 @@ static void test_typed_pointer_plans_and_fallback(void)
     mutation_typed_fixture_free(&fixture);
 }
 
+static bool reference_variant_matches_write(
+    const Stage7ReferenceVariant *expected,
+    const SnapshotMutationWrite *actual)
+{
+    if (expected == NULL || actual == NULL ||
+        (uint32_t)actual->kind != (uint32_t)expected->kind ||
+        actual->addr != expected->addr || actual->size != expected->size ||
+        (uintptr_t)actual->expr != expected->expr_identity ||
+        memcmp(actual->value, expected->value, sizeof(actual->value)) != 0 ||
+        actual->target.extent != expected->target_extent ||
+        actual->target.resolved_raw != expected->resolved_target_raw ||
+        actual->target.resolved_end != expected->resolved_target_end) {
+        return false;
+    }
+    if (expected->kind == STAGE7_REFERENCE_POINTER_FRESH) {
+        return actual->target.bytes != NULL &&
+               expected->target_bytes != NULL &&
+               memcmp(actual->target.bytes, expected->target_bytes,
+                      (size_t)expected->target_extent) == 0;
+    }
+    return actual->target.bytes == NULL;
+}
+
+static void test_reference_plan_matrix(void)
+{
+    MutationTypedFixture fixture;
+    Stage7ReferenceCandidate reference_candidate;
+    MutationCandidate source;
+    target_ulong concrete;
+
+    mutation_typed_fixture_init(&fixture, 13);
+    memset(&source, 0, sizeof(source));
+    source.addr = fixture.cell.start.raw;
+    source.size = sizeof(target_ulong);
+    source.expr = (Expr *)(uintptr_t)0x7654;
+    memset(&reference_candidate, 0, sizeof(reference_candidate));
+    reference_candidate.addr = source.addr;
+    reference_candidate.size = source.size;
+    reference_candidate.expr_identity = (uintptr_t)source.expr;
+
+#define CHECK_PLAN(_label, _allowed, _source_kind, _target) do {             \
+        Stage7ReferencePlan expected = {0};                                  \
+        GQueue *actual_queue = g_queue_new();                                \
+        reference_candidate.addr = source.addr;                              \
+        reference_candidate.size = source.size;                              \
+        memcpy(reference_candidate.value, source.value,                    \
+               sizeof(reference_candidate.value));                           \
+        bool reference_ok = stage7_reference_plan_build(                     \
+            fixture.ctx, &fixture.model, &reference_candidate,               \
+            &fixture.cell, (_target), (_allowed),                              \
+            (Stage7ReferencePointerSource)(_source_kind),                    \
+            SNAPSHOT_PAGE_SIZE, 0x10, &expected);                              \
+        bool production_ok = add_pointer_typed_candidate(                    \
+            actual_queue, &source, &fixture.cell, (_target), (_allowed),       \
+            (_source_kind));                                                   \
+        CHECK(reference_ok && production_ok, _label " plan builds");          \
+        if (reference_ok && production_ok) {                                   \
+            CHECK(g_queue_get_length(actual_queue) == expected.count,          \
+                  _label " variant count matches reference");                \
+            if (g_queue_get_length(actual_queue) == expected.count) {          \
+                for (uint32_t vi = 0; vi < expected.count; vi++) {             \
+                    Modification *m = g_queue_peek_nth(actual_queue, vi);     \
+                    CHECK(m != NULL && m->num_mods == 1 &&                     \
+                          reference_variant_matches_write(                    \
+                              &expected.variants[vi], &m->mods[0]),            \
+                          _label " variant matches reference");              \
+                }                                                               \
+            }                                                                   \
+        }                                                                       \
+        stage7_reference_plan_clear(&expected);                                \
+        free_plan_queue(actual_queue);                                          \
+    } while (0)
+
+    /* NULL pointer from both record families must produce the same three
+     * independent fresh plans and exact full-target payloads. */
+    memset(source.value, 0, sizeof(source.value));
+    CHECK_PLAN("null primitive", true, SNAPSHOT_POINTER_FROM_PRIMITIVE,
+               NULL);
+    CHECK_PLAN("null pointer-access", true, SNAPSHOT_POINTER_FROM_ACCESS,
+               NULL);
+
+    /* A concrete target must produce NULL then checked OOB in the same
+     * order, with the resolved baseline interval retained for observation. */
+    concrete = fixture.target.raw;
+    memcpy(source.value, &concrete, sizeof(concrete));
+    CHECK_PLAN("non-null pointer-access", true, SNAPSHOT_POINTER_FROM_ACCESS,
+               &fixture.target);
+
+    /* The parent-wide sticky gate and every identity mismatch are per-access
+     * generic fallbacks, never partial typed prefixes. */
+    memset(source.value, 0, sizeof(source.value));
+    CHECK_PLAN("sticky primitive fallback", false,
+               SNAPSHOT_POINTER_FROM_PRIMITIVE, NULL);
+    CHECK_PLAN("sticky pointer fallback", false,
+               SNAPSHOT_POINTER_FROM_ACCESS, NULL);
+    MutationCandidate saved_source = source;
+    source.addr++;
+    CHECK_PLAN("cell-address mismatch fallback", true,
+               SNAPSHOT_POINTER_FROM_ACCESS, NULL);
+    source = saved_source;
+
+    OspreyRuntimeAddressRef stale = fixture.target;
+    stale.prov_generation++;
+    concrete = fixture.target.raw;
+    memcpy(source.value, &concrete, sizeof(concrete));
+    CHECK_PLAN("stale target fallback", true, SNAPSHOT_POINTER_FROM_ACCESS,
+               &stale);
+    OspreyRuntimeAddressRef wrong_region = fixture.target;
+    wrong_region.address.region = fixture.global_region;
+    CHECK_PLAN("canonical target mismatch fallback", true,
+               SNAPSHOT_POINTER_FROM_ACCESS, &wrong_region);
+    CHECK_PLAN("missing target locator fallback", true,
+               SNAPSHOT_POINTER_FROM_ACCESS, NULL);
+
+    /* Fresh-target size boundaries are compared at the exact cap and one
+     * byte above it; changing the model cannot alter the source candidate. */
+    memset(source.value, 0, sizeof(source.value));
+    fixture.types[1].size = SNAPSHOT_PAGE_SIZE;
+    CHECK_PLAN("fresh exact-cap", true, SNAPSHOT_POINTER_FROM_PRIMITIVE,
+               NULL);
+    fixture.types[1].size = SNAPSHOT_PAGE_SIZE + 1;
+    CHECK_PLAN("fresh over-cap fallback", true,
+               SNAPSHOT_POINTER_FROM_PRIMITIVE, NULL);
+    fixture.types[1].size = 0;
+    CHECK_PLAN("fresh zero-size fallback", true,
+               SNAPSHOT_POINTER_FROM_PRIMITIVE, NULL);
+    fixture.types[1].size = 13;
+
+#undef CHECK_PLAN
+    mutation_typed_fixture_free(&fixture);
+}
+
 static void test_fresh_pointer_application(void)
 {
     CPUArchState *env = g_malloc0(sizeof(*env));
@@ -1891,6 +2024,7 @@ int main(void)
     test_owned_untyped_pointer_parity();
     test_owned_fresh_payloads();
     test_typed_pointer_plans_and_fallback();
+    test_reference_plan_matrix();
     test_fresh_pointer_application();
     test_atomic_plan_enqueue_failures();
     test_nested_payload_failures();

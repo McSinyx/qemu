@@ -78,7 +78,7 @@ CC        ?= gcc
 CFLAGS    := -O0 -g -fno-pie -no-pie -fno-stack-protector -U_FORTIFY_SOURCE -fno-builtin
 LDFLAGS   := -no-pie
 
-TESTS := osprey_deref t01_regions t01_clone t02_chunk_widths t04_mpx t05_enter_fault t06_control_reject t07_legacy_width_reject t08_bound_reject t09_address_origins t10_value_origins t11_modeled_copies t12_allocator_facts t13_rule_graph
+TESTS := osprey_deref t01_regions t01_clone t02_chunk_widths t04_mpx t05_enter_fault t06_control_reject t07_legacy_width_reject t08_bound_reject t09_address_origins t10_value_origins t11_modeled_copies t12_allocator_facts t13_rule_graph t14_typed_mutation
 
 GUEST_BINS := $(addprefix $(WORK)/,$(TESTS))
 PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))
@@ -169,6 +169,13 @@ $(WORK)/t12_allocator_facts: $(GUESTS)/t12_allocator_facts.c | $(WORK)
 
 # t13_rule_graph: complete Stage-3 relation/graph integration fixture.
 $(WORK)/t13_rule_graph: $(GUESTS)/t13_rule_graph.c | $(WORK)
+	$(CC) -O0 -g -fPIE -pie -fno-omit-frame-pointer -fno-stack-protector \
+		-U_FORTIFY_SOURCE -fno-builtin -o $@ $<
+
+# t14_typed_mutation: Stage-7.5 applied-state fixture.  Keep the global
+# cells and same-site heap targets in a PIE guest so observations can assert
+# concrete child state without using host addresses as semantic identity.
+$(WORK)/t14_typed_mutation: $(GUESTS)/t14_typed_mutation.c | $(WORK)
 	$(CC) -O0 -g -fPIE -pie -fno-omit-frame-pointer -fno-stack-protector \
 		-U_FORTIFY_SOURCE -fno-builtin -o $@ $<
 
@@ -323,10 +330,12 @@ MUTATION_INCLUDED_SRCS := ../../linux-user/snapshot.c \
 unit-stage7-mutation: $(MUTATION_UNIT_BIN)
 	@$(MUTATION_UNIT_BIN)
 
-$(MUTATION_UNIT_BIN): stage7_mutation_test.c $(MUTATION_INCLUDED_SRCS) \
+$(MUTATION_UNIT_BIN): stage7_mutation_test.c stage7_mutation_reference.c \
+		stage7_mutation_reference.h $(MUTATION_INCLUDED_SRCS) \
 		$(OSPREY_OBJS) $(SBSV_OBJS) $(OSPREY_HEADERS) | $(WORK)
-	$(CC) $(UNIT_CFLAGS) -o $@ stage7_mutation_test.c $(OSPREY_OBJS) \
-		$(SBSV_OBJS) -lglib-2.0 -lpthread -lm
+	$(CC) $(UNIT_CFLAGS) -o $@ stage7_mutation_test.c \
+		stage7_mutation_reference.c $(OSPREY_OBJS) $(SBSV_OBJS) \
+		-lglib-2.0 -lpthread -lm
 
 unit-stage7-mutation-asan: $(MUTATION_ASAN_BIN)
 	@ASAN_OPTIONS=detect_leaks=1 $(MUTATION_ASAN_BIN)
@@ -336,10 +345,12 @@ unit-stage7-mutation-asan: $(MUTATION_ASAN_BIN)
 # ASan-compiled objects.  sbsv needs ASan-compiled copies too.
 SBSV_ASAN_OBJS := $(addprefix $(WORK)/,sbsv.asan.o sbsv_parser.asan.o)
 
-$(MUTATION_ASAN_BIN): stage7_mutation_test.c $(MUTATION_INCLUDED_SRCS) \
+$(MUTATION_ASAN_BIN): stage7_mutation_test.c stage7_mutation_reference.c \
+		stage7_mutation_reference.h $(MUTATION_INCLUDED_SRCS) \
 		$(OSPREY_ASAN_OBJS) $(SBSV_ASAN_OBJS) $(OSPREY_HEADERS) | $(WORK)
 	$(CC) $(ASAN_CFLAGS) -o $@ stage7_mutation_test.c \
-		$(OSPREY_ASAN_OBJS) $(SBSV_ASAN_OBJS) -lglib-2.0 -lpthread -lm
+		stage7_mutation_reference.c $(OSPREY_ASAN_OBJS) \
+		$(SBSV_ASAN_OBJS) -lglib-2.0 -lpthread -lm
 
 $(WORK)/sbsv.asan.o: ../../linux-user/sbsv.c | $(WORK)
 	$(CC) $(ASAN_CFLAGS) -c -o $@ $<

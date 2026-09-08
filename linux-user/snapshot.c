@@ -156,6 +156,11 @@ typedef enum SnapshotMutationKind {
 typedef struct SnapshotMutationTarget {
     uint64_t extent;
     uint8_t *bytes;             /* owned; only valid for FRESH */
+    /* Baseline target interval retained only for Stage 7.5's child
+     * observation.  These are zero for fresh/null writes and are not part of
+     * the solver/shared mutation ABI. */
+    uint64_t resolved_raw;
+    uint64_t resolved_end;
 } SnapshotMutationTarget;
 
 /* Parent-owned immutable mutation write.  expr is a non-owning locator into
@@ -2537,6 +2542,247 @@ static target_ulong snapshot_alloc_pointer_target(CPUArchState *env,
     return target;
 }
 
+static bool snapshot_test_parse_offset(const char *text, uint64_t *out)
+{
+    char *end = NULL;
+    uint64_t value;
+
+    if (text == NULL || text[0] == '\0' || out == NULL) {
+        return false;
+    }
+    errno = 0;
+    value = g_ascii_strtoull(text, &end, 0);
+    if (errno != 0 || end == text || *end != '\0') {
+        return false;
+    }
+    *out = value;
+    return true;
+}
+
+static bool snapshot_test_address_ref_equal(
+    const OspreyRuntimeAddressRef *a, const OspreyRuntimeAddressRef *b)
+{
+    OspreyKey a_key;
+    OspreyKey b_key;
+
+    if (a == NULL || b == NULL) {
+        return false;
+    }
+    a_key = osprey_addr_key(&a->address);
+    b_key = osprey_addr_key(&b->address);
+    return osprey_key_equal(&a_key, &b_key) && a->raw == b->raw &&
+           a->instance_id == b->instance_id &&
+           a->prov_object_id == b->prov_object_id &&
+           a->prov_generation == b->prov_generation &&
+           a->valid == b->valid;
+}
+
+static bool snapshot_test_install_applied_model(void)
+{
+    const char *enabled = getenv("BINRADAR_OSPREY_TEST_APPLIED_STATE");
+    const char *pointer_offset_text =
+        getenv("BINRADAR_OSPREY_TEST_POINTER_GLOBAL_OFFSET");
+    const char *null_offset_text =
+        getenv("BINRADAR_OSPREY_TEST_NULL_GLOBAL_OFFSET");
+    const char *late_offset_text =
+        getenv("BINRADAR_OSPREY_TEST_LATE_POINTER_GLOBAL_OFFSET");
+    const char *generic_offset_text =
+        getenv("BINRADAR_OSPREY_TEST_GENERIC_GLOBAL_OFFSET");
+    PointerAccess *selected = NULL;
+    PointerAccess *selected_late = NULL;
+    PrimitiveAccess *selected_null = NULL;
+    PrimitiveAccess *selected_generic = NULL;
+    OspreyRuntimeAddressRef *target_ref;
+    OspreyRegionInstance *target_instance = NULL;
+    OspreyModel *model;
+    OspreyDecodedObject *objects;
+    OspreyDecodedType *types;
+    OspreyModelIndexEntry *chunk_index;
+    uint64_t pointer_offset = 0;
+    uint64_t null_offset = 0;
+    uint64_t late_offset = 0;
+    uint64_t generic_offset = 0;
+    uint32_t object_count;
+    uint32_t same_site_instances = 0;
+    uint64_t target_extent = 13;
+
+    if (enabled == NULL || enabled[0] == '\0' || atoi(enabled) == 0 ||
+        g_osprey_ctx == NULL || shared_trace_data == NULL) {
+        return false;
+    }
+    if (!snapshot_test_parse_offset(pointer_offset_text, &pointer_offset) ||
+        !snapshot_test_parse_offset(null_offset_text, &null_offset) ||
+        !snapshot_test_parse_offset(late_offset_text, &late_offset) ||
+        !snapshot_test_parse_offset(generic_offset_text, &generic_offset)) {
+        log_msg("[osprey] [test-model] [invalid-symbol-offsets]\n");
+        return false;
+    }
+    for (uint32_t i = 0; i < shared_trace_data->ptr_idx &&
+                           i < MAX_POINTER_ACCESS; i++) {
+        PointerAccess *candidate = &shared_trace_data->pointers[i];
+        uint64_t offset;
+
+        if (candidate->cell.start.valid != 1 ||
+            candidate->target_ref.valid != 1 ||
+            candidate->cell.start.address.region.kind !=
+                OSPREY_REGION_GLOBAL) {
+            continue;
+        }
+        offset = (uint64_t)candidate->cell.start.address.offset;
+        if (offset == pointer_offset) {
+            selected = candidate;
+        } else if (offset == late_offset) {
+            selected_late = candidate;
+        }
+    }
+    if (selected == NULL || selected_late == NULL ||
+        !snapshot_test_address_ref_equal(&selected->target_ref,
+                                         &selected_late->target_ref)) {
+        log_msg("[osprey] [test-model] [missing-pointer-access]\n");
+        return false;
+    }
+    for (uint32_t i = 0; i < shared_trace_data->prim_idx &&
+                           i < MAX_PRIMITIVE_ACCESS; i++) {
+        PrimitiveAccess *candidate = &shared_trace_data->primitives[i];
+        uint64_t offset;
+
+        if (candidate->size != sizeof(target_ulong) ||
+            candidate->cell.start.valid != 1 ||
+            candidate->cell.start.address.region.kind !=
+                OSPREY_REGION_GLOBAL) {
+            continue;
+        }
+        offset = (uint64_t)candidate->cell.start.address.offset;
+        if (offset == null_offset) {
+            selected_null = candidate;
+        } else if (offset == generic_offset) {
+            selected_generic = candidate;
+        }
+    }
+    if (selected_null == NULL || selected_generic == NULL) {
+        log_msg("[osprey] [test-model] [missing-primitive-access]\n");
+        return false;
+    }
+    target_ref = &selected->target_ref;
+    for (guint i = 0; i < g_osprey_ctx->region_instances->len; i++) {
+        OspreyRegionInstance *candidate = &g_array_index(
+            g_osprey_ctx->region_instances, OspreyRegionInstance, i);
+        OspreyKey candidate_region = osprey_region_key(&candidate->region);
+        OspreyKey target_region = osprey_region_key(
+            &target_ref->address.region);
+
+        if (!osprey_key_equal(&candidate_region, &target_region)) {
+            continue;
+        }
+        same_site_instances++;
+        if (candidate->instance_id == target_ref->instance_id &&
+            candidate->raw_base <= target_ref->raw &&
+            target_ref->raw < candidate->raw_max &&
+            candidate->prov_object_id == target_ref->prov_object_id &&
+            candidate->prov_generation == target_ref->prov_generation) {
+            target_instance = candidate;
+        }
+    }
+    if (target_instance == NULL || same_site_instances < 2 ||
+        target_ref->address.region.kind != OSPREY_REGION_HEAP_SITE ||
+        target_ref->raw != target_instance->raw_base ||
+        target_ref->address.offset != 0 ||
+        target_instance->raw_max - target_ref->raw < target_extent) {
+        log_msg("[osprey] [test-model] [missing-target-instance]\n");
+        return false;
+    }
+
+    object_count = 3;
+    model = g_new0(OspreyModel, 1);
+    objects = g_new0(OspreyDecodedObject, object_count);
+    types = g_new0(OspreyDecodedType, 2);
+    chunk_index = g_new0(OspreyModelIndexEntry, object_count);
+    for (uint32_t i = 0; i < object_count; i++) {
+        OspreyDecodedObject *object = &objects[i];
+        const OspreyRuntimeChunkRef *cell = i == 0 ? &selected->cell :
+            (i == 1 ? &selected_late->cell : &selected_null->cell);
+        object->chunk.address = cell->start.address;
+        object->chunk.size = sizeof(target_ulong);
+        object->storage_role = OSPREY_STORAGE_FIELD;
+        object->has_pointer_target = 1;
+        object->value_type_id = 0;
+        object->pointer_target = target_ref->address;
+        object->storage_posterior = 1.0;
+        object->pointer_posterior = 1.0;
+    }
+    for (uint32_t i = 1; i < object_count; i++) {
+        OspreyDecodedObject value = objects[i];
+        uint32_t j = i;
+        while (j > 0 && value.chunk.address.offset <
+                          objects[j - 1].chunk.address.offset) {
+            objects[j] = objects[j - 1];
+            j--;
+        }
+        objects[j] = value;
+    }
+    types[0].id = 0;
+    types[0].kind = OSPREY_TYPE_POINTER;
+    types[0].size = sizeof(target_ulong);
+    types[0].target_type_id = 1;
+    types[0].canonical_base = target_ref->address;
+    types[1].id = 1;
+    types[1].kind = OSPREY_TYPE_STRUCT;
+    types[1].size = target_extent;
+    types[1].canonical_base = target_ref->address;
+    for (uint32_t i = 0; i < object_count; i++) {
+        chunk_index[i].key = osprey_chunk_key(&objects[i].chunk);
+        chunk_index[i].ordinal = i;
+    }
+    model->version = OSPREY_MODEL_VERSION;
+    model->object_count = object_count;
+    model->type_count = 2;
+    model->chunk_index_count = object_count;
+    model->objects = objects;
+    model->types = types;
+    model->chunk_index = chunk_index;
+    model->ledger[OSPREY_MODEL_LEDGER_OBJECTS] = (OspreyModelAllocation){
+        .base = objects, .capacity = object_count, .used = object_count,
+        .bytes = object_count * sizeof(*objects),
+        .element_size = sizeof(*objects),
+        .destructor_kind = OSPREY_MODEL_DESTRUCTOR_FREE,
+    };
+    model->ledger[OSPREY_MODEL_LEDGER_TYPES] = (OspreyModelAllocation){
+        .base = types, .capacity = 2, .used = 2,
+        .bytes = 2 * sizeof(*types), .element_size = sizeof(*types),
+        .destructor_kind = OSPREY_MODEL_DESTRUCTOR_FREE,
+    };
+    model->ledger[OSPREY_MODEL_LEDGER_CHUNK_INDEX] =
+        (OspreyModelAllocation){
+            .base = chunk_index, .capacity = object_count,
+            .used = object_count,
+            .bytes = object_count * sizeof(*chunk_index),
+            .element_size = sizeof(*chunk_index),
+            .destructor_kind = OSPREY_MODEL_DESTRUCTOR_FREE,
+        };
+    if (g_osprey_ctx->model != NULL) {
+        osprey_model_free(g_osprey_ctx->model);
+    }
+    if (g_osprey_ctx->staged_model != NULL) {
+        osprey_model_free(g_osprey_ctx->staged_model);
+        g_osprey_ctx->staged_model = NULL;
+    }
+    g_osprey_ctx->model = model;
+    g_osprey_ctx->tx_status = OSPREY_OK;
+    g_osprey_ctx->tx_stage = NULL;
+    g_osprey_ctx->tx_reason = NULL;
+    g_osprey_ctx->tx_model_ready = true;
+    log_msg("[osprey] [test-model] [cell %lx] [late-cell %lx] "
+            "[null-cell %lx] [generic-cell %lx] [target %lx] "
+            "[extent %llu] [same-site %u]\n",
+            (unsigned long)selected->cell.start.raw,
+            (unsigned long)selected_late->cell.start.raw,
+            (unsigned long)selected_null->cell.start.raw,
+            (unsigned long)selected_generic->cell.start.raw,
+            (unsigned long)target_ref->raw,
+            (unsigned long long)target_extent, same_site_instances);
+    return true;
+}
+
 static bool snapshot_apply_fresh_target(CPUArchState *env,
                                         target_ulong target,
                                         const uint8_t *bytes,
@@ -2554,6 +2800,78 @@ static bool snapshot_apply_fresh_target(CPUArchState *env,
     sem_mem_overwrite(env, target, (target_ulong)extent,
                       SEM_OP_SNAPSHOT);
     return true;
+}
+
+/* Stage 7.5 test-only observation.  The file is opt-in, append-only, and
+ * outside the forkserver protocol; production runs never open it.  Keep the
+ * record fixed-width and address-bearing only for the concrete child state,
+ * never host pointers or model identities. */
+static uint64_t snapshot_test_observation_digest(const uint8_t *bytes,
+                                                 uint64_t size)
+{
+    uint64_t digest = 1469598103934665603ULL;
+    for (uint64_t i = 0; i < size; i++) {
+        digest ^= bytes[i];
+        digest *= 1099511628211ULL;
+    }
+    return digest;
+}
+
+static void snapshot_test_observe_write(const SnapshotMutationWrite *write,
+                                        target_ulong fresh_target,
+                                        target_ulong before_value,
+                                        bool applied)
+{
+    const char *path = getenv("BINRADAR_OSPREY_TEST_OBSERVATION_FILE");
+    const uint8_t *observed_target = NULL;
+    uint8_t cell_bytes[sizeof(target_ulong)] = {0};
+    uint64_t observed_extent = 0;
+    uint64_t digest = 0;
+    target_ulong cell_value = 0;
+    uint8_t first = 0;
+    uint8_t last = 0;
+    int fd;
+
+    if (path == NULL || path[0] == '\0' || write == NULL) return;
+    if (applied && fresh_target != 0 && write->target.extent != 0) {
+        observed_target = g2h(fresh_target);
+        observed_extent = write->target.extent;
+    } else if (applied && write->target.resolved_end >
+                              write->target.resolved_raw) {
+        observed_target = g2h((target_ulong)write->target.resolved_raw);
+        observed_extent = write->target.resolved_end -
+                          write->target.resolved_raw;
+    }
+    if (observed_target != NULL) {
+        digest = snapshot_test_observation_digest(observed_target,
+                                                   observed_extent);
+        first = observed_target[0];
+        last = observed_target[observed_extent - 1];
+    }
+    if (applied) {
+        size_t cell_size = MIN((size_t)write->size, sizeof(cell_bytes));
+        if (write->addr < SNAPSHOT_PAGE_SIZE) {
+            memcpy(cell_bytes, write->value, cell_size);
+        } else {
+            memcpy(cell_bytes, g2h(write->addr), cell_size);
+        }
+        memcpy(&cell_value, cell_bytes, sizeof(cell_value));
+    }
+    fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd < 0) return;
+    dprintf(fd,
+            "[stage7-observation] [status %s] [kind %u] [cell %lx] "
+            "[before %lx] [value %lx] [target %lx] [extent %llu] "
+            "[digest %016llx] [first %02x] [last %02x] "
+            "[resolved_raw %lx] [resolved_end %lx]\n",
+            applied ? "ok" : "apply-failure", (unsigned)write->kind,
+            (unsigned long)write->addr, (unsigned long)before_value,
+            (unsigned long)cell_value, (unsigned long)fresh_target,
+            (unsigned long long)observed_extent,
+            (unsigned long long)digest, first, last,
+            (unsigned long)write->target.resolved_raw,
+            (unsigned long)write->target.resolved_end);
+    close(fd);
 }
 
 static Modification *snapshot_mutation_new(const MutationCandidate *candidate,
@@ -2730,7 +3048,16 @@ static void snapshot_modify_memory(CPUArchState *cpu_env)
     for (uint32_t i = 0; i < mod->num_mods; i++) {
         const SnapshotMutationWrite *write = &mod->mods[i];
         SnapshotMutationWrite local = *write;
+        target_ulong applied_fresh_target = 0;
+        target_ulong before_value = 0;
 
+        if (write->size > 0 && write->size <= sizeof(write->value)) {
+            if (write->addr < CPU_NB_REGS) {
+                before_value = cpu_env->regs[(size_t)write->addr];
+            } else if (write->addr >= SNAPSHOT_PAGE_SIZE) {
+                memcpy(&before_value, g2h(write->addr), write->size);
+            }
+        }
         if (write->kind != SNAPSHOT_MUTATION_BYTES &&
             write->kind != SNAPSHOT_MUTATION_POINTER_NULL &&
             write->kind != SNAPSHOT_MUTATION_POINTER_OOB &&
@@ -2745,11 +3072,13 @@ static void snapshot_modify_memory(CPUArchState *cpu_env)
                 !snapshot_apply_fresh_target(cpu_env, target,
                                              write->target.bytes,
                                              write->target.extent)) {
+                snapshot_test_observe_write(write, 0, before_value, false);
                 log_msg("[mod-pointer] [apply-error] fresh target failed\n");
                 exit_with_status(1);
             }
             /* The target is fully initialized and its metadata is published
              * before the child-local pointer cell is changed. */
+            applied_fresh_target = target;
             memcpy(local.value, &target, sizeof(target));
         }
 
@@ -2771,6 +3100,8 @@ static void snapshot_modify_memory(CPUArchState *cpu_env)
             log_msg("[mod-reg] [register %ld] [size %ld] [total %d]\n",
                     local.addr, local.size,
                     g_queue_get_length(mod_manager->modifications));
+            snapshot_test_observe_write(&local, applied_fresh_target,
+                                        before_value, true);
             continue;
         }
 
@@ -2783,6 +3114,8 @@ static void snapshot_modify_memory(CPUArchState *cpu_env)
         log_msg("[mod] [addr %lx] [size %ld] [total %d]\n",
                 local.addr, local.size,
                 g_queue_get_length(mod_manager->modifications));
+        snapshot_test_observe_write(&local, applied_fresh_target,
+                                        before_value, true);
     }
 }
 
@@ -2971,6 +3304,14 @@ static bool add_pointer_typed_candidate(
     status = osprey_runtime_resolve_pointer(
         g_osprey_ctx, model, cell, concrete_value, target_ref,
         &resolution);
+    if (getenv("BINRADAR_OSPREY_TEST_APPLIED_STATE") != NULL) {
+        log_msg("[osprey] [test-plan] [addr %lx] [value %lx] [status %d] "
+                "[extent %llu] [target-valid %u] [runtime-target %u]\n",
+                (unsigned long)source->addr,
+                (unsigned long)concrete_value, (int)status,
+                (unsigned long long)resolution.target_extent,
+                resolution.target_valid, resolution.has_runtime_target);
+    }
     if (status != OSPREY_RUNTIME_RESOLVED || resolution.target_extent == 0 ||
         resolution.target_extent > SNAPSHOT_PAGE_SIZE) {
         goto generic;
@@ -3029,6 +3370,10 @@ static bool add_pointer_typed_candidate(
             snapshot_mutation_free_batch(batch, count);
             goto generic;
         }
+        batch[0]->mods[0].target.resolved_raw = target_raw;
+        batch[0]->mods[0].target.resolved_end = target_end;
+        batch[1]->mods[0].target.resolved_raw = target_raw;
+        batch[1]->mods[0].target.resolved_end = target_end;
     }
     if (snapshot_mutation_enqueue_batch(modifications, batch, count)) {
         return true;
@@ -3223,8 +3568,11 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
                 continue;
             }
             // Get actual value
-            target_ulong actual_value;
-            memcpy(&actual_value, g2h(ptr->addr), sizeof(target_ulong));
+            /* The parent retains the pre-snapshot memory image.  The
+             * pointer value observed by the baseline child is therefore the
+             * authoritative cell bytes for planning; reading g2h(ptr->addr)
+             * here would turn every child-written pointer into NULL. */
+            target_ulong actual_value = (target_ulong)ptr->target;
             memcpy(mod.value, &actual_value, sizeof(target_ulong));
             if (!add_pointer_typed_candidate(
                     mod_manager->modifications, &mod, &ptr->cell,
@@ -3798,7 +4146,9 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
                 if (g_osprey_ctx != NULL &&
                     g_osprey_ctx->config.enabled &&
                     osprey_tx_ok(g_osprey_ctx)) {
-                    osprey_analyze(g_osprey_ctx);
+                    if (!snapshot_test_install_applied_model()) {
+                        osprey_analyze(g_osprey_ctx);
+                    }
                 }
                 remaining_mods = analyze_collected_data(arg_info, num_arg_regs);
                 binradar_commit(binradar_manager);

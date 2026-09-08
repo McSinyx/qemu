@@ -911,6 +911,28 @@ TESTS = [
         },
         timeout=60,
     ),
+    dict(
+        name="t14_typed_mutation",
+        mode="binradar",
+        memcheck=0,
+        env={"BINRADAR_OSPREY_TEST_APPLIED_STATE": "1"},
+        test_symbol_offsets={
+            "BINRADAR_OSPREY_TEST_POINTER_GLOBAL_OFFSET":
+                "t14_pointer_cell",
+            "BINRADAR_OSPREY_TEST_LATE_POINTER_GLOBAL_OFFSET":
+                "t14_late_pointer_cell",
+            "BINRADAR_OSPREY_TEST_NULL_GLOBAL_OFFSET": "t14_null_cell",
+            "BINRADAR_OSPREY_TEST_GENERIC_GLOBAL_OFFSET":
+                "t14_generic_cell",
+        },
+        observe_applied=True,
+        drain_queue=True,
+        patch_count=0,
+        rc=(2,),
+        expect_rows=[("test-model", "[extent 13]")],
+        applied_assert=True,
+        timeout=120,
+    ),
 ]
 
 
@@ -1058,12 +1080,18 @@ def run_binradar(test, guest, qemu, solver_bin, workdir):
     env.update(test.get("env", {}))
     env["BINRADAR_FORKSERVER_ENABLE"] = "1"
     env["BINRADAR_ENTRYPOINT"] = resolve_entrypoint(guest)
+    for env_name, symbol in test.get("test_symbol_offsets", {}).items():
+        env[env_name] = hex(resolve_dump_symbol(guest, symbol)[2])
     env["PLT_INFO_FILE"] = guest + ".plt"
     env["BINRADAR_FORKSERVER_CHILD_TIMEOUT"] = "4"
     env["BINRADAR_MEMCHECK_ENABLE"] = str(test.get("memcheck", 1))
-    env["BINRADAR_PATCH_CNT"] = "1"
+    env["BINRADAR_PATCH_CNT"] = str(test.get("patch_count", 1))
     env["BINRADAR_PATCH_FILTER_FILE"] = ""
     env["BINRADAR_PATCH_SHM_KEY"] = hex(random.getrandbits(32))
+    observation_path = None
+    if test.get("observe_applied"):
+        observation_path = os.path.join(run_dir, "stage7-observation.ssv")
+        env["BINRADAR_OSPREY_TEST_OBSERVATION_FILE"] = observation_path
     solver = None
     ctrl_r = ctrl_w = stat_r = stat_w = None
     try:
@@ -1112,23 +1140,33 @@ def run_binradar(test, guest, qemu, solver_bin, workdir):
             proc.wait(timeout=10)
             raise RuntimeError("forkserver ack EOF")
 
-        # Baseline iteration.
-        os.write(ctrl_w, struct.pack("<I", 0))  # was_killed
-        status = read_exact(stat_r, 12)
-        if len(status) != 12:
-            raise RuntimeError("baseline status EOF")
-        os.write(ctrl_w, struct.pack("<I", 0))  # analyze_result_len
-        remaining = read_exact(stat_r, 4)
-        if len(remaining) != 4:
-            raise RuntimeError("baseline remaining EOF")
+        def run_one_iteration(label):
+            os.write(ctrl_w, struct.pack("<I", 0))
+            status_bytes = read_exact(stat_r, 12)
+            if len(status_bytes) != 12:
+                raise RuntimeError(f"{label} status EOF")
+            os.write(ctrl_w, struct.pack("<I", 0))
+            remaining_bytes = read_exact(stat_r, 4)
+            if len(remaining_bytes) != 4:
+                raise RuntimeError(f"{label} remaining EOF")
+            return struct.unpack("<I", remaining_bytes)[0]
 
-        # Second iteration (after the iter-1 analyze barrier).
-        os.write(ctrl_w, struct.pack("<I", 0))
-        status2 = read_exact(stat_r, 12)
-        if len(status2) != 12:
-            raise RuntimeError("second status EOF")
-        os.write(ctrl_w, struct.pack("<I", 0))
-        remaining2 = read_exact(stat_r, 4)
+        # Baseline iteration.  Its returned count is the first owned plan
+        # plus the queued tail after analyze_collected_data().
+        remaining_count = run_one_iteration("baseline")
+
+        if test.get("drain_queue"):
+            rounds = 0
+            while remaining_count != 0:
+                rounds += 1
+                if rounds > 4096:
+                    raise RuntimeError("mutation queue did not drain")
+                remaining_count = run_one_iteration(
+                    f"mutation-{rounds}")
+        else:
+            # Existing fixtures intentionally observe only the first child
+            # after the iteration-1 analysis barrier.
+            run_one_iteration("second")
 
         os.close(ctrl_w)
         try:
@@ -1139,6 +1177,9 @@ def run_binradar(test, guest, qemu, solver_bin, workdir):
         stderr_fh.close()
         with open(stderr_path, "r", errors="replace") as f:
             stderr_text = f.read()
+        if observation_path is not None and os.path.exists(observation_path):
+            with open(observation_path, "r", errors="replace") as f:
+                stderr_text += "\n" + f.read()
         return (proc.returncode, stderr_text)
     finally:
         if ctrl_w is not None:
@@ -2067,6 +2108,147 @@ def check_graph_dump(test, dump):
     return problems
 
 
+def parse_stage7_observations(out):
+    observations = []
+    for line in out.splitlines():
+        if not line.startswith("[stage7-observation]"):
+            continue
+        fields = dict(re.findall(r"\[([a-z_]+) ([^]]+)\]", line))
+        required = ("status", "kind", "cell", "before", "value", "target",
+                    "extent", "digest", "first", "last", "resolved_raw",
+                    "resolved_end")
+        if any(name not in fields for name in required):
+            observations.append({"malformed": line})
+            continue
+        try:
+            observations.append({
+                "status": fields["status"],
+                "kind": int(fields["kind"], 0),
+                "cell": int(fields["cell"], 16),
+                "before": int(fields["before"], 16),
+                "value": int(fields["value"], 16),
+                "target": int(fields["target"], 16),
+                "extent": int(fields["extent"], 10),
+                "digest": int(fields["digest"], 16),
+                "first": int(fields["first"], 16),
+                "last": int(fields["last"], 16),
+                "resolved_raw": int(fields["resolved_raw"], 16),
+                "resolved_end": int(fields["resolved_end"], 16),
+            })
+        except ValueError:
+            observations.append({"malformed": line})
+    return observations
+
+
+def stage7_bytes_digest(values):
+    digest = 1469598103934665603
+    for value in values:
+        digest ^= value
+        digest = (digest * 1099511628211) & ((1 << 64) - 1)
+    return digest
+
+
+def stage7_fill_digest(fill, extent):
+    return stage7_bytes_digest(bytes([fill]) * extent)
+
+
+def parse_stage7_test_model(out):
+    rows = []
+    for line in out.splitlines():
+        if "[osprey] [test-model] [cell " not in line:
+            continue
+        fields = dict(re.findall(r"\[([a-z-]+) ([^]]+)\]", line))
+        required = ("cell", "late-cell", "null-cell", "generic-cell",
+                    "target", "extent", "same-site")
+        if any(name not in fields for name in required):
+            rows.append({"malformed": line})
+            continue
+        try:
+            rows.append({
+                "cell": int(fields["cell"], 16),
+                "late_cell": int(fields["late-cell"], 16),
+                "null_cell": int(fields["null-cell"], 16),
+                "generic_cell": int(fields["generic-cell"], 16),
+                "target": int(fields["target"], 16),
+                "extent": int(fields["extent"], 10),
+                "same_site": int(fields["same-site"], 10),
+            })
+        except ValueError:
+            rows.append({"malformed": line})
+    return rows
+
+
+def check_applied_state(test, out):
+    problems = []
+    model_rows = parse_stage7_test_model(out)
+    observations = parse_stage7_observations(out)
+    if len(model_rows) != 1 or "malformed" in model_rows[0]:
+        return ["missing or malformed Stage 7.5 fixture model row"]
+    model = model_rows[0]
+    if model["extent"] != 13 or model["same_site"] < 2:
+        problems.append("fixture did not select the second same-site heap instance")
+    if not observations:
+        return problems + ["missing Stage 7.5 applied-state observations"]
+    if any("malformed" in row for row in observations):
+        problems.append("malformed Stage 7.5 observation row")
+    rows = [row for row in observations if "malformed" not in row]
+    if any(row["status"] != "ok" for row in rows):
+        problems.append("child reported an applied-state failure")
+
+    def rows_for(cell):
+        return [row for row in rows if row["cell"] == cell]
+
+    # The NULL cell must receive exactly the three target-first fills.  Digest
+    # and edge bytes are read from the child mapping after application, not
+    # from the immutable parent plan.
+    fresh = rows_for(model["null_cell"])
+    if [row["kind"] for row in fresh] != [3, 3, 3]:
+        problems.append("NULL cell does not have exactly three fresh variants")
+    else:
+        for row, fill in zip(fresh, (0, 1, 0xff), strict=True):
+            if (row["before"] != 0 or row["extent"] != 13 or
+                    row["first"] != fill or row["last"] != fill or
+                    row["digest"] != stage7_fill_digest(fill, 13) or
+                    row["target"] == 0 or row["value"] != row["target"]):
+                problems.append(f"fresh fill 0x{fill:02x} child state mismatch")
+
+    target_bytes = bytes([0x11]) * 8 + bytes([0x22]) * 5
+    target_digest = stage7_bytes_digest(target_bytes)
+
+    def check_nonnull_cell(cell, before, label):
+        cell_rows = rows_for(cell)
+        if [row["kind"] for row in cell_rows] != [1, 2]:
+            problems.append(f"{label} does not have exact NULL/OOB order")
+            return
+        null_row, oob_row = cell_rows
+        for row in cell_rows:
+            if (row["before"] != before or row["resolved_raw"] !=
+                    model["target"] or row["resolved_end"] !=
+                    model["target"] + 13 or row["extent"] != 13 or
+                    row["digest"] != target_digest or row["first"] != 0x11 or
+                    row["last"] != 0x22):
+                problems.append(f"{label} target interval changed before application")
+        if null_row["value"] != 0:
+            problems.append(f"{label} NULL variant is not exact zero")
+        if (oob_row["value"] != model["target"] + 13 + 0x10 or
+                model["target"] <= oob_row["value"] < model["target"] + 13):
+            problems.append(f"{label} OOB variant is not outside target extent")
+
+    check_nonnull_cell(model["cell"], model["target"], "snapshot pointer")
+    # This cell is NULL in the parent's snapshot and becomes non-NULL only in
+    # the baseline child.  Two typed variants prove planning used ptr->target,
+    # not stale g2h(cell) bytes from the parent.
+    check_nonnull_cell(model["late_cell"], 0, "late-written pointer")
+
+    generic = rows_for(model["generic_cell"])
+    if ([row["kind"] for row in generic] != [0, 0] or
+            [row["value"] for row in generic] != [1, (1 << 64) - 1] or
+            any(row["before"] != 0 or row["extent"] != 0 or
+                row["target"] != 0 for row in generic)):
+        problems.append("generic control descriptors/order changed")
+    return problems
+
+
 def check(test, rc, out):
     problems = []
     if rc != test.get("rc", (0,)) and rc not in (
@@ -2093,6 +2275,8 @@ def check(test, rc, out):
             problems.append(
                 f"mutation queue max {max(lengths) if lengths else 'missing'} "
                 f"< {queue_min}")
+    if test.get("applied_assert"):
+        problems.extend(check_applied_state(test, out))
     return problems
 
 
