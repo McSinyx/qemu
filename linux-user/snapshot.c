@@ -15,6 +15,7 @@
 
 #define SNAPSHOT_EXIT_DESC_LEN 256
 #define SNAPSHOT_BT_DEPTH 64
+#define BINRADAR_FORKSERVER_PROTOCOL_V2 0x41464c01u
 // #define SNAPSHOT_DEBUG
 
 #ifdef SNAPSHOT_DEBUG
@@ -3977,13 +3978,10 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
     bool binradar_mode = (binradar_manager != NULL);
     
     uint32_t   was_killed;
-    uint32_t version = 0x41464c00;
+    uint32_t version = BINRADAR_FORKSERVER_PROTOCOL_V2;
     uint32_t tmp = version ^ 0xffffffff, reply_value;
     uint8_t *msg = (uint8_t *)&version;
     uint8_t *reply = (uint8_t *)&reply_value;
-    uint32_t analyze_result_len = 0;
-    uint32_t analyze_result_len_prev = 0;
-    uint8_t *analyze_result = NULL;
     uint32_t status[3] = {0, 0, 0}; // status[0]: child exit status, status[1]: patch id, status[2]: iter
     uint32_t remaining_mods = 0;
     /* Tell the parent that we're alive. If the parent doesn't want
@@ -4116,27 +4114,6 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
             }
         }
         if (write_exact(binradar_forkserver_stat_w, status, sizeof(status)) < 0) exit_with_status(7);
-
-        // Get type inference result
-        if (read_exact(binradar_forkserver_ctrl_r, &analyze_result_len, 4) < 0) {
-            log_msg("[forkserver] [error] failed to read analyze_result_len from %d\n", binradar_forkserver_ctrl_r);
-            exit_with_status(8);
-        }
-        log_msg("[forkserver] [analyze-result] [len %lu]\n", analyze_result_len);
-
-        if (analyze_result_len > 0) {
-            if (analyze_result_len > analyze_result_len_prev) {
-                g_free(analyze_result);
-                analyze_result = g_malloc(analyze_result_len + 1);
-                analyze_result_len_prev = analyze_result_len;
-            }
-            if (read_exact(binradar_forkserver_ctrl_r, analyze_result, analyze_result_len) < 0) {
-                log_msg("[forkserver] [error] failed to read analyze_result from %d\n", binradar_forkserver_ctrl_r);
-                exit_with_status(9);
-            }
-            analyze_result[analyze_result_len] = '\0';
-            log_msg("[forkserver] [analyze-result] [accept %lu]\n", analyze_result_len);
-        }
 
         if (binradar_mode) {
             if (binradar_iter == 1) {

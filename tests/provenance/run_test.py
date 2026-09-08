@@ -32,6 +32,9 @@ import tempfile
 import time
 from typing import Any
 
+
+HANDSHAKE_EXPECTED = 0x41464C01
+
 # ---------------------------------------------------------------------------
 # Test configuration
 # ---------------------------------------------------------------------------
@@ -633,19 +636,27 @@ def run_forkserver(test, guest, qemu, solver_bin, workdir):
             proc.wait(timeout=10)
             raise RuntimeError(
                 f"forkserver banner EOF (tracer rc={proc.returncode})")
-        os.write(ctrl_w, struct.pack("<I",
-                                     struct.unpack("<I", banner)[0] ^ 0xFFFFFFFF))
+        banner_value = struct.unpack("<I", banner)[0]
+        if banner_value != HANDSHAKE_EXPECTED:
+            raise RuntimeError(f"unexpected forkserver banner: {banner_value:#x}")
+        os.write(ctrl_w, struct.pack("<I", HANDSHAKE_EXPECTED ^ 0xFFFFFFFF))
         ack = read_exact(stat_r, 4)
         if len(ack) != 4:
             proc.wait(timeout=10)
             raise RuntimeError("forkserver ack EOF")
+        ack_value = struct.unpack("<I", ack)[0]
+        if ack_value != HANDSHAKE_EXPECTED:
+            raise RuntimeError(f"unexpected forkserver ack: {ack_value:#x}")
 
         # One iteration.
         os.write(ctrl_w, struct.pack("<I", 0))  # was_killed
         status = read_exact(stat_r, 12)
-        child_status = struct.unpack("<III", status)[0] if len(status) == 12 else -1
-        os.write(ctrl_w, struct.pack("<I", 0))  # analyze_result_len
+        if len(status) != 12:
+            raise RuntimeError("forkserver status EOF")
+        child_status = struct.unpack("<III", status)[0]
         remaining = read_exact(stat_r, 4)
+        if len(remaining) != 4:
+            raise RuntimeError("forkserver remaining EOF")
 
         os.close(ctrl_w)
         try:

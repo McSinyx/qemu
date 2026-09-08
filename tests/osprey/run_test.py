@@ -29,6 +29,9 @@ import sys
 import tempfile
 import time
 
+
+HANDSHAKE_EXPECTED = 0x41464C01
+
 # ---------------------------------------------------------------------------
 # Test configuration
 # ---------------------------------------------------------------------------
@@ -1133,19 +1136,23 @@ def run_binradar(test, guest, qemu, solver_bin, workdir):
             proc.wait(timeout=10)
             raise RuntimeError(
                 f"forkserver banner EOF (tracer rc={proc.returncode})")
-        os.write(ctrl_w, struct.pack("<I",
-                                     struct.unpack("<I", banner)[0] ^ 0xFFFFFFFF))
+        banner_value = struct.unpack("<I", banner)[0]
+        if banner_value != HANDSHAKE_EXPECTED:
+            raise RuntimeError(f"unexpected forkserver banner: {banner_value:#x}")
+        os.write(ctrl_w, struct.pack("<I", HANDSHAKE_EXPECTED ^ 0xFFFFFFFF))
         ack = read_exact(stat_r, 4)
         if len(ack) != 4:
             proc.wait(timeout=10)
             raise RuntimeError("forkserver ack EOF")
+        ack_value = struct.unpack("<I", ack)[0]
+        if ack_value != HANDSHAKE_EXPECTED:
+            raise RuntimeError(f"unexpected forkserver ack: {ack_value:#x}")
 
         def run_one_iteration(label):
             os.write(ctrl_w, struct.pack("<I", 0))
             status_bytes = read_exact(stat_r, 12)
             if len(status_bytes) != 12:
                 raise RuntimeError(f"{label} status EOF")
-            os.write(ctrl_w, struct.pack("<I", 0))
             remaining_bytes = read_exact(stat_r, 4)
             if len(remaining_bytes) != 4:
                 raise RuntimeError(f"{label} remaining EOF")
