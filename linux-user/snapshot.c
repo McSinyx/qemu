@@ -3634,6 +3634,15 @@ static int64_t forkserver_child_timeout_ms(void) {
     return secs * 1000;
 }
 
+/* Abort an always-hanging mutation plan after this many consecutive
+ * child-timeout kills (binradar mode only).  0 disables the abort. */
+#define FORKSERVER_ABORT_DEFAULT 10
+static int forkserver_timeout_abort_count(void) {
+    const char *var = getenv("BINRADAR_FORKSERVER_TIMEOUT_ABORT_COUNT");
+    if (var == NULL) return FORKSERVER_ABORT_DEFAULT;
+    return atoi(var);
+}
+
 /* Parent-side deferred-finding reporter: after the child died (or was
  * killed on timeout), surface any provenance finding the child recorded
  * in shared memory.  Returns true if a finding was reported. */
@@ -3691,12 +3700,17 @@ static bool report_shared_prov_finding(uint32_t *status_out) {
     return true;
 }
 
+/* Wait for the forkserver child, draining patch results while it runs.
+ * Returns 0 when the child exited on its own, 1 when it was SIGKILLed
+ * after BINRADAR_FORKSERVER_CHILD_TIMEOUT (the forkserver loop uses this
+ * to count consecutive timeouts and abort always-hanging plans), and -1
+ * on an internal wait error. */
 static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
         if (binradar_manager == NULL) {
         // Not binradar mode - fallback to original
         int64_t timeout_ms = forkserver_child_timeout_ms();
         if (timeout_ms < 0) {
-            return waitpid(child_pid, (int *)status_out, 0);
+            return waitpid(child_pid, (int *)status_out, 0) >= 0 ? 0 : -1;
         }
         // Bounded wait with deadline
         int status = 0;
@@ -3723,7 +3737,7 @@ static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
                  * provenance finding before looping forever.  Surface it
                  * as a synthetic crash instead of a bare timeout. */
                 report_shared_prov_finding(status_out);
-                return 0;
+                return 1;
             }
             g_usleep(50 * 1000);
         }
@@ -3743,6 +3757,7 @@ static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
 
     int64_t timeout_ms = forkserver_child_timeout_ms();
     int64_t deadline = (timeout_ms >= 0) ? g_get_monotonic_time() + timeout_ms * 1000 : -1; /* us */
+    bool child_timed_out = false;
 
     while (!child_exited) {
         if (deadline >= 0 && g_get_monotonic_time() >= deadline) {
@@ -3751,6 +3766,7 @@ static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
             kill(child_pid, SIGKILL);
             waitpid(child_pid, &status, 0);
             child_exited = true;
+            child_timed_out = true;
             /* Timeout-safe transport: surface a deferred finding as a
              * synthetic crash (see non-binradar path above). */
             report_shared_prov_finding((uint32_t *)&status);
@@ -3792,7 +3808,7 @@ static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
     binradar_manager_drain_patch_fd_once(binradar_manager);
 
     *status_out = (uint32_t)status;
-    return 0;
+    return child_timed_out ? 1 : 0;
 }
 
 
@@ -3827,6 +3843,12 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
     uint8_t *analyze_result = NULL;
     uint32_t status[3] = {0, 0, 0}; // status[0]: child exit status, status[1]: patch id, status[2]: iter
     uint32_t remaining_mods = 0;
+    /* Consecutive child-timeout kills; an always-hanging mutation plan
+     * (deterministic deadlock at one patch id) must abort instead of
+     * burning one child timeout per remaining mod. */
+    int consecutive_child_timeouts = 0;
+    int abort_after_timeouts = forkserver_timeout_abort_count();
+    bool plan_aborted = false;
     /* Tell the parent that we're alive. If the parent doesn't want
        to talk, assume that we're not running in forkserver mode. */
   
@@ -3924,7 +3946,22 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
 
         /* Get and relay exit status to parent. */
 
-        if (wait_child_and_drain_patch(child_pid, status) < 0) exit_with_status(6);
+        int wait_rc = wait_child_and_drain_patch(child_pid, status);
+        if (wait_rc < 0) exit_with_status(6);
+        if (wait_rc > 0) {
+            consecutive_child_timeouts++;
+            log_msg("[forkserver] [child-timeout] [consecutive %d]\n",
+                    consecutive_child_timeouts);
+        } else {
+            consecutive_child_timeouts = 0;
+        }
+        if (binradar_mode && !plan_aborted && abort_after_timeouts > 0 &&
+            consecutive_child_timeouts >= abort_after_timeouts) {
+            log_msg("[forkserver] [abort] [consecutive-timeout %d] [remaining %u]\n",
+                    consecutive_child_timeouts, remaining_mods);
+            plan_aborted = true;
+            remaining_mods = 0;
+        }
 
         // Child process exit
         trace_mem_flush();
@@ -3952,7 +3989,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
             snapshot_load_inferred_types(analyze_result);
         }
 
-        if (binradar_mode) {
+        if (binradar_mode && !plan_aborted) {
             if (binradar_iter == 1) {
                 remaining_mods = analyze_collected_data(arg_info, num_arg_regs);
                 binradar_commit(binradar_manager);
