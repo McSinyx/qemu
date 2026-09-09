@@ -6636,7 +6636,7 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
      * and collapse the forkserver hit count to zero.  Emit the hit counter
      * here for mode-2 TBs; the main pass emits it for mode 0/1 TBs. */
     if (tb_pc == binradar_entrypoint && mode == 2 &&
-        !is_in_exclude_region(tb_pc)) {
+        !is_in_e9_exclude_region(tb_pc)) {
         TCGOp *op;
         QTAILQ_FOREACH(op, &tcg_ctx->ops, link) {
             if (op->opc != INDEX_op_insn_start) {
@@ -6662,7 +6662,7 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
         return 0;
     }
 #endif
-    if (is_in_exclude_region(tb_pc)) {
+    if (is_in_e9_exclude_region(tb_pc)) {
         // log_msg("[instrument] [skip] [patch region] [pc %lx]\n", tb_pc);
         return 0;
     }

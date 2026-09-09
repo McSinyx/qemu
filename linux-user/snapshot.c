@@ -3,6 +3,7 @@
 #include "sem-events.h"
 #include "osprey.h"
 #include "osprey-internal.h"
+#include "e9-ranges.h"
 #include "../tcg/symbolic/symbolic-struct.h"
 #include "sbsv.h"
 #include "qemu/rcu.h"
@@ -59,17 +60,12 @@ static uint8_t  binradar_query_window_dumped    = 0;
 bool forkserver_installed = false;
 unsigned char afl_fork_child;
 unsigned int  afl_forksrv_pid;
-typedef struct exclude_region {
-    uintptr_t start;
-    uintptr_t end;
-} exclude_region;
-
-exclude_region binradar_exclude_regions[4] = {
-    {0, 0}, // PATCH_RESERVE_RANGE
-    {0, 0}, // E9_TRAMPOLINE_RANGE
-    {0, 0}, // E9_LOADER_RANGE
-    {0, 0}
-};
+/* Exact E9 exclusion intervals (loader + RESERVE + TRAMPOLINE maps of the
+ * executing artifact), parsed from E9_EXCLUDE_RANGES.  Missing or empty
+ * means no E9 regions. */
+static e9_exclude_region *binradar_exclude_regions = NULL;
+static size_t binradar_exclude_regions_len = 0;
+static size_t binradar_exclude_regions_cap = 0;
 
 typedef struct e9_relocated_call {
     target_ulong jump_addr;
@@ -327,8 +323,8 @@ typedef struct BinradarManager {
 static SharedTraceData *shared_trace_data = NULL;
 /* OSPREY in-process structural type analysis (Stage 1: shared-run fact
  * transport).  The parent allocates one fixed-layout MAP_SHARED run and
- * resets it before each fork; the child attaches and the parent merges
- * the completed sample after waitpid. */
+ * resets it before each fork; the child attaches and the parent merges the
+ * completed sample after waitpid. */
 static OspreyContext *g_osprey_ctx = NULL;
 static OspreySharedRun *g_osprey_shared_run = NULL;
 static GList *binradar_protected_mappings = NULL;
@@ -361,9 +357,9 @@ static BinradarResult *binradar_manager_alloc_one_iter(BinradarManager *manager)
 
 static void trace_mem_flush(void);
 static void snapshot_modification_manager_reset(bool analysis_started);
+static void exit_with_status(int status);
 static int binradar_manager_cur_patch_id(BinradarManager *manager, int new_patch_id);
 static int binradar_manager_cur_iter(BinradarManager *manager, int new_iter);
-void parse_exclude_region_str(const char *name, uintptr_t load_bias, exclude_region *region);
 bool is_e9_relocated_call(target_ulong pc, target_ulong *call_site,
                           target_ulong *ret_addr);
 
@@ -409,21 +405,31 @@ static int write_exact(int fd, const void *buf, size_t len) {
     return 0;
 }
 
-void parse_exclude_region_str(const char *name, uintptr_t load_bias, exclude_region *region) {
-    if (name == NULL || region == NULL) {
+/* Parse E9_EXCLUDE_RANGES: a canonical comma-separated list of half-open
+ * intervals.  Missing or empty initializes an empty collection.  A
+ * malformed non-empty value is a configuration error: emit one structured
+ * diagnostic and terminate before guest execution rather than continue
+ * with a partial list.  The getenv() storage is never modified. */
+void parse_e9_exclude_ranges(uintptr_t load_bias) {
+    const char *value = getenv("E9_EXCLUDE_RANGES");
+    if (value == NULL || value[0] == '\0') {
         return;
     }
-    // Expected format: "0x20e9e9000-0x20e9ea000"
-    char *region_str = getenv(name);
-    char *dash = strchr(region_str, '-');
-    if (dash == NULL) {
-        log_msg("[snapshot] [parse-exclude-region] [name %s] [invalid-format] %s\n", name, region_str ? region_str : "NULL");
-        return;
+    size_t len = 0;
+    size_t cap = 0;
+    if (e9_parse_exclude_ranges(value, load_bias, &binradar_exclude_regions,
+                                &len, &cap) != 0) {
+        log_msg("[snapshot] [parse-e9-exclude-range] [invalid-format] "
+                "[value %s]\n", value);
+        exit_with_status(1);
     }
-    *dash = '\0';
-    region->start = strtoull(region_str, NULL, 16) + load_bias;
-    region->end = strtoull(dash + 1, NULL, 16) + load_bias;
-    log_msg("[snapshot] [parse-exclude-region] [name %s] [start %lx] [end %lx]\n", name, region->start, region->end);
+    binradar_exclude_regions_len = len;
+    binradar_exclude_regions_cap = cap;
+    for (size_t i = 0; i < len; i++) {
+        log_msg("[snapshot] [parse-e9-exclude-range] [start %lx] [end %lx]\n",
+                (unsigned long)binradar_exclude_regions[i].start,
+                (unsigned long)binradar_exclude_regions[i].end);
+    }
 }
 
 static void check_env_var(const char *name) {
@@ -526,9 +532,7 @@ void check_all_env_var(void) {
     check_env_var("BINRADAR_PATCH_CNT");
     check_env_var("BINRADAR_PATCH_FILTER_FILE");
     // e9tool patch region related
-    check_env_var("PATCH_RESERVE_RANGE");
-    check_env_var("E9_TRAMPOLINE_RANGE");
-    check_env_var("E9_LOADER_RANGE");
+    check_env_var("E9_EXCLUDE_RANGES");
     // E9Patch relocated call jumps (jump-addr:call-site:ret-addr, comma separated)
     check_env_var("E9_RELOCATED_CALL_JUMPS");
     // Shared memory
@@ -539,20 +543,12 @@ void check_all_env_var(void) {
 }
 
 void add_exclude_regions(uintptr_t load_bias) {
-    parse_exclude_region_str("PATCH_RESERVE_RANGE", load_bias, &binradar_exclude_regions[0]);
-    parse_exclude_region_str("E9_TRAMPOLINE_RANGE", load_bias, &binradar_exclude_regions[1]);
-    parse_exclude_region_str("E9_LOADER_RANGE", load_bias, &binradar_exclude_regions[2]);
+    parse_e9_exclude_ranges(load_bias);
 }
 
-bool is_in_exclude_region(target_ulong pc) {
-    // Inserted patch should not exceed 1MB
-    for (int i = 0; i < 3; i++) {
-        exclude_region *region = &binradar_exclude_regions[i];
-        if (pc >= region->start && pc < region->end) {
-            return true;
-        }
-    }
-    return false;
+bool is_in_e9_exclude_region(target_ulong pc) {
+    return e9_is_in_exclude_region(binradar_exclude_regions,
+                                   binradar_exclude_regions_len, pc);
 }
 
 void snapshot_protect_mapping(target_ulong addr, target_ulong len) {
@@ -767,7 +763,6 @@ uint8_t snapshot_on_entrypoint_hit(target_ulong pc) {
     if (binradar_forkserver_target_hit_count == 0) return 0;
     return binradar_entrypoint_hit_count == binradar_forkserver_target_hit_count;
 }
-
 
 static int use_trace = -1;
 static int trace_fd = -1;
@@ -1904,7 +1899,7 @@ static SnapshotMemRegion *mr_manager_global_search(target_ulong addr) {
     while (low <= high) {
         int mid = low + (high - low) / 2;
         SnapshotMemRegion *mr = g_array_index(globals, SnapshotMemRegion *, mid);
-        
+
         int res = check_addr_in_region(mr, addr);
         if (res == 0) {
             found = mr;
@@ -2082,7 +2077,7 @@ static int walk_memory_cb(void *priv, target_ulong start, target_ulong end,
             info->perms = flags;
             info->data = g_malloc(SNAPSHOT_PAGE_SIZE);
             uint64_t key = addr & SNAPSHOT_PAGE_MASK;
-            
+
             void *host_addr = g2h(addr);
             // memcpy(info->data, host_addr, SNAPSHOT_PAGE_SIZE);
 
@@ -2210,12 +2205,12 @@ void snapshot_read_access(CPUArchState *env, SnapshotMemAccess *mem_access) {
 
 //     while (g_hash_table_iter_next(&iter, &key, &value)) {
 //         target_ulong addr = *(target_ulong*)key;
-        
+
 //         SnapshotPageInfo *info = g_hash_table_lookup(g_snapshot.pages, &addr);
 //         if (info) {
 //             // memcpy with original data
 //             void *host_addr = g2h(addr);
-            
+
 //             // mprotect(host_addr, SNAPSHOT_PAGE_SIZE, PROT_READ | PROT_WRITE); 
 //             memcpy(host_addr, info->data, SNAPSHOT_PAGE_SIZE);
 //             trace_mem("[snapshot] [restore] [dirty] [addr %lx]\n", (uintptr_t)addr);
@@ -3271,7 +3266,6 @@ typedef enum SnapshotPointerSource {
     SNAPSHOT_POINTER_FROM_PRIMITIVE = 0,
     SNAPSHOT_POINTER_FROM_ACCESS = 1,
 } SnapshotPointerSource;
-
 /* Resolve one baseline pointer access and enqueue its complete typed batch.
  * typed_allowed is the parent-wide Stage 7.1 record-integrity gate; a sticky
  * overflow or corrupt count disables typed planning for both record families.
@@ -3395,8 +3389,6 @@ static bool binradar_manager_check_addr(target_ulong addr) {
     return false;
 }
 
-
-
 // In parent process, called after child execution
 // Return: remaining modifications
 static int select_next_modification(SnapshotExitInfo *exit_info) {
@@ -3485,7 +3477,7 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
     // First run: collect all data
     if (!mutation_analysis_started) {
         mod_manager_init(exit_info);
-        
+
         memcpy(&original_exit_info, exit_info, sizeof(SnapshotExitInfo));
         g_read_access_tainted_primitives_original = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
         g_read_access_pointers_original = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
@@ -3517,7 +3509,7 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
                 }
             }
         }
-        
+
         // Create modification list
         for (uint32_t i = 0; i < prim_count; i++) {
             PrimitiveAccess *prim = &shared_trace_data->primitives[i];
@@ -3794,6 +3786,15 @@ static int64_t forkserver_child_timeout_ms(void) {
     return secs * 1000;
 }
 
+/* Abort an always-hanging mutation plan after this many consecutive
+ * child-timeout kills (binradar mode only).  0 disables the abort. */
+#define FORKSERVER_ABORT_DEFAULT 10
+static int forkserver_timeout_abort_count(void) {
+    const char *var = getenv("BINRADAR_FORKSERVER_TIMEOUT_ABORT_COUNT");
+    if (var == NULL) return FORKSERVER_ABORT_DEFAULT;
+    return atoi(var);
+}
+
 /* Parent-side deferred-finding reporter: after the child died (or was
  * killed on timeout), surface any provenance finding the child recorded
  * in shared memory.  Returns true if a finding was reported. */
@@ -3851,12 +3852,17 @@ static bool report_shared_prov_finding(uint32_t *status_out) {
     return true;
 }
 
+/* Wait for the forkserver child, draining patch results while it runs.
+ * Returns 0 when the child exited on its own, 1 when it was SIGKILLed
+ * after BINRADAR_FORKSERVER_CHILD_TIMEOUT (the forkserver loop uses this
+ * to count consecutive timeouts and abort always-hanging plans), and -1
+ * on an internal wait error. */
 static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
         if (binradar_manager == NULL) {
         // Not binradar mode - fallback to original
         int64_t timeout_ms = forkserver_child_timeout_ms();
         if (timeout_ms < 0) {
-            return waitpid(child_pid, (int *)status_out, 0);
+            return waitpid(child_pid, (int *)status_out, 0) >= 0 ? 0 : -1;
         }
         // Bounded wait with deadline
         int status = 0;
@@ -3883,7 +3889,7 @@ static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
                  * provenance finding before looping forever.  Surface it
                  * as a synthetic crash instead of a bare timeout. */
                 report_shared_prov_finding(status_out);
-                return 0;
+                return 1;
             }
             g_usleep(50 * 1000);
         }
@@ -3903,6 +3909,7 @@ static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
 
     int64_t timeout_ms = forkserver_child_timeout_ms();
     int64_t deadline = (timeout_ms >= 0) ? g_get_monotonic_time() + timeout_ms * 1000 : -1; /* us */
+    bool child_timed_out = false;
 
     while (!child_exited) {
         if (deadline >= 0 && g_get_monotonic_time() >= deadline) {
@@ -3911,6 +3918,7 @@ static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
             kill(child_pid, SIGKILL);
             waitpid(child_pid, &status, 0);
             child_exited = true;
+            child_timed_out = true;
             /* Timeout-safe transport: surface a deferred finding as a
              * synthetic crash (see non-binradar path above). */
             report_shared_prov_finding((uint32_t *)&status);
@@ -3952,7 +3960,7 @@ static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
     binradar_manager_drain_patch_fd_once(binradar_manager);
 
     *status_out = (uint32_t)status;
-    return 0;
+    return child_timed_out ? 1 : 0;
 }
 
 
@@ -3984,6 +3992,12 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
     uint8_t *reply = (uint8_t *)&reply_value;
     uint32_t status[3] = {0, 0, 0}; // status[0]: child exit status, status[1]: patch id, status[2]: iter
     uint32_t remaining_mods = 0;
+    /* Consecutive child-timeout kills; an always-hanging mutation plan
+     * (deterministic deadlock at one patch id) must abort instead of
+     * burning one child timeout per remaining mod. */
+    int consecutive_child_timeouts = 0;
+    int abort_after_timeouts = forkserver_timeout_abort_count();
+    bool plan_aborted = false;
     /* Tell the parent that we're alive. If the parent doesn't want
        to talk, assume that we're not running in forkserver mode. */
   
@@ -4092,7 +4106,22 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
 
         /* Get and relay exit status to parent. */
 
-        if (wait_child_and_drain_patch(child_pid, status) < 0) exit_with_status(6);
+        int wait_rc = wait_child_and_drain_patch(child_pid, status);
+        if (wait_rc < 0) exit_with_status(6);
+        if (wait_rc > 0) {
+            consecutive_child_timeouts++;
+            log_msg("[forkserver] [child-timeout] [consecutive %d]\n",
+                    consecutive_child_timeouts);
+        } else {
+            consecutive_child_timeouts = 0;
+        }
+        if (binradar_mode && !plan_aborted && abort_after_timeouts > 0 &&
+            consecutive_child_timeouts >= abort_after_timeouts) {
+            log_msg("[forkserver] [abort] [consecutive-timeout %d] [remaining %u]\n",
+                    consecutive_child_timeouts, remaining_mods);
+            plan_aborted = true;
+            remaining_mods = 0;
+        }
 
         // Child process exit
         trace_mem_flush();
@@ -4101,8 +4130,8 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
          * unmodified baseline sample (patch 0, iteration 1) is merged;
          * later mutation runs are never merged.  A failed merge rejects
          * the analysis transaction (Stage 0). */
-        if (g_osprey_ctx != NULL && g_osprey_shared_run != NULL &&
-            g_osprey_ctx->config.enabled &&
+        if (wait_rc == 0 && g_osprey_ctx != NULL &&
+            g_osprey_shared_run != NULL && g_osprey_ctx->config.enabled &&
             binradar_mode && binradar_iter == 1 && binradar_patch_id == 0) {
             OspreyStatus mst = osprey_parent_merge_sample(
                 g_osprey_ctx, g_osprey_shared_run);
@@ -4115,12 +4144,12 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
         }
         if (write_exact(binradar_forkserver_stat_w, status, sizeof(status)) < 0) exit_with_status(7);
 
-        if (binradar_mode) {
+        if (binradar_mode && !plan_aborted) {
             if (binradar_iter == 1) {
                 /* OSPREY: baseline sample is merged; run the in-process
                  * analysis (closure/inference in Stages 2-4) only when
                  * the merge succeeded (fail-closed transaction). */
-                if (g_osprey_ctx != NULL &&
+                if (wait_rc == 0 && g_osprey_ctx != NULL &&
                     g_osprey_ctx->config.enabled &&
                     osprey_tx_ok(g_osprey_ctx)) {
                     if (!snapshot_test_install_applied_model()) {

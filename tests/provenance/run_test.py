@@ -22,6 +22,7 @@ Exit status: 0 if every test passes, 1 otherwise.
 """
 
 import argparse
+import ctypes
 import os
 import random
 import re
@@ -129,6 +130,13 @@ TESTS: list[dict[str, Any]] = [
                       fields={"obj_id": 1, "gen": 1, "size": 8, "offset": 0,
                               "width": 1}),
          note="timeout transport: deferred UAF surfaces as synthetic 139"),
+    dict(name="t79_forkserver_abort", mode="fors", rc=(2,), fs_status=139,
+         verdict="crash", fs_binradar=True, fs_abort_count=3,
+         fs_child_timeout=3, timeout=90,
+         finding=dict(reason="heap-use-after-free", is_uaf=1, count=3,
+                      fields={"obj_id": 1, "gen": 1, "size": 8, "offset": 0,
+                              "width": 1}),
+         note="binradar plan aborts after 3 consecutive child timeouts"),
     # --- UNKNOWN-provenance negative cases (no numeric UAF) --------------
     dict(name="t28_unknown_no_uaf", mode="mem", rc=(0,), verdict="normal",
          finding=None,
@@ -331,14 +339,11 @@ TESTS: list[dict[str, Any]] = [
               "copyout EFAULT returns an error to the guest"),
 ]
 
-# Env vars that must always be set: parse_exclude_region_str strchr()s the
-# getenv result without a NULL check — all three ranges are required.
+# Env vars that must always be set for the tracer runs.
 BASE_ENV = {
     "BINRADAR_TRACE_FILE": "none",
     "BINRADAR_FORKSERVER_ENABLE": "0",
-    "PATCH_RESERVE_RANGE": "0x0-0x0",
-    "E9_TRAMPOLINE_RANGE": "0x0-0x0",
-    "E9_LOADER_RANGE": "0x0-0x0",
+    "E9_EXCLUDE_RANGES": "",
     "BINRADAR_MEMCHECK_ENABLE": "1",
 }
 
@@ -584,22 +589,46 @@ def run_symbolic(test, guest, qemu, solver_bin, workdir):
 
 
 def cleanup_shm(env):
-    for key in ("EXPR_POOL_SHM_KEY", "QUERY_SHM_KEY", "MUTATION_REQ_SHM_KEY"):
+    for key in ("EXPR_POOL_SHM_KEY", "QUERY_SHM_KEY", "MUTATION_REQ_SHM_KEY",
+                "BINRADAR_PATCH_SHM_KEY"):
         k = env.get(key)
         if k:
             subprocess.run(["ipcrm", "-M", k], capture_output=True)
 
 
 def run_forkserver(test, guest, qemu, solver_bin, workdir):
-    """Forkserver driver: handshake, one child iteration, close the parent
-    pipe. Returns (tracer_rc, child_status, stderr_text)."""
+    """Forkserver driver: handshake, iterate children until the plan ends
+    (remaining == 0), close the parent pipe.  With ``fs_binradar`` the
+    driver also sets up the binradar patch shm/fd so the forkserver runs
+    its binradar-mode loop (patch-id iteration, child-timeout abort).
+    Returns (tracer_rc, first_child_status, stderr_text)."""
     run_dir = tempfile.mkdtemp(prefix="prov-fs-")
     env = dict(os.environ)
     env.update(BASE_ENV)
     env["BINRADAR_FORKSERVER_ENABLE"] = "1"
     env["BINRADAR_ENTRYPOINT"] = resolve_entrypoint(guest)
     env["PLT_INFO_FILE"] = guest + ".plt"
-    env["BINRADAR_FORKSERVER_CHILD_TIMEOUT"] = "4"
+    env["BINRADAR_FORKSERVER_CHILD_TIMEOUT"] = str(test.get("fs_child_timeout", 4))
+    fs_binradar = test.get("fs_binradar", False)
+    patch_r = patch_w = None
+    if fs_binradar:
+        env["BINRADAR_FORKSERVER_TIMEOUT_ABORT_COUNT"] = \
+            str(test.get("fs_abort_count", 3))
+        # binradar-mode marker for the tracer: patch shm (cur patch-id/
+        # iter pair) + a patch-results pipe.  PATCH_CNT keeps the plan
+        # alive across several iterations.
+        patch_shm_key = random.getrandbits(30) | (1 << 29)
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        IPC_CREAT = 0o1000
+        shmid = libc.shmget(ctypes.c_int(patch_shm_key), ctypes.c_size_t(8),
+                            ctypes.c_int(0o666 | IPC_CREAT))
+        if shmid == -1:
+            raise RuntimeError(
+                f"shmget failed: {ctypes.geterrno()}")
+        env["BINRADAR_PATCH_SHM_KEY"] = hex(patch_shm_key)
+        env["BINRADAR_PATCH_CNT"] = "2"
+        patch_r, patch_w = os.pipe()
+        env["BINRADAR_PATCH_FD_R"] = str(patch_r)
     solver = None
     ctrl_r = ctrl_w = stat_r = stat_w = None
     try:
@@ -614,12 +643,16 @@ def run_forkserver(test, guest, qemu, solver_bin, workdir):
         stderr_fh = open(stderr_path, "w")
         proc = subprocess.Popen(
             [qemu, "-symbolic", guest],
-            env=env, pass_fds=(ctrl_r, stat_w),
+            env=env,
+            pass_fds=(ctrl_r, stat_w) + ((patch_r,) if patch_r is not None else ()),
             stdout=subprocess.DEVNULL, stderr=stderr_fh,
             start_new_session=True,
         )
         os.close(ctrl_r)
         os.close(stat_w)
+        if patch_r is not None:
+            os.close(patch_r)
+            patch_r = None
 
         def read_exact(fd, n):
             buf = b""
@@ -648,15 +681,23 @@ def run_forkserver(test, guest, qemu, solver_bin, workdir):
         if ack_value != HANDSHAKE_EXPECTED:
             raise RuntimeError(f"unexpected forkserver ack: {ack_value:#x}")
 
-        # One iteration.
-        os.write(ctrl_w, struct.pack("<I", 0))  # was_killed
-        status = read_exact(stat_r, 12)
-        if len(status) != 12:
-            raise RuntimeError("forkserver status EOF")
-        child_status = struct.unpack("<III", status)[0]
-        remaining = read_exact(stat_r, 4)
-        if len(remaining) != 4:
-            raise RuntimeError("forkserver remaining EOF")
+        # Iterate children until the plan reports no remaining mods.
+        # Non-binradar forkserver tests see remaining == 0 after the first
+        # iteration, i.e. exactly one child as before.
+        remaining = 1
+        child_status = -1
+        for _ in range(20):
+            os.write(ctrl_w, struct.pack("<I", 0))  # was_killed
+            status = read_exact(stat_r, 12)
+            if len(status) != 12:
+                break
+            child_status = struct.unpack("<III", status)[0]
+            rem = read_exact(stat_r, 4)
+            if len(rem) != 4:
+                break
+            remaining = struct.unpack("<I", rem)[0]
+            if remaining == 0:
+                break
 
         os.close(ctrl_w)
         try:
@@ -672,6 +713,16 @@ def run_forkserver(test, guest, qemu, solver_bin, workdir):
         if ctrl_w is not None:
             try:
                 os.close(ctrl_w)
+            except OSError:
+                pass
+        if patch_w is not None:
+            try:
+                os.close(patch_w)
+            except OSError:
+                pass
+        if patch_r is not None:
+            try:
+                os.close(patch_r)
             except OSError:
                 pass
         if solver is not None:
@@ -725,6 +776,13 @@ def check(test, rc, fs_status, out):
         want_status = test.get("fs_status")
         if want_status is not None and fs_status != want_status:
             problems.append(f"child status {fs_status} != {want_status}")
+        want_abort = test.get("fs_abort_count")
+        if want_abort is not None:
+            marker = f"[forkserver] [abort] [consecutive-timeout {want_abort}]"
+            if marker not in out:
+                problems.append(f"missing forkserver abort line {marker!r}")
+            if "[forkserver] [child-timeout]" not in out:
+                problems.append("missing forkserver child-timeout line")
 
     verdict, final_query, final_expr = parse_exit_line(out)
     want_verdict = test["verdict"]

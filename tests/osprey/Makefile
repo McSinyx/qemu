@@ -333,6 +333,8 @@ clean:
 MUTATION_UNIT_BIN := $(WORK)/stage7_mutation
 MUTATION_ASAN_BIN := $(WORK)/stage7_mutation_asan
 SBSV_OBJS := $(addprefix $(WORK)/,sbsv.o sbsv_parser.o)
+E9_RANGES_SRC := ../../linux-user/e9-ranges.c
+E9_RANGES_HDR := ../../linux-user/e9-ranges.h
 MUTATION_INCLUDED_SRCS := ../../linux-user/snapshot.c \
                           ../../linux-user/snapshot.h
 
@@ -341,10 +343,11 @@ unit-stage7-mutation: $(MUTATION_UNIT_BIN)
 
 $(MUTATION_UNIT_BIN): stage7_mutation_test.c stage7_mutation_reference.c \
 		stage7_mutation_reference.h $(MUTATION_INCLUDED_SRCS) \
+		$(E9_RANGES_SRC) $(E9_RANGES_HDR) \
 		$(OSPREY_OBJS) $(SBSV_OBJS) $(OSPREY_HEADERS) | $(WORK)
 	$(CC) $(UNIT_CFLAGS) -o $@ stage7_mutation_test.c \
-		stage7_mutation_reference.c $(OSPREY_OBJS) $(SBSV_OBJS) \
-		-lglib-2.0 -lpthread -lm
+		stage7_mutation_reference.c $(E9_RANGES_SRC) \
+		$(OSPREY_OBJS) $(SBSV_OBJS) -lglib-2.0 -lpthread -lm
 
 unit-stage7-mutation-asan: $(MUTATION_ASAN_BIN)
 	@ASAN_OPTIONS=detect_leaks=1 $(MUTATION_ASAN_BIN)
@@ -356,10 +359,11 @@ SBSV_ASAN_OBJS := $(addprefix $(WORK)/,sbsv.asan.o sbsv_parser.asan.o)
 
 $(MUTATION_ASAN_BIN): stage7_mutation_test.c stage7_mutation_reference.c \
 		stage7_mutation_reference.h $(MUTATION_INCLUDED_SRCS) \
+		$(E9_RANGES_SRC) $(E9_RANGES_HDR) \
 		$(OSPREY_ASAN_OBJS) $(SBSV_ASAN_OBJS) $(OSPREY_HEADERS) | $(WORK)
 	$(CC) $(ASAN_CFLAGS) -o $@ stage7_mutation_test.c \
-		stage7_mutation_reference.c $(OSPREY_ASAN_OBJS) \
-		$(SBSV_ASAN_OBJS) -lglib-2.0 -lpthread -lm
+		stage7_mutation_reference.c $(E9_RANGES_SRC) \
+		$(OSPREY_ASAN_OBJS) $(SBSV_ASAN_OBJS) -lglib-2.0 -lpthread -lm
 
 $(WORK)/sbsv.asan.o: ../../linux-user/sbsv.c | $(WORK)
 	$(CC) $(ASAN_CFLAGS) -c -o $@ $<
