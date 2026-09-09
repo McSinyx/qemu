@@ -12,7 +12,6 @@
 #   make clean      # remove build products
 
 QEMU      := ../../build/x86_64-linux-user/qemu-x86_64
-SOLVER    := ../../../solver/build/solver-smt
 RUNNER    := $(CURDIR)/run_test.py
 INVENTORY := $(CURDIR)/check_semantic_inventory.py
 GEN_PLT   := $(CURDIR)/../provenance/gen_plt.py
@@ -108,7 +107,7 @@ unit-stage7-mutation-asan unit-stage7-runtime unit-stage7-runtime-asan: inventor
 inventory:
 	@python3 $(INVENTORY)
 run: guests plts
-	@$(RUNNER) $(GUESTS) $(WORK) $(QEMU) $(SOLVER) --quiet
+	@$(RUNNER) $(GUESTS) $(WORK) $(QEMU) --quiet
 unit: $(UNIT_BIN)
 	@$(UNIT_BIN)
 unit-asan: $(UNIT_ASAN_BIN)

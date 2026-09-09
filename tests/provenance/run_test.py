@@ -8,15 +8,16 @@ Modes
 -----
 memcheck   : plain tracer (-d page), BINRADAR_MEMCHECK_ENABLE=1, no solver.
              Covers allocation-lifecycle / tag-transfer / region tests.
-symbolic   : -symbolic + live solver (SHM pools). Required for libc models
-             (memcpy/memset/memchr) and for the deferred-continuation and
-             crash-precedence tests.
-forkserver : -symbolic + solver + forkserver pipes. The driver performs the
-             handshake and runs one child iteration, then closes the ctrl
-             pipe (tracer exits 2 on EOF).
+symbolic   : -symbolic + NO_EXTERNAL_SOLVER=1. The tracer keeps the
+             expression/query data structures but backs them with process-local
+             memory, so libc models (memcpy/memset/memchr) and deferred
+             continuation tests need no solver process.
+forkserver : -symbolic + NO_EXTERNAL_SOLVER=1 + forkserver pipes. The driver
+             performs the handshake and runs one child iteration, then closes
+             the ctrl pipe (tracer exits 2 on EOF).
 
 Invocation (see Makefile):
-    run_test.py GUESTS WORK QEMU SOLVER [--quiet]
+    run_test.py GUESTS WORK QEMU [--quiet]
 
 Exit status: 0 if every test passes, 1 otherwise.
 """
@@ -539,53 +540,27 @@ def run_memcheck(test, guest, qemu, workdir):
     return run_tracer(cmd, env, test.get("timeout", 30))
 
 
-def run_solver(solver_bin, env, run_dir, timeout):
-    """Start the solver with the shared env; returns the Popen handle."""
-    for key in ("EXPR_POOL_SHM_KEY", "QUERY_SHM_KEY", "MUTATION_REQ_SHM_KEY"):
-        env[key] = hex(random.getrandbits(32))
-    env["SOLVER_TIMEOUT"] = str(int(timeout) + 10)
+def prepare_symbolic_env(env, run_dir):
+    """Configure symbolic input while leaving the solver transport local."""
+    env["NO_EXTERNAL_SOLVER"] = "1"
+    for key in ("EXPR_POOL_SHM_KEY", "QUERY_SHM_KEY", "BITMAP_SHM_KEY",
+                "MUTATION_REQ_SHM_KEY"):
+        env.pop(key, None)
     env["SYMBOLIC_INJECT_INPUT_MODE"] = "FROM_FILE"
     env["SYMBOLIC_TESTCASE_NAME"] = os.path.join(run_dir, "input")
     with open(env["SYMBOLIC_TESTCASE_NAME"], "w") as f:
         f.write("A")
-    os.makedirs(os.path.join(run_dir, "out"), exist_ok=True)
-    for b in ("global-bitmap", "context-bitmap", "memory-bitmap"):
-        open(os.path.join(run_dir, b), "w").close()
-    solver = subprocess.Popen(
-        ["stdbuf", "-o0", solver_bin,
-         "-i", env["SYMBOLIC_TESTCASE_NAME"],
-         "-o", os.path.join(run_dir, "out"),
-         "-b", os.path.join(run_dir, "global-bitmap"),
-         "-c", os.path.join(run_dir, "context-bitmap"),
-         "-m", os.path.join(run_dir, "memory-bitmap")],
-        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    # The tracer polls shmget for the pools; give the solver time to create
-    # them before the tracer starts.
-    time.sleep(1.2)
-    return solver
 
 
-def run_symbolic(test, guest, qemu, solver_bin, workdir):
+def run_symbolic(test, guest, qemu, workdir):
     run_dir = tempfile.mkdtemp(prefix="prov-test-")
     env = dict(os.environ)
     env.update(BASE_ENV)
     env["BINRADAR_ENTRYPOINT"] = resolve_entrypoint(guest)
     env["PLT_INFO_FILE"] = guest + ".plt"
-    solver = None
-    try:
-        solver = run_solver(solver_bin, env, run_dir, test.get("timeout", 30))
-        cmd = [qemu, "-symbolic", guest]
-        return run_tracer(cmd, env, test.get("timeout", 30))
-    finally:
-        if solver is not None:
-            try:
-                solver.terminate()
-                solver.wait(timeout=5)
-            except (subprocess.TimeoutExpired, ProcessLookupError):
-                solver.kill()
-        cleanup_shm(env)
+    prepare_symbolic_env(env, run_dir)
+    cmd = [qemu, "-symbolic", guest]
+    return run_tracer(cmd, env, test.get("timeout", 30))
 
 
 def cleanup_shm(env):
@@ -596,7 +571,7 @@ def cleanup_shm(env):
             subprocess.run(["ipcrm", "-M", k], capture_output=True)
 
 
-def run_forkserver(test, guest, qemu, solver_bin, workdir):
+def run_forkserver(test, guest, qemu, workdir):
     """Forkserver driver: handshake, iterate children until the plan ends
     (remaining == 0), close the parent pipe.  With ``fs_binradar`` the
     driver also sets up the binradar patch shm/fd so the forkserver runs
@@ -629,10 +604,9 @@ def run_forkserver(test, guest, qemu, solver_bin, workdir):
         env["BINRADAR_PATCH_CNT"] = "2"
         patch_r, patch_w = os.pipe()
         env["BINRADAR_PATCH_FD_R"] = str(patch_r)
-    solver = None
     ctrl_r = ctrl_w = stat_r = stat_w = None
     try:
-        solver = run_solver(solver_bin, env, run_dir, test.get("timeout", 30))
+        prepare_symbolic_env(env, run_dir)
         ctrl_r, ctrl_w = os.pipe()
         stat_r, stat_w = os.pipe()
         env["BINRADAR_FORKSERVER_CTRL_R"] = str(ctrl_r)
@@ -725,16 +699,10 @@ def run_forkserver(test, guest, qemu, solver_bin, workdir):
                 os.close(patch_r)
             except OSError:
                 pass
-        if solver is not None:
-            try:
-                solver.terminate()
-                solver.wait(timeout=5)
-            except (subprocess.TimeoutExpired, ProcessLookupError):
-                solver.kill()
         cleanup_shm(env)
 
 
-def run_test(test, guests_dir, workdir, qemu, solver):
+def run_test(test, guests_dir, workdir, qemu):
     guest = os.path.join(workdir, test["name"])
     if not os.path.isfile(guest):
         raise FileNotFoundError(f"guest binary missing: {guest} (run 'make guests')")
@@ -747,11 +715,11 @@ def run_test(test, guests_dir, workdir, qemu, solver):
         rc, stderr_text = result.returncode, result.stderr.decode(errors="replace")
         fs_status = None
     elif test["mode"] == "sym":
-        result = run_symbolic(test, guest, qemu, solver, workdir)
+        result = run_symbolic(test, guest, qemu, workdir)
         rc, stderr_text = result.returncode, result.stderr.decode(errors="replace")
         fs_status = None
     else:
-        rc, fs_status, stderr_text = run_forkserver(test, guest, qemu, solver, workdir)
+        rc, fs_status, stderr_text = run_forkserver(test, guest, qemu, workdir)
 
     return (rc, fs_status, stderr_text)
 
@@ -903,15 +871,12 @@ def main():
     ap.add_argument("guests", help="guests source dir (unused, for CLI parity)")
     ap.add_argument("work", help="work dir with built guests + .plt files")
     ap.add_argument("qemu", help="tracer binary")
-    ap.add_argument("solver", help="solver binary")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--test", default=None, help="run only this test name")
     args = ap.parse_args()
 
     if not os.path.isfile(args.qemu):
         sys.exit(f"tracer binary not found: {args.qemu}")
-    if not os.path.isfile(args.solver):
-        sys.exit(f"solver binary not found: {args.solver}")
 
     failures = []
     ran = 0
@@ -922,7 +887,7 @@ def main():
         start = time.time()
         try:
             rc, fs_status, out = run_test(spec, args.guests, args.work,
-                                          args.qemu, args.solver)
+                                          args.qemu)
         except Exception as e:  # noqa: BLE001 — per-test isolation
             failures.append(spec)
             print(f"FAIL {spec['name']}: {e}")

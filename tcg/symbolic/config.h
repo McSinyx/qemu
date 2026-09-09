@@ -35,6 +35,11 @@ typedef struct SymbolicConfig {
     int8_t      coverage_tracer_filter_lib;
     //
     int8_t      debug_fuzz_expr;
+    /* Runtime NO_EXTERNAL_SOLVER=1 mode: back the expr pool / query queue /
+     * bitmap with process-local heap memory instead of SysV shm and skip the
+     * SHM_READY handshake, so the tracer runs without a solver attached.
+     * Data structures are byte-identical to solver mode for bug reproduction. */
+    int8_t      no_external_solver;
     uint64_t    debug_fuzz_expr_idx;
     uint64_t    debug_fuzz_expr_value;
 } SymbolicConfig;

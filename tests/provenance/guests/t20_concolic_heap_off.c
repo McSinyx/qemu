@@ -1,7 +1,7 @@
 /* t20: symbolic continuation: a provenance finding detected mid-run must
  * NOT terminate the guest; execution continues and the finding is
  * finalized as a synthetic crash at normal exit (guest exit code 0).
- * Runs in symbolic mode (solver attached). */
+ * Runs in symbolic mode with NO_EXTERNAL_SOLVER=1. */
 #include <stdlib.h>
 
 int main(void) {

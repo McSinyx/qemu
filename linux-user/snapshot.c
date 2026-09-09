@@ -535,6 +535,8 @@ void check_all_env_var(void) {
     check_env_var("E9_EXCLUDE_RANGES");
     // E9Patch relocated call jumps (jump-addr:call-site:ret-addr, comma separated)
     check_env_var("E9_RELOCATED_CALL_JUMPS");
+    // Symbolic transport
+    check_env_var("NO_EXTERNAL_SOLVER");
     // Shared memory
     check_env_var("EXPR_POOL_SHM_KEY");
     check_env_var("QUERY_SHM_KEY");

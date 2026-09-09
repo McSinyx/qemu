@@ -583,19 +583,26 @@ static inline void    load_configuration(void)
         return;
     }
 
+    var = getenv("NO_EXTERNAL_SOLVER");
+    if (var && strcmp(var, "1") == 0) {
+        s_config.no_external_solver = 1;
+    }
+
     var = getenv("EXPR_POOL_SHM_KEY");
     if (var) {
         s_config.expr_pool_shm_key = (uintptr_t)strtoull(var, NULL, 16);
         assert(s_config.expr_pool_shm_key != ULLONG_MAX);
     }
-    assert(s_config.expr_pool_shm_key != 0 && "Missing EXPR_POOL_SHM_KEY");
+    assert((s_config.no_external_solver || s_config.expr_pool_shm_key != 0) &&
+           "Missing EXPR_POOL_SHM_KEY");
 
     var = getenv("QUERY_SHM_KEY");
     if (var) {
         s_config.query_shm_key = (uintptr_t)strtoull(var, NULL, 16);
         assert(s_config.query_shm_key != ULLONG_MAX);
     }
-    assert(s_config.query_shm_key != 0 && "Missing QUERY_SHM_KEY");
+    assert((s_config.no_external_solver || s_config.query_shm_key != 0) &&
+           "Missing QUERY_SHM_KEY");
 
 #if BRANCH_COVERAGE == FUZZOLIC
     var = getenv("BITMAP_SHM_KEY");
@@ -603,7 +610,8 @@ static inline void    load_configuration(void)
         s_config.bitmap_shm_key = (uintptr_t)strtoull(var, NULL, 16);
         assert(s_config.bitmap_shm_key != ULLONG_MAX);
     }
-    assert(s_config.bitmap_shm_key != 0 && "Missing BITMAP_SHM_KEY");
+    assert((s_config.no_external_solver || s_config.bitmap_shm_key != 0) &&
+           "Missing BITMAP_SHM_KEY");
 #endif
 
     var = getenv("BINRADAR_PATCH_SHM_KEY");
@@ -811,7 +819,17 @@ void init_symbolic_mode(void)
         return;
     }
 
-#ifndef DISABLE_SOLVER
+    if (s_config.no_external_solver) {
+        /* NO_EXTERNAL_SOLVER mode: process-local heap backing with the same
+         * data structures as solver mode (pool at EXPR_POOL_ADDR-compatible
+         * layout, query queue, bitmap). No SysV shm, no solver handshake. */
+        pool        = g_malloc0(sizeof(Expr) * EXPR_POOL_CAPACITY);
+        query_queue = g_malloc0(sizeof(Query) * EXPR_QUERY_CAPACITY);
+#if BRANCH_COVERAGE == FUZZOLIC
+        bitmap      = g_malloc0(sizeof(uint8_t) * BRANCH_BITMAP_SIZE);
+#endif
+        printf("\nTRACER in NO_EXTERNAL_SOLVER mode\n");
+    } else {
 
     struct timespec polling_time;
     polling_time.tv_sec  = 0;
@@ -865,13 +883,7 @@ void init_symbolic_mode(void)
     assert(bitmap);
 #endif
 
-#else
-    pool        = g_malloc0(sizeof(Expr) * EXPR_POOL_CAPACITY);
-    query_queue = g_malloc0(sizeof(Query) * EXPR_QUERY_CAPACITY);
-    bitmap      = g_malloc0(sizeof(uint8_t) * BRANCH_BITMAP_SIZE);
-
-    printf("\nTRACER in NO SOLVER mode\n");
-#endif
+    } /* end solver-shm branch */
 
     // printf("POOL_ADDR=%p\n", pool);
 
@@ -883,11 +895,14 @@ void init_symbolic_mode(void)
     next_free_expr = pool;
     next_query     = query_queue;
 
-#ifndef DISABLE_SOLVER
-    while (next_query[0].query != (void*)SHM_READY) {
-        nanosleep(&polling_time, NULL);
+    if (!s_config.no_external_solver) {
+        struct timespec polling_time;
+        polling_time.tv_sec  = 0;
+        polling_time.tv_nsec = 50;
+        while (next_query[0].query != (void*)SHM_READY) {
+            nanosleep(&polling_time, NULL);
+        }
     }
-#endif
 
     MEM_BARRIER();
 

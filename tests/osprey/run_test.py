@@ -2,7 +2,8 @@
 """OSPREY in-process analysis test harness.
 
 Runs a small guest under the tracer with BINRADAR_OSPREY_ENABLE=1 in
-binradar forkserver mode (patch shm + patch fd). Stage 0 asserts that
+binradar forkserver mode (patch shm + patch fd) and
+NO_EXTERNAL_SOLVER=1. Stage 0 asserts that
 known-invalid graphs and injected limits reject atomically, expose no
 typed model, retain a generic mutation queue, and reach iteration 2.
 
@@ -1072,30 +1073,16 @@ def resolve_entrypoint(guest):
     return hex(resolve_symbol(guest, "main"))
 
 
-def run_solver(solver_bin, env, run_dir, timeout):
+def prepare_symbolic_env(env, run_dir):
+    """Configure symbolic input while leaving the solver transport local."""
+    env["NO_EXTERNAL_SOLVER"] = "1"
     for key in ("EXPR_POOL_SHM_KEY", "QUERY_SHM_KEY", "BITMAP_SHM_KEY",
                 "MUTATION_REQ_SHM_KEY"):
-        env[key] = hex(random.getrandbits(32))
-    env["SOLVER_TIMEOUT"] = str(int(timeout) + 10)
+        env.pop(key, None)
     env["SYMBOLIC_INJECT_INPUT_MODE"] = "FROM_FILE"
     env["SYMBOLIC_TESTCASE_NAME"] = os.path.join(run_dir, "input")
     with open(env["SYMBOLIC_TESTCASE_NAME"], "w") as f:
         f.write("A")
-    os.makedirs(os.path.join(run_dir, "out"), exist_ok=True)
-    for b in ("global-bitmap", "context-bitmap", "memory-bitmap"):
-        open(os.path.join(run_dir, b), "w").close()
-    solver = subprocess.Popen(
-        ["stdbuf", "-o0", solver_bin,
-         "-i", env["SYMBOLIC_TESTCASE_NAME"],
-         "-o", os.path.join(run_dir, "out"),
-         "-b", os.path.join(run_dir, "global-bitmap"),
-         "-c", os.path.join(run_dir, "context-bitmap"),
-         "-m", os.path.join(run_dir, "memory-bitmap")],
-        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    time.sleep(1.2)
-    return solver
 
 
 def cleanup_shm(env):
@@ -1106,7 +1093,7 @@ def cleanup_shm(env):
             subprocess.run(["ipcrm", "-M", k], capture_output=True)
 
 
-def run_binradar(test, guest, qemu, solver_bin, workdir):
+def run_binradar(test, guest, qemu, workdir):
     """Binradar forkserver driver: handshake, baseline iteration, analyze
     barrier, one more iteration, close the parent pipe. Returns
     (tracer_rc, stderr_text)."""
@@ -1132,10 +1119,9 @@ def run_binradar(test, guest, qemu, solver_bin, workdir):
     if test.get("observe_applied"):
         observation_path = os.path.join(run_dir, "stage7-observation.ssv")
         env["BINRADAR_OSPREY_TEST_OBSERVATION_FILE"] = observation_path
-    solver = None
     ctrl_r = ctrl_w = stat_r = stat_w = None
     try:
-        solver = run_solver(solver_bin, env, run_dir, test.get("timeout", 30))
+        prepare_symbolic_env(env, run_dir)
         ctrl_r, ctrl_w = os.pipe()
         stat_r, stat_w = os.pipe()
         patch_r, patch_w = os.pipe()
@@ -1231,25 +1217,19 @@ def run_binradar(test, guest, qemu, solver_bin, workdir):
                 os.close(ctrl_w)
             except OSError:
                 pass
-        if solver is not None:
-            try:
-                solver.terminate()
-                solver.wait(timeout=5)
-            except (subprocess.TimeoutExpired, ProcessLookupError):
-                solver.kill()
         cleanup_shm(env)
 
 
-def run_test(test, workdir, qemu, solver):
+def run_test(test, workdir, qemu):
     guest = os.path.join(workdir, test.get("guest", test["name"]))
     if not os.path.isfile(guest):
         return (None, f"guest binary missing: {guest} (run 'make guests')")
     if not os.path.isfile(guest + ".plt"):
         return (None, f"plt file missing: {guest}.plt (run 'make plts')")
-    return run_binradar(test, guest, qemu, solver, workdir)
+    return run_binradar(test, guest, qemu, workdir)
 
 
-def run_dump_compare(test, workdir, qemu, solver):
+def run_dump_compare(test, workdir, qemu):
     """Canonical F01-F06 dump gate: run the guest under three distinct
     PIE load biases (default + two forced BINRADAR_MMAP_START values),
     require byte-identical dumps (ASLR invariance), then compare every
@@ -1324,7 +1304,7 @@ def run_dump_compare(test, workdir, qemu, solver):
                 model_dump_path
         if bias is not None:
             spec["env"]["BINRADAR_MMAP_START"] = bias
-        rc, out = run_binradar(spec, guest, qemu, solver, workdir)
+        rc, out = run_binradar(spec, guest, qemu, workdir)
         rcs.append(rc)
         outs.append(out)
         runtime_problems = check(test, rc, out)
@@ -2627,15 +2607,12 @@ def main():
     ap.add_argument("guests", help="guests source dir (unused, for CLI parity)")
     ap.add_argument("work", help="work dir with built guests + .plt files")
     ap.add_argument("qemu", help="tracer binary")
-    ap.add_argument("solver", help="solver binary")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--test", default=None, help="run only this test name")
     args = ap.parse_args()
 
     if not os.path.isfile(args.qemu):
         sys.exit(f"tracer binary not found: {args.qemu}")
-    if not os.path.isfile(args.solver):
-        sys.exit(f"solver binary not found: {args.solver}")
 
     failures: list[str] = []
     ran = 0
@@ -2646,10 +2623,9 @@ def main():
         start = time.time()
         try:
             if spec.get("mode") == "dump_compare":
-                rc, out = run_dump_compare(spec, args.work, args.qemu,
-                                           args.solver)
+                rc, out = run_dump_compare(spec, args.work, args.qemu)
             else:
-                rc, out = run_test(spec, args.work, args.qemu, args.solver)
+                rc, out = run_test(spec, args.work, args.qemu)
             if rc is None:
                 problems = [out]
             else:

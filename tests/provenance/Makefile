@@ -13,7 +13,6 @@
 #   make clean      # remove build products
 
 QEMU      := ../../build/x86_64-linux-user/qemu-x86_64
-SOLVER    := ../../../solver/build/solver-smt
 RUNNER    := $(CURDIR)/run_test.py
 GEN_PLT   := $(CURDIR)/gen_plt.py
 GUESTS    := $(CURDIR)/guests
@@ -57,11 +56,12 @@ TESTS := t01_double_free t02_small_double_free t03_uaf_stack t04_uaf_heap \
 GUEST_BINS := $(addprefix $(WORK)/,$(TESTS))
 PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))
 
-# The test suite depends on the tracer and the solver binaries.
+# The test suite depends only on the tracer; symbolic cases use
+# NO_EXTERNAL_SOLVER=1 and do not launch solver-smt.
 .PHONY: check run guests plts clean
 check: run
 run: guests plts
-	@$(RUNNER) $(GUESTS) $(WORK) $(QEMU) $(SOLVER) --quiet
+	@$(RUNNER) $(GUESTS) $(WORK) $(QEMU) --quiet
 guests: $(GUEST_BINS)
 plts: $(PLT_FILES)
 
