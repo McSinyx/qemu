@@ -6776,7 +6776,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                     if (pre_base != NULL) {
                         tcg_temp_free(pre_base);
                     }
-                } else {
+                } else if (pre_base != NULL) {
                     gen_sem_reg_lea_dyn(reg, a.base, s->pc_start,
                                         pre_base);
                     tcg_temp_free(pre_base);
