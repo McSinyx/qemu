@@ -515,7 +515,28 @@ static void print_query_loc(Query *query, uint64_t pc, const char *msg) {
     }
 }
 
+static bool query_slot_available(void)
+{
+    /* Keep one terminal slot available for end_symbolic_mode().  The old
+     * post-write assert allowed the final branch to write past the queue and
+     * then aborted the tracer, turning a long but valid guest loop into the
+     * misleading pre-entrypoint forkserver EOF. */
+    if (next_query + 1 >= query_queue + EXPR_QUERY_CAPACITY) {
+        static bool reported;
+        if (!reported) {
+            log_msg("[query] [overflow] [capacity %u] [pc %lx]\n",
+                    EXPR_QUERY_CAPACITY, current_tb_pc);
+            reported = true;
+        }
+        return false;
+    }
+    return true;
+}
+
 void add_query(Expr *q, uintptr_t address, uintptr_t pc, const char *msg) {
+    if (!query_slot_available()) {
+        return;
+    }
     next_query->query = q;
     next_query->address = address;
     print_query_loc(next_query, pc, msg);
@@ -4927,6 +4948,10 @@ static inline void branch_helper_internal(uintptr_t a, uintptr_t b,
     }
 #endif
 
+    if (!query_slot_available()) {
+        return;
+    }
+
     Expr*   branch_expr = new_expr();
     TCGCond sat_cond    = check_branch_cond_helper(a, b, cond);
     branch_expr->opkind = get_opkind_from_cond(sat_cond);
@@ -5362,6 +5387,34 @@ static Expr** get_expr_addr(uintptr_t addr, size_t size, uint8_t allocate,
     }
 
     return &l3_page->entries[l3_page_idx];
+}
+
+/* Return a contiguous view of symbolic-byte metadata across the internal
+ * 64-KiB pages used by s_memory.  Library models scan guest strings/ranges
+ * whose start and length are not page-aligned; passing such a range directly
+ * to get_expr_addr() used to assert when it crossed an internal page. */
+static Expr** get_expr_addr_span(uintptr_t addr, size_t size)
+{
+    if (size == 0) {
+        return NULL;
+    }
+
+    Expr** span = g_new0(Expr*, size);
+    size_t copied = 0;
+    const size_t page_size = (size_t)1 << L3_PAGE_BITS;
+    const uintptr_t page_mask = (uintptr_t)(page_size - 1);
+    while (copied < size) {
+        uintptr_t current = addr + copied;
+        size_t page_offset = (size_t)(current & page_mask);
+        size_t chunk = MIN(size - copied, page_size - page_offset);
+        Expr** page_exprs = get_expr_addr(current, chunk, 0, NULL);
+        if (page_exprs != NULL) {
+            memcpy(span + copied, page_exprs,
+                   chunk * sizeof(*page_exprs));
+        }
+        copied += chunk;
+    }
+    return span;
 }
 
 __attribute__((unused))

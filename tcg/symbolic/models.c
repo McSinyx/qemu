@@ -98,6 +98,9 @@ static inline void clear_call_args_temps(void)
 }
 
 static void add_query_with_model(Expr *q, uintptr_t address, MODEL_T model, const char *msg) {
+    if (!query_slot_available()) {
+        return;
+    }
     next_query->query = q;
     next_query->address = address;
     next_query->model = model;
@@ -360,24 +363,24 @@ static inline int model_strlen(CPUX86State* env, uintptr_t pc, uintptr_t n,
         provenance_model_check_access(env, (target_ulong)s1, len, pc, reg);
     }
     // printf("LEN: %lu\n", len);
-    Expr** s1_exprs = get_expr_addr((uintptr_t)s1, len, 0, NULL);
+    Expr** s1_exprs = get_expr_addr_span((uintptr_t)s1, len);
 
     if (s1_exprs == NULL) {
         return mode;
     }
 
     int s1_is_not_null = 0;
-    if (s1_exprs) {
-        for (size_t i = 0; i < len && s1_is_not_null == 0; i++) {
-            s1_is_not_null |= s1_exprs[i] != NULL;
-        }
+    for (size_t i = 0; i < len && s1_is_not_null == 0; i++) {
+        s1_is_not_null |= s1_exprs[i] != NULL;
     }
 
     if (!s1_is_not_null) {
+        g_free(s1_exprs);
         return mode;
     }
 
     Expr* s1_expr = build_expr(s1_exprs, s1, len);
+    g_free(s1_exprs);
 
     uint64_t v = 0;
     v          = PACK_0(v, s1_len);
