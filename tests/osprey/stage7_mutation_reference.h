@@ -34,7 +34,7 @@ typedef enum Stage7ReferenceMutationKind {
 typedef struct Stage7ReferenceCandidate {
     target_ulong addr;
     uint32_t size;
-    uintptr_t expr_identity;
+    int64_t expr_index;
     uint8_t value[sizeof(target_ulong)];
 } Stage7ReferenceCandidate;
 
@@ -42,7 +42,7 @@ typedef struct Stage7ReferenceVariant {
     Stage7ReferenceMutationKind kind;
     target_ulong addr;
     uint32_t size;
-    uintptr_t expr_identity;
+    int64_t expr_index;
     uint8_t value[sizeof(target_ulong)];
     uint64_t target_extent;
     uint8_t *target_bytes;

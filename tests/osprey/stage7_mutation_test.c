@@ -940,7 +940,8 @@ static void test_parent_count_clamp(void)
     CHECK(mod_manager == NULL && mutation_analysis_started,
           "empty corrupt input destroys the exhausted manager");
     CHECK(remaining == 0, "corrupt count reports no remaining work");
-    CHECK(g_hash_table_size(g_read_access_tainted_primitives_all) == 0,
+    CHECK(g_read_access_tainted_primitives_all == NULL ||
+              g_hash_table_size(g_read_access_tainted_primitives_all) == 0,
           "corrupt count traverses no primitive records");
 
     reset_shared_records();
@@ -1132,13 +1133,14 @@ static void test_owned_generic_plan_parity(void)
 
         uint32_t ordinal = 0;
         for (GList *node = queue->head; node != NULL; node = node->next) {
-            Modification *modification = node->data;
+            SnapshotMutationPlan *modification = node->data;
             CHECK(modification->num_mods == 1,
                   "generic queue entries have one owned write");
             SnapshotMutationWrite *write = &modification->mods[0];
             CHECK(write->kind == SNAPSHOT_MUTATION_BYTES &&
                   write->addr == source.addr && write->size == source.size &&
-                  write->expr == source.expr && write->target.bytes == NULL &&
+                  write->expr_index == -1 && write->query_index == -1 &&
+                  write->target.bytes == NULL &&
                   write->target.extent == 0,
                   "generic plan descriptor is private and inactive-target clean");
             if (source.size == 3) {
@@ -1220,7 +1222,7 @@ static void test_owned_generic_boundary_parity(void)
 
         uint32_t ordinal = 0;
         for (GList *node = queue->head; node != NULL; node = node->next) {
-            Modification *modification = node->data;
+            SnapshotMutationPlan *modification = node->data;
             uint8_t expected[sizeof(target_ulong)] = {0};
             memcpy(expected, &cases[ci].expected[ordinal], source.size);
             CHECK(modification->num_mods == 1 &&
@@ -1254,14 +1256,15 @@ static void test_owned_untyped_pointer_parity(void)
     CHECK(g_queue_get_length(queue) == 1,
           "untyped pointer keeps one legacy null plan");
     if (!g_queue_is_empty(queue)) {
-        Modification *modification = g_queue_peek_head(queue);
+        SnapshotMutationPlan *modification = g_queue_peek_head(queue);
         target_ulong value = UINT64_MAX;
         memcpy(&value, modification->mods[0].value, sizeof(value));
         CHECK(modification->num_mods == 1 &&
               modification->mods[0].kind == SNAPSHOT_MUTATION_POINTER_NULL &&
               modification->mods[0].addr == source.addr &&
               modification->mods[0].size == sizeof(target_ulong) &&
-              modification->mods[0].expr == source.expr && value == 0 &&
+              modification->mods[0].expr_index == -1 &&
+              modification->mods[0].query_index == -1 && value == 0 &&
               modification->mods[0].target.bytes == NULL &&
               modification->mods[0].target.extent == 0,
               "untyped pointer descriptor preserves null fallback");
@@ -1290,7 +1293,7 @@ static void test_owned_fresh_payloads(void)
     uint8_t zero[sizeof(target_ulong)] = {0};
     uint8_t ones[sizeof(target_ulong)];
     memset(ones, 1, sizeof(ones));
-    Modification *batch[2] = {
+    SnapshotMutationPlan *batch[2] = {
         snapshot_mutation_new(&source, SNAPSHOT_MUTATION_POINTER_FRESH,
                               zero, source.size, sizeof(zero), zero),
         snapshot_mutation_new(&source, SNAPSHOT_MUTATION_POINTER_FRESH,
@@ -1302,8 +1305,8 @@ static void test_owned_fresh_payloads(void)
     CHECK(snapshot_mutation_enqueue_batch(queue, batch, 2),
           "fresh plan batch enqueues atomically");
     if (g_queue_get_length(queue) == 2) {
-        Modification *first = g_queue_peek_nth(queue, 0);
-        Modification *second = g_queue_peek_nth(queue, 1);
+        SnapshotMutationPlan *first = g_queue_peek_nth(queue, 0);
+        SnapshotMutationPlan *second = g_queue_peek_nth(queue, 1);
         CHECK(first->mods[0].target.bytes != second->mods[0].target.bytes,
               "fresh target payloads do not alias");
         CHECK(memcmp(first->mods[0].target.bytes, zero, sizeof(zero)) == 0 &&
@@ -1348,7 +1351,7 @@ static void test_typed_pointer_plans_and_fallback(void)
         CHECK(g_queue_get_length(queue) == 3,
               "NULL typed pointer has exactly three variants");
         for (uint32_t i = 0; i < G_N_ELEMENTS(fills); i++) {
-            Modification *modification = g_queue_peek_nth(queue, i);
+            SnapshotMutationPlan *modification = g_queue_peek_nth(queue, i);
             SnapshotMutationWrite *write = &modification->mods[0];
             CHECK(write->kind == SNAPSHOT_MUTATION_POINTER_FRESH &&
                   write->size == sizeof(target_ulong) &&
@@ -1360,7 +1363,7 @@ static void test_typed_pointer_plans_and_fallback(void)
                          sizeof(write->value)) == 0,
                   "fresh pointer cell retains an immutable placeholder");
             if (i != 0) {
-                Modification *previous = g_queue_peek_nth(queue, i - 1);
+                SnapshotMutationPlan *previous = g_queue_peek_nth(queue, i - 1);
                 CHECK(write->target.bytes != previous->mods[0].target.bytes,
                       "fresh pointer payloads are independently owned");
             }
@@ -1383,7 +1386,7 @@ static void test_typed_pointer_plans_and_fallback(void)
         CHECK(g_queue_get_length(queue) == 3,
               "fresh extent boundary retains three variants");
         for (uint32_t variant = 0; variant < G_N_ELEMENTS(fills); variant++) {
-            Modification *modification = g_queue_peek_nth(queue, variant);
+            SnapshotMutationPlan *modification = g_queue_peek_nth(queue, variant);
             CHECK(modification->mods[0].target.extent == other_extents[i] &&
                   bytes_equal_value(modification->mods[0].target.bytes,
                                     other_extents[i], fills[variant]),
@@ -1404,8 +1407,8 @@ static void test_typed_pointer_plans_and_fallback(void)
     CHECK(g_queue_get_length(queue) == 2,
           "non-NULL typed pointer has exactly NULL and OOB variants");
     if (g_queue_get_length(queue) == 2) {
-        Modification *null_mod = g_queue_peek_nth(queue, 0);
-        Modification *oob_mod = g_queue_peek_nth(queue, 1);
+        SnapshotMutationPlan *null_mod = g_queue_peek_nth(queue, 0);
+        SnapshotMutationPlan *oob_mod = g_queue_peek_nth(queue, 1);
         target_ulong null_value = UINT64_MAX;
         target_ulong oob_value = 0;
         memcpy(&null_value, null_mod->mods[0].value, sizeof(null_value));
@@ -1429,7 +1432,7 @@ static void test_typed_pointer_plans_and_fallback(void)
               SNAPSHOT_POINTER_FROM_PRIMITIVE),
           "untrusted primitive record falls back generically");
     CHECK(g_queue_get_length(queue) == 2 &&
-          ((Modification *)g_queue_peek_head(queue))->mods[0].kind ==
+          ((SnapshotMutationPlan *)g_queue_peek_head(queue))->mods[0].kind ==
               SNAPSHOT_MUTATION_BYTES,
           "sticky record failure disables typed primitive planning");
     free_plan_queue(queue);
@@ -1440,7 +1443,7 @@ static void test_typed_pointer_plans_and_fallback(void)
               SNAPSHOT_POINTER_FROM_ACCESS),
           "untrusted pointer record falls back generically");
     CHECK(g_queue_get_length(queue) == 1 &&
-          ((Modification *)g_queue_peek_head(queue))->mods[0].kind ==
+          ((SnapshotMutationPlan *)g_queue_peek_head(queue))->mods[0].kind ==
               SNAPSHOT_MUTATION_POINTER_NULL,
           "sticky record failure preserves untyped pointer behavior");
     free_plan_queue(queue);
@@ -1453,7 +1456,7 @@ static void test_typed_pointer_plans_and_fallback(void)
               SNAPSHOT_POINTER_FROM_ACCESS),
           "mismatched cell locator falls back generically");
     CHECK(g_queue_get_length(queue) == 1 &&
-          ((Modification *)g_queue_peek_head(queue))->mods[0].kind ==
+          ((SnapshotMutationPlan *)g_queue_peek_head(queue))->mods[0].kind ==
               SNAPSHOT_MUTATION_POINTER_NULL,
           "typed planning binds the locator to the mutation address");
     free_plan_queue(queue);
@@ -1465,7 +1468,7 @@ static void test_typed_pointer_plans_and_fallback(void)
               SNAPSHOT_POINTER_FROM_ACCESS),
           "zero-size target falls back generically");
     CHECK(g_queue_get_length(queue) == 1 &&
-          ((Modification *)g_queue_peek_head(queue))->mods[0].kind ==
+          ((SnapshotMutationPlan *)g_queue_peek_head(queue))->mods[0].kind ==
               SNAPSHOT_MUTATION_POINTER_NULL,
           "zero-size target preserves one untyped pointer plan");
     free_plan_queue(queue);
@@ -1477,7 +1480,7 @@ static void test_typed_pointer_plans_and_fallback(void)
               SNAPSHOT_POINTER_FROM_ACCESS),
           "oversized target falls back generically");
     CHECK(g_queue_get_length(queue) == 1 &&
-          ((Modification *)g_queue_peek_head(queue))->mods[0].kind ==
+          ((SnapshotMutationPlan *)g_queue_peek_head(queue))->mods[0].kind ==
               SNAPSHOT_MUTATION_POINTER_NULL,
           "fresh target cap preserves one untyped pointer plan");
     free_plan_queue(queue);
@@ -1500,7 +1503,7 @@ static void test_typed_pointer_plans_and_fallback(void)
               SNAPSHOT_POINTER_FROM_ACCESS),
           "OOB delta overflow falls back generically");
     CHECK(g_queue_get_length(queue) == 1 &&
-          ((Modification *)g_queue_peek_head(queue))->mods[0].kind ==
+          ((SnapshotMutationPlan *)g_queue_peek_head(queue))->mods[0].kind ==
               SNAPSHOT_MUTATION_POINTER_NULL,
           "OOB overflow publishes no partial typed prefix");
     free_plan_queue(queue);
@@ -1511,7 +1514,7 @@ static void test_typed_pointer_plans_and_fallback(void)
     for (int64_t fail_after = 0; fail_after < 32; fail_after++) {
         queue = g_queue_new();
         snapshot_mutation_test_set_alloc_fail_after(-1);
-        Modification *sentinel = snapshot_mutation_new(
+        SnapshotMutationPlan *sentinel = snapshot_mutation_new(
             &source, SNAPSHOT_MUTATION_BYTES, source.value, source.size,
             0, NULL);
         CHECK(sentinel != NULL &&
@@ -1545,7 +1548,7 @@ static bool reference_variant_matches_write(
     if (expected == NULL || actual == NULL ||
         (uint32_t)actual->kind != (uint32_t)expected->kind ||
         actual->addr != expected->addr || actual->size != expected->size ||
-        (uintptr_t)actual->expr != expected->expr_identity ||
+        actual->expr_index != expected->expr_index ||
         memcmp(actual->value, expected->value, sizeof(actual->value)) != 0 ||
         actual->target.extent != expected->target_extent ||
         actual->target.resolved_raw != expected->resolved_target_raw ||
@@ -1576,7 +1579,7 @@ static void test_reference_plan_matrix(void)
     memset(&reference_candidate, 0, sizeof(reference_candidate));
     reference_candidate.addr = source.addr;
     reference_candidate.size = source.size;
-    reference_candidate.expr_identity = (uintptr_t)source.expr;
+    reference_candidate.expr_index = -1;
 
 #define CHECK_PLAN(_label, _allowed, _source_kind, _target) do {             \
         Stage7ReferencePlan expected = {0};                                  \
@@ -1599,7 +1602,7 @@ static void test_reference_plan_matrix(void)
                   _label " variant count matches reference");                \
             if (g_queue_get_length(actual_queue) == expected.count) {          \
                 for (uint32_t vi = 0; vi < expected.count; vi++) {             \
-                    Modification *m = g_queue_peek_nth(actual_queue, vi);     \
+                    SnapshotMutationPlan *m = g_queue_peek_nth(actual_queue, vi);     \
                     CHECK(m != NULL && m->num_mods == 1 &&                     \
                           reference_variant_matches_write(                    \
                               &expected.variants[vi], &m->mods[0]),            \
@@ -1684,7 +1687,7 @@ static void test_fresh_pointer_application(void)
     memset(g2h(source.addr), 0xcc, sizeof(target_ulong));
     memset(g2h(target), 0xa5, sizeof(payload) + 1);
 
-    Modification *plan = snapshot_mutation_new(
+    SnapshotMutationPlan *plan = snapshot_mutation_new(
         &source, SNAPSHOT_MUTATION_POINTER_FRESH, source.value, source.size,
         sizeof(payload), payload);
     CHECK(plan != NULL, "fresh application plan allocates");
@@ -1779,7 +1782,7 @@ static void test_atomic_plan_enqueue_failures(void)
     for (int64_t fail_after = 0; fail_after < 64; fail_after++) {
         GQueue *queue = g_queue_new();
         snapshot_mutation_test_set_alloc_fail_after(-1);
-        Modification *sentinel = snapshot_mutation_new(
+        SnapshotMutationPlan *sentinel = snapshot_mutation_new(
             &source, SNAPSHOT_MUTATION_BYTES, source.value, source.size,
             0, NULL);
         CHECK(sentinel != NULL, "sentinel plan allocates");
@@ -1822,14 +1825,14 @@ static void test_nested_payload_failures(void)
     for (int64_t fail_after = 0; fail_after < 32; fail_after++) {
         GQueue *queue = g_queue_new();
         snapshot_mutation_test_set_alloc_fail_after(-1);
-        Modification *sentinel = snapshot_mutation_new(
+        SnapshotMutationPlan *sentinel = snapshot_mutation_new(
             &source, SNAPSHOT_MUTATION_BYTES, source.value, source.size,
             0, NULL);
         CHECK(sentinel != NULL, "nested-failure sentinel allocates");
         CHECK(snapshot_mutation_enqueue_one(queue, sentinel),
               "nested-failure sentinel enqueues");
 
-        Modification *batch[2] = {NULL, NULL};
+        SnapshotMutationPlan *batch[2] = {NULL, NULL};
         snapshot_mutation_test_set_alloc_fail_after(fail_after);
         batch[0] = snapshot_mutation_new(
             &source, SNAPSHOT_MUTATION_POINTER_FRESH, zero, source.size,
@@ -1877,6 +1880,141 @@ static void test_owned_plan_validation(void)
           "non-native pointer width is rejected");
 }
 
+static void test_mutation_coordinator_contract(void)
+{
+    SnapshotMutationBaseline baseline = {0};
+    SnapshotMutationBaselineEntry entries[4] = {0};
+    SnapshotMutationCoordinator coordinator = {0};
+    SnapshotMutationProposalSink sink = {0};
+    SnapshotMutationProposalWrite writes[2] = {0};
+    SnapshotMutationProposalVariant variant = {0};
+    SnapshotMutationProposalFamily family = {0};
+    GQueue *queue = g_queue_new();
+
+    baseline.run_epoch = 7;
+    baseline.entry_count = G_N_ELEMENTS(entries);
+    baseline.entries = entries;
+    for (uint32_t i = 0; i < G_N_ELEMENTS(entries); i++) {
+        entries[i].token.run_epoch = baseline.run_epoch;
+        entries[i].token.source_ordinal = i;
+        entries[i].lane = i == 0 ? SNAPSHOT_MUTATION_LANE_PRIMITIVE
+                                 : SNAPSHOT_MUTATION_LANE_ARGUMENT;
+        entries[i].source_kind = i == 0
+            ? SNAPSHOT_MUTATION_SOURCE_PRIMITIVE
+            : SNAPSHOT_MUTATION_SOURCE_ARGUMENT_PRIMITIVE;
+        entries[i].eligible = true;
+        entries[i].typed_eligible = true;
+        entries[i].size = i == 0 ? 1 : sizeof(target_ulong);
+        entries[i].addr = i == 0 ? TEST_GUEST_BASE + 0xd000 : R_EAX;
+        entries[i].planner_bytes[0] = (uint8_t)(0x10 + i);
+    }
+    entries[3].addr = TEST_GUEST_BASE + 0xd000;
+    entries[3].size = 2;
+
+    coordinator.baseline = &baseline;
+    coordinator.families = g_ptr_array_new_with_free_func(
+        snapshot_mutation_proposal_family_free);
+    coordinator.staged = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)snapshot_mutation_free);
+    sink.coordinator = &coordinator;
+    sink.advisor_id = 7;
+    sink.advisor_priority = 2;
+
+    writes[0].destination = entries[0].token;
+    writes[0].kind = SNAPSHOT_MUTATION_BYTES;
+    writes[0].size = 1;
+    writes[0].value[0] = 0x22;
+    writes[1].destination = entries[1].token;
+    writes[1].kind = SNAPSHOT_MUTATION_BYTES;
+    writes[1].size = sizeof(target_ulong);
+    writes[1].value[0] = 0x44;
+    variant.variant_id = 4;
+    variant.write_count = G_N_ELEMENTS(writes);
+    variant.writes = writes;
+    family.advisor_id = sink.advisor_id;
+    family.advisor_priority = sink.advisor_priority;
+    family.family_id = 100;
+    family.primary_seed = entries[0].token;
+    family.seed_semantics = SNAPSHOT_MUTATION_SEED_SNAPSHOT_STATE;
+    family.variant_count = 1;
+    family.variants = &variant;
+
+    CHECK(snapshot_mutation_sink_submit(&sink, &family),
+          "coordinator accepts a complete family");
+    CHECK(snapshot_mutation_sink_submit(&sink, &family) &&
+              coordinator.families->len == 1,
+          "coordinator deduplicates same-advisor descriptor");
+
+    writes[0].value[0] = entries[0].planner_bytes[0];
+    CHECK(!snapshot_mutation_proposal_validate(&coordinator, &family),
+          "coordinator rejects an unchanged primary");
+    writes[0].value[0] = 0x22;
+    family.primary_seed.run_epoch++;
+    CHECK(!snapshot_mutation_proposal_validate(&coordinator, &family),
+          "coordinator rejects a stale source epoch");
+    family.primary_seed.run_epoch = baseline.run_epoch;
+
+    writes[0].kind = SNAPSHOT_MUTATION_POINTER_FRESH;
+    writes[0].target_extent = 1;
+    writes[0].target_bytes = NULL;
+    CHECK(!snapshot_mutation_proposal_validate(&coordinator, &family),
+          "coordinator rejects malformed fresh payload");
+    writes[0].kind = SNAPSHOT_MUTATION_BYTES;
+    writes[0].target_extent = 0;
+
+    SnapshotMutationProposalWrite duplicate_register_writes[2] = {0};
+    SnapshotMutationProposalVariant duplicate_register_variant = {0};
+    SnapshotMutationProposalFamily duplicate_register_family = family;
+    duplicate_register_writes[0].destination = entries[1].token;
+    duplicate_register_writes[0].kind = SNAPSHOT_MUTATION_BYTES;
+    duplicate_register_writes[0].size = sizeof(target_ulong);
+    duplicate_register_writes[0].value[0] = 0x55;
+    duplicate_register_writes[1] = duplicate_register_writes[0];
+    duplicate_register_writes[1].destination = entries[2].token;
+    duplicate_register_writes[1].value[0] = 0x66;
+    duplicate_register_variant.variant_id = 1;
+    duplicate_register_variant.write_count = 2;
+    duplicate_register_variant.writes = duplicate_register_writes;
+    duplicate_register_family.family_id = 101;
+    duplicate_register_family.primary_seed = entries[1].token;
+    duplicate_register_family.variants = &duplicate_register_variant;
+    CHECK(!snapshot_mutation_proposal_validate(
+              &coordinator, &duplicate_register_family),
+          "coordinator rejects duplicate register writes");
+
+    SnapshotMutationProposalWrite overlap_writes[2] = {0};
+    SnapshotMutationProposalVariant overlap_variant = {0};
+    SnapshotMutationProposalFamily overlap_family = family;
+    overlap_writes[0] = writes[0];
+    overlap_writes[0].destination = entries[0].token;
+    overlap_writes[0].size = 1;
+    overlap_writes[0].value[0] = 0x23;
+    overlap_writes[1] = writes[0];
+    overlap_writes[1].destination = entries[3].token;
+    overlap_writes[1].size = 2;
+    overlap_writes[1].value[0] = 0x24;
+    overlap_variant.variant_id = 2;
+    overlap_variant.write_count = 2;
+    overlap_variant.writes = overlap_writes;
+    overlap_family.family_id = 102;
+    overlap_family.variants = &overlap_variant;
+    CHECK(!snapshot_mutation_proposal_validate(&coordinator,
+                                               &overlap_family),
+          "coordinator rejects overlapping memory writes");
+
+    SnapshotMutationProposalFamily *accepted =
+        g_ptr_array_index(coordinator.families, 0);
+    CHECK(snapshot_mutation_stage_family(&coordinator, accepted),
+          "coordinator stages a complete family off-queue");
+    CHECK(g_queue_is_empty(queue),
+          "coordinator staging does not publish a queue prefix");
+    CHECK(snapshot_mutation_coordinator_publish(&coordinator, queue) &&
+              g_queue_get_length(queue) == 2,
+          "coordinator publishes every family write atomically");
+    free_plan_queue(queue);
+    snapshot_mutation_coordinator_clear(&coordinator);
+}
+
 static void test_manager_fifo_and_cleanup(void)
 {
     reset_shared_records();
@@ -1888,7 +2026,7 @@ static void test_manager_fifo_and_cleanup(void)
     MutationCandidate source = {0};
     source.addr = TEST_GUEST_BASE + 0xace0;
     source.size = sizeof(target_ulong);
-    Modification *batch[3] = {NULL, NULL, NULL};
+    SnapshotMutationPlan *batch[3] = {NULL, NULL, NULL};
     for (uint32_t i = 0; i < G_N_ELEMENTS(batch); i++) {
         source.value[0] = (uint8_t)(0x11 * (i + 1));
         batch[i] = snapshot_mutation_new(
@@ -1922,7 +2060,7 @@ static void test_manager_fifo_and_cleanup(void)
         mod_manager->current = snapshot_mutation_new(
             &source, SNAPSHOT_MUTATION_BYTES, source.value, source.size,
             0, NULL);
-        Modification *queued = snapshot_mutation_new(
+        SnapshotMutationPlan *queued = snapshot_mutation_new(
             &source, SNAPSHOT_MUTATION_BYTES, source.value, source.size,
             0, NULL);
         CHECK(mod_manager->current != NULL && queued != NULL &&
@@ -1933,6 +2071,87 @@ static void test_manager_fifo_and_cleanup(void)
         CHECK(mod_manager == NULL && !mutation_analysis_started,
               "manager cleanup cycle releases all ownership");
     }
+}
+
+static SnapshotMutationPlan *make_two_write_plan(
+    target_ulong first_addr, uint32_t first_size, uint8_t first_value,
+    target_ulong second_addr, uint32_t second_size, uint8_t second_value)
+{
+    SnapshotMutationPlan *plan = g_malloc0(sizeof(*plan));
+    plan->num_mods = 2;
+    plan->mods = g_malloc0(2 * sizeof(*plan->mods));
+    plan->mods[0].kind = SNAPSHOT_MUTATION_BYTES;
+    plan->mods[0].addr = first_addr;
+    plan->mods[0].size = first_size;
+    plan->mods[0].value[0] = first_value;
+    plan->mods[1].kind = SNAPSHOT_MUTATION_BYTES;
+    plan->mods[1].addr = second_addr;
+    plan->mods[1].size = second_size;
+    plan->mods[1].value[0] = second_value;
+    return plan;
+}
+
+static void test_child_multiwrite_atomicity(void)
+{
+    CPUArchState *env = g_malloc0(sizeof(*env));
+    void *shared = mmap(NULL, SNAPSHOT_PAGE_SIZE,
+                        PROT_READ | PROT_WRITE,
+                        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    unsigned long saved_guest_base;
+    target_ulong first = TEST_GUEST_BASE + 0x120;
+    target_ulong second = TEST_GUEST_BASE + 0x128;
+    int status = 0;
+
+    CHECK(shared != MAP_FAILED, "multiwrite fixture maps shared memory");
+    if (shared == MAP_FAILED) {
+        g_free(env);
+        return;
+    }
+    saved_guest_base = guest_base;
+    guest_base = (unsigned long)shared - TEST_GUEST_BASE;
+    memset(shared, 0xa5, SNAPSHOT_PAGE_SIZE);
+
+    mod_manager = g_new0(ModificationManager, 1);
+    mod_manager->modifications = g_queue_new();
+    mod_manager->current = make_two_write_plan(first, 1, 0x11,
+                                                second, 2, 0x22);
+    mutation_analysis_started = true;
+    pid_t pid = fork();
+    if (pid == 0) {
+        snapshot_modify_memory(env);
+        _exit(0);
+    }
+    CHECK(pid > 0 && waitpid(pid, &status, 0) == pid &&
+              WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "valid multiwrite child resumes after complete preflight");
+    CHECK(((uint8_t *)shared)[0x120] == 0x11 &&
+              ((uint8_t *)shared)[0x128] == 0x22,
+          "valid multiwrite publishes every cell");
+    snapshot_modification_manager_reset(false);
+
+    memset(shared, 0xa5, SNAPSHOT_PAGE_SIZE);
+    mod_manager = g_new0(ModificationManager, 1);
+    mod_manager->modifications = g_queue_new();
+    mod_manager->current = make_two_write_plan(first, 2, 0x11,
+                                                first + 1, 1, 0x22);
+    mutation_analysis_started = true;
+    status = 0;
+    pid = fork();
+    if (pid == 0) {
+        snapshot_modify_memory(env);
+        _exit(0);
+    }
+    CHECK(pid > 0 && waitpid(pid, &status, 0) == pid &&
+              WIFEXITED(status) && WEXITSTATUS(status) == 1,
+          "overlapping multiwrite exits before publication");
+    CHECK(((uint8_t *)shared)[0x120] == 0xa5 &&
+              ((uint8_t *)shared)[0x121] == 0xa5,
+          "overlap rejection leaves every cell unchanged");
+    snapshot_modification_manager_reset(false);
+
+    guest_base = saved_guest_base;
+    munmap(shared, SNAPSHOT_PAGE_SIZE);
+    g_free(env);
 }
 
 static void test_child_application_does_not_mutate_plan(void)
@@ -1947,7 +2166,7 @@ static void test_child_application_does_not_mutate_plan(void)
     target_ulong value = 0x1122334455667788ULL;
     memcpy(source.value, &value, sizeof(value));
 
-    Modification *plan = snapshot_mutation_new(
+    SnapshotMutationPlan *plan = snapshot_mutation_new(
         &source, SNAPSHOT_MUTATION_BYTES, source.value, source.size, 0, NULL);
     CHECK(plan != NULL, "application plan allocates");
     if (plan != NULL) {
@@ -2029,7 +2248,9 @@ int main(void)
     test_atomic_plan_enqueue_failures();
     test_nested_payload_failures();
     test_owned_plan_validation();
+    test_mutation_coordinator_contract();
     test_manager_fifo_and_cleanup();
+    test_child_multiwrite_atomicity();
     test_child_application_does_not_mutate_plan();
 
     osprey_free_runtime_regions();

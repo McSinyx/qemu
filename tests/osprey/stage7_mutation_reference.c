@@ -302,7 +302,7 @@ static bool reference_append_variant(Stage7ReferencePlan *plan,
     variant->kind = kind;
     variant->addr = candidate->addr;
     variant->size = candidate->size;
-    variant->expr_identity = candidate->expr_identity;
+    variant->expr_index = candidate->expr_index;
     if (value == NULL) {
         memcpy(variant->value, candidate->value, sizeof(variant->value));
     } else {

@@ -160,14 +160,15 @@ typedef struct SnapshotMutationTarget {
     uint64_t resolved_end;
 } SnapshotMutationTarget;
 
-/* Parent-owned immutable mutation write.  expr is a non-owning locator into
- * the process-lifetime shared expression pool; the queue cannot outlive that
- * pool.  Every byte used after enqueue is private plan ownership. */
+/* Parent-owned immutable mutation write.  Expression and query identity are
+ * scalar pool indexes; the executor never dereferences either pool.  Every
+ * byte used after enqueue is private plan ownership. */
 typedef struct SnapshotMutationWrite {
     SnapshotMutationKind kind;
     target_ulong addr;
     uint32_t size;
-    Expr *expr;
+    int64_t expr_index;
+    int64_t query_index;
     uint8_t value[sizeof(target_ulong)];
     SnapshotMutationTarget target;
 } SnapshotMutationWrite;
@@ -175,14 +176,106 @@ typedef struct SnapshotMutationWrite {
 _Static_assert(sizeof(target_ulong) <= sizeof(((MutationCandidate *)0)->value),
                "target_ulong does not fit MutationCandidate value");
 
-typedef struct Modification {
+typedef struct SnapshotMutationPlan {
     uint32_t num_mods;
     SnapshotMutationWrite *mods;
-} Modification;
+} SnapshotMutationPlan;
+
+typedef enum SnapshotMutationLane {
+    SNAPSHOT_MUTATION_LANE_PRIMITIVE = 0,
+    SNAPSHOT_MUTATION_LANE_POINTER = 1,
+    SNAPSHOT_MUTATION_LANE_ARGUMENT = 2,
+} SnapshotMutationLane;
+
+typedef enum SnapshotMutationSourceKind {
+    SNAPSHOT_MUTATION_SOURCE_PRIMITIVE = 0,
+    SNAPSHOT_MUTATION_SOURCE_POINTER = 1,
+    SNAPSHOT_MUTATION_SOURCE_ARGUMENT_PRIMITIVE = 2,
+    SNAPSHOT_MUTATION_SOURCE_ARGUMENT_POINTER = 3,
+} SnapshotMutationSourceKind;
+
+typedef struct SnapshotMutationSourceToken {
+    uint64_t run_epoch;
+    uint32_t source_ordinal;
+} SnapshotMutationSourceToken;
+
+typedef struct SnapshotMutationBaselineEntry {
+    SnapshotMutationSourceToken token;
+    SnapshotMutationLane lane;
+    SnapshotMutationSourceKind source_kind;
+    uint64_t access_id;
+    uintptr_t pc;
+    target_ulong addr;
+    uint32_t size;
+    bool eligible;
+    bool typed_eligible;
+    bool protected_addr;
+    bool target_ref_valid;
+    int64_t expr_index;
+    int64_t query_index;
+    uint8_t planner_bytes[sizeof(target_ulong)];
+    OspreyRuntimeChunkRef cell;
+    OspreyRuntimeAddressRef target_ref;
+} SnapshotMutationBaselineEntry;
+
+typedef struct SnapshotMutationBaseline {
+    uint64_t run_epoch;
+    uint32_t entry_count;
+    bool counts_valid;
+    int64_t query_start;
+    int64_t query_end;
+    int64_t expr_start;
+    int64_t expr_end;
+    SnapshotMutationBaselineEntry *entries;
+} SnapshotMutationBaseline;
+
+typedef enum SnapshotMutationSeedSemantics {
+    SNAPSHOT_MUTATION_SEED_SNAPSHOT_STATE = 0,
+    SNAPSHOT_MUTATION_SEED_OBSERVED_READ = 1,
+} SnapshotMutationSeedSemantics;
+
+typedef struct SnapshotMutationProposalWrite {
+    SnapshotMutationSourceToken destination;
+    SnapshotMutationKind kind;
+    uint32_t size;
+    uint8_t value[sizeof(target_ulong)];
+    uint64_t target_extent;
+    const uint8_t *target_bytes;
+    uint64_t resolved_raw;
+    uint64_t resolved_end;
+} SnapshotMutationProposalWrite;
+
+typedef struct SnapshotMutationProposalVariant {
+    uint32_t variant_id;
+    uint32_t write_count;
+    SnapshotMutationProposalWrite *writes;
+} SnapshotMutationProposalVariant;
+
+typedef struct SnapshotMutationProposalFamily {
+    uint32_t advisor_id;
+    uint32_t advisor_priority;
+    uint64_t family_id;
+    SnapshotMutationSourceToken primary_seed;
+    SnapshotMutationSeedSemantics seed_semantics;
+    uint32_t variant_count;
+    SnapshotMutationProposalVariant *variants;
+} SnapshotMutationProposalFamily;
+
+typedef struct SnapshotMutationCoordinator {
+    const SnapshotMutationBaseline *baseline;
+    GPtrArray *families; /* owns accepted family copies */
+    GPtrArray *staged;   /* owns SnapshotMutationPlan values */
+} SnapshotMutationCoordinator;
+
+typedef struct SnapshotMutationProposalSink {
+    SnapshotMutationCoordinator *coordinator;
+    uint32_t advisor_id;
+    uint32_t advisor_priority;
+} SnapshotMutationProposalSink;
 
 typedef struct ModificationManager {
-    GQueue *modifications; // Queue<Modification *>
-    Modification *current;
+    GQueue *modifications; // Queue<SnapshotMutationPlan *>
+    SnapshotMutationPlan *current;
 } ModificationManager;
 
 /* Focused Stage-7 allocation-failure hook.  The production default is
@@ -218,7 +311,7 @@ static void *snapshot_mutation_try_malloc0(size_t size)
     return g_try_malloc0(size);
 }
 
-static void snapshot_mutation_free(Modification *mod)
+static void snapshot_mutation_free(SnapshotMutationPlan *mod)
 {
     if (mod == NULL) {
         return;
@@ -232,8 +325,8 @@ static void snapshot_mutation_free(Modification *mod)
     g_free(mod);
 }
 
-static void snapshot_mutation_free_batch(Modification **mods,
-                                         uint32_t count)
+static void snapshot_mutation_free_batch(SnapshotMutationPlan **mods,
+                                         size_t count)
 {
     if (mods == NULL) {
         return;
@@ -249,6 +342,7 @@ typedef struct PrimitiveAccess {
     uintptr_t addr;
     uintptr_t pc;
     uint64_t access_id;
+    uint64_t run_epoch;
     Expr *expr;
     /* Stage 7.1: fixed-layout runtime locator.  valid == 0 when the
      * canonical identity was not capturable; the record then stays
@@ -261,6 +355,7 @@ typedef struct PointerAccess {
     uintptr_t target;
     uintptr_t pc;
     uint64_t access_id;
+    uint64_t run_epoch;
     Expr *expr;
     /* Stage 7.1: locator for the pointer cell and, when the loaded
      * target is a valid non-zero address, for the target address
@@ -270,6 +365,9 @@ typedef struct PointerAccess {
 } PointerAccess;
 
 typedef struct SharedTraceData {
+    /* Parent publishes this before each baseline child.  Every retained
+     * access copies it, making stale records locally rejectable. */
+    uint64_t run_epoch;
     uint32_t prim_idx;
     uint32_t ptr_idx;
     uint64_t prim_access_cnt;
@@ -343,6 +441,10 @@ static ModificationManager *mod_manager = NULL;
  * exhausted the manager is destroyed, but analysis must not restart and trace
  * collection must stay disabled. */
 static bool mutation_analysis_started = false;
+static uint64_t next_snapshot_mutation_epoch = 0;
+static int64_t snapshot_mutation_query_start = -1;
+static int64_t snapshot_mutation_expr_start = -1;
+static SnapshotMutationBaseline *snapshot_mutation_baseline = NULL;
 static SnapshotExitInfo original_exit_info;
 
 static BinradarManager *binradar_manager = NULL;
@@ -1204,6 +1306,7 @@ static void add_read_access_pointer(CPUArchState *env, uintptr_t addr,
     ptr->target = target;
     ptr->pc = pc;
     ptr->access_id = __atomic_fetch_add(&shared_trace_data->ptr_access_cnt, 1, __ATOMIC_RELAXED);
+    ptr->run_epoch = shared_trace_data->run_epoch;
     ptr->expr = NULL;
     /* Stage 7.1: refresh locators on every write so a replaced record
      * never carries a stale identity.  Capture failure leaves the
@@ -1258,6 +1361,7 @@ static void add_read_access_primitive(CPUArchState *env, uintptr_t addr,
     prim->size = size;
     prim->pc = pc;
     prim->access_id = __atomic_fetch_add(&shared_trace_data->prim_access_cnt, 1, __ATOMIC_RELAXED);
+    prim->run_epoch = shared_trace_data->run_epoch;
     prim->expr = NULL;
     /* Stage 7.1: refresh the cell locator (see add_read_access_pointer). */
     memset(&prim->cell, 0, sizeof(prim->cell));
@@ -2876,15 +2980,31 @@ static void snapshot_test_observe_write(const SnapshotMutationWrite *write,
     close(fd);
 }
 
-static Modification *snapshot_mutation_new(const MutationCandidate *candidate,
-                                             SnapshotMutationKind kind,
-                                             const uint8_t *value,
-                                             uint32_t size,
-                                             uint64_t target_extent,
-                                             const uint8_t *target_bytes)
+static int64_t snapshot_expr_index_from_ptr(const Expr *expr)
 {
-    if (candidate == NULL || size == 0 ||
-        size > sizeof(((SnapshotMutationWrite *)0)->value)) {
+    uintptr_t base;
+    uintptr_t end;
+    uintptr_t value;
+
+    if (expr == NULL || pool == NULL || next_free_expr == NULL) {
+        return -1;
+    }
+    base = (uintptr_t)pool;
+    end = (uintptr_t)next_free_expr;
+    value = (uintptr_t)expr;
+    if (value < base || value >= end ||
+        ((value - base) % sizeof(Expr)) != 0) {
+        return -1;
+    }
+    return (int64_t)((value - base) / sizeof(Expr));
+}
+
+static SnapshotMutationPlan *snapshot_mutation_new_descriptor(
+    target_ulong addr, uint32_t size, int64_t expr_index,
+    int64_t query_index, SnapshotMutationKind kind, const uint8_t *value,
+    uint64_t target_extent, const uint8_t *target_bytes)
+{
+    if (size == 0 || size > sizeof(((SnapshotMutationWrite *)0)->value)) {
         return NULL;
     }
     switch (kind) {
@@ -2896,8 +3016,7 @@ static Modification *snapshot_mutation_new(const MutationCandidate *candidate,
     default:
         return NULL;
     }
-    if (candidate->addr < SNAPSHOT_PAGE_SIZE &&
-        candidate->addr >= CPU_NB_REGS) {
+    if (addr < SNAPSHOT_PAGE_SIZE && addr >= CPU_NB_REGS) {
         return NULL;
     }
     if (kind != SNAPSHOT_MUTATION_BYTES && size != sizeof(target_ulong)) {
@@ -2912,25 +3031,24 @@ static Modification *snapshot_mutation_new(const MutationCandidate *candidate,
         return NULL;
     }
 
-    Modification *mod = snapshot_mutation_try_malloc0(sizeof(*mod));
-    if (mod == NULL) {
+    SnapshotMutationPlan *plan = snapshot_mutation_try_malloc0(sizeof(*plan));
+    if (plan == NULL) {
         return NULL;
     }
-    mod->num_mods = 1;
-    mod->mods = snapshot_mutation_try_malloc0(sizeof(*mod->mods));
-    if (mod->mods == NULL) {
-        snapshot_mutation_free(mod);
+    plan->num_mods = 1;
+    plan->mods = snapshot_mutation_try_malloc0(sizeof(*plan->mods));
+    if (plan->mods == NULL) {
+        snapshot_mutation_free(plan);
         return NULL;
     }
 
-    SnapshotMutationWrite *write = &mod->mods[0];
+    SnapshotMutationWrite *write = &plan->mods[0];
     write->kind = kind;
-    write->addr = candidate->addr;
+    write->addr = addr;
     write->size = size;
-    write->expr = candidate->expr;
-    if (value == NULL) {
-        memcpy(write->value, candidate->value, sizeof(write->value));
-    } else {
+    write->expr_index = expr_index;
+    write->query_index = query_index;
+    if (value != NULL) {
         memcpy(write->value, value, sizeof(write->value));
     }
 
@@ -2939,65 +3057,412 @@ static Modification *snapshot_mutation_new(const MutationCandidate *candidate,
         write->target.bytes = snapshot_mutation_try_malloc(
             (size_t)target_extent);
         if (write->target.bytes == NULL) {
-            snapshot_mutation_free(mod);
+            snapshot_mutation_free(plan);
             return NULL;
         }
         memcpy(write->target.bytes, target_bytes, (size_t)target_extent);
     }
-    return mod;
+    return plan;
 }
 
-static bool snapshot_mutation_enqueue_batch(GQueue *queue,
-                                             Modification **mods,
-                                             uint32_t count)
+static SnapshotMutationPlan *snapshot_mutation_new(
+    const MutationCandidate *candidate, SnapshotMutationKind kind,
+    const uint8_t *value, uint32_t size, uint64_t target_extent,
+    const uint8_t *target_bytes)
 {
-    if (queue == NULL || mods == NULL || count == 0 ||
-        count > MUTATION_MAX_ITEMS) {
-        snapshot_mutation_free_batch(mods, count);
+    if (candidate == NULL) {
+        return NULL;
+    }
+    const uint8_t *source_value = value != NULL ? value : candidate->value;
+    return snapshot_mutation_new_descriptor(
+        (target_ulong)candidate->addr, size,
+        snapshot_expr_index_from_ptr(candidate->expr), -1, kind,
+        source_value, target_extent, target_bytes);
+}
+
+static bool snapshot_mutation_enqueue_plan_array(
+    GQueue *queue, SnapshotMutationPlan **plans, size_t count)
+{
+    if (queue == NULL || plans == NULL || count == 0 ||
+        count > SIZE_MAX / sizeof(GList *)) {
+        snapshot_mutation_free_batch(plans, count);
         return false;
     }
 
-    GList **links = snapshot_mutation_try_malloc0(
-        (size_t)count * sizeof(GList *));
+    GList **links = snapshot_mutation_try_malloc0(count * sizeof(*links));
     if (links == NULL) {
-        snapshot_mutation_free_batch(mods, count);
+        snapshot_mutation_free_batch(plans, count);
         return false;
     }
-
-    for (uint32_t i = 0; i < count; i++) {
-        if (mods[i] == NULL) {
-            for (uint32_t j = 0; j < i; j++) {
-                g_free(links[j]);
-            }
+    for (size_t i = 0; i < count; i++) {
+        if (plans[i] == NULL) {
+            for (size_t j = 0; j < i; j++) g_free(links[j]);
             g_free(links);
-            snapshot_mutation_free_batch(mods, count);
+            snapshot_mutation_free_batch(plans, count);
             return false;
         }
         links[i] = snapshot_mutation_try_malloc0(sizeof(GList));
         if (links[i] == NULL) {
-            for (uint32_t j = 0; j < i; j++) {
-                g_free(links[j]);
-            }
+            for (size_t j = 0; j < i; j++) g_free(links[j]);
             g_free(links);
-            snapshot_mutation_free_batch(mods, count);
+            snapshot_mutation_free_batch(plans, count);
             return false;
         }
-        links[i]->data = mods[i];
+        links[i]->data = plans[i];
     }
 
-    /* Every allocation is complete before the first queue mutation. */
-    for (uint32_t i = 0; i < count; i++) {
+    /* All links and plan ownership are complete before queue mutation. */
+    for (size_t i = 0; i < count; i++) {
         g_queue_push_tail_link(queue, links[i]);
-        mods[i] = NULL; /* ownership transferred to the queue */
+        plans[i] = NULL;
     }
     g_free(links);
     return true;
 }
 
-static bool snapshot_mutation_enqueue_one(GQueue *queue, Modification *mod)
+static bool snapshot_mutation_enqueue_batch(GQueue *queue,
+                                             SnapshotMutationPlan **plans,
+                                             uint32_t count)
 {
-    Modification *batch[] = {mod};
+    return snapshot_mutation_enqueue_plan_array(queue, plans, count);
+}
+
+static bool snapshot_mutation_enqueue_one(GQueue *queue,
+                                           SnapshotMutationPlan *plan)
+{
+    SnapshotMutationPlan *batch[] = {plan};
     return snapshot_mutation_enqueue_batch(queue, batch, 1);
+}
+
+#define SNAPSHOT_MUTATION_MAX_SPECIALIZED_FAMILIES 4096u
+#define SNAPSHOT_MUTATION_MAX_SPECIALIZED_VARIANTS 64u
+#define SNAPSHOT_MUTATION_MAX_SPECIALIZED_WRITES 64u
+
+static bool snapshot_mutation_token_equal(
+    SnapshotMutationSourceToken a, SnapshotMutationSourceToken b)
+{
+    return a.run_epoch == b.run_epoch &&
+           a.source_ordinal == b.source_ordinal;
+}
+
+static const SnapshotMutationBaselineEntry *snapshot_mutation_lookup_entry(
+    const SnapshotMutationBaseline *baseline,
+    SnapshotMutationSourceToken token)
+{
+    const SnapshotMutationBaselineEntry *entry;
+
+    if (baseline == NULL || baseline->entries == NULL ||
+        token.run_epoch != baseline->run_epoch ||
+        token.source_ordinal >= baseline->entry_count) {
+        return NULL;
+    }
+    entry = &baseline->entries[token.source_ordinal];
+    return snapshot_mutation_token_equal(entry->token, token) ? entry : NULL;
+}
+
+static void snapshot_mutation_proposal_family_free(gpointer data)
+{
+    SnapshotMutationProposalFamily *family = data;
+    if (family == NULL) return;
+    if (family->variants != NULL) {
+        for (uint32_t vi = 0; vi < family->variant_count; vi++) {
+            SnapshotMutationProposalVariant *variant = &family->variants[vi];
+            if (variant->writes != NULL) {
+                for (uint32_t wi = 0; wi < variant->write_count; wi++) {
+                    g_free((void *)variant->writes[wi].target_bytes);
+                }
+                g_free(variant->writes);
+            }
+        }
+        g_free(family->variants);
+    }
+    g_free(family);
+}
+
+static bool snapshot_mutation_memory_interval(
+    const SnapshotMutationBaselineEntry *entry, uint32_t size,
+    uint64_t *end_out)
+{
+    uint64_t end;
+    if (entry == NULL || size == 0 || entry->addr < SNAPSHOT_PAGE_SIZE) {
+        return false;
+    }
+    if ((uint64_t)entry->addr > UINT64_MAX - size) return false;
+    end = (uint64_t)entry->addr + size;
+    if (end <= (uint64_t)entry->addr) return false;
+    if (end_out != NULL) *end_out = end;
+    return true;
+}
+
+static bool snapshot_mutation_proposal_validate(
+    const SnapshotMutationCoordinator *coordinator,
+    const SnapshotMutationProposalFamily *family)
+{
+    const SnapshotMutationBaselineEntry *primary;
+
+    if (coordinator == NULL || coordinator->baseline == NULL ||
+        family == NULL || family->advisor_id == 0 ||
+        family->variants == NULL || family->variant_count == 0 ||
+        family->variant_count > SNAPSHOT_MUTATION_MAX_SPECIALIZED_VARIANTS ||
+        family->seed_semantics != SNAPSHOT_MUTATION_SEED_SNAPSHOT_STATE) {
+        return false;
+    }
+    primary = snapshot_mutation_lookup_entry(coordinator->baseline,
+                                             family->primary_seed);
+    if (primary == NULL || !primary->typed_eligible || primary->protected_addr) {
+        return false;
+    }
+
+    for (uint32_t vi = 0; vi < family->variant_count; vi++) {
+        const SnapshotMutationProposalVariant *variant = &family->variants[vi];
+        uint32_t primary_count = 0;
+        if (variant->writes == NULL || variant->write_count == 0 ||
+            variant->write_count > SNAPSHOT_MUTATION_MAX_SPECIALIZED_WRITES) {
+            return false;
+        }
+        for (uint32_t prior_vi = 0; prior_vi < vi; prior_vi++) {
+            if (family->variants[prior_vi].variant_id == variant->variant_id) {
+                return false;
+            }
+        }
+        for (uint32_t wi = 0; wi < variant->write_count; wi++) {
+            const SnapshotMutationProposalWrite *write = &variant->writes[wi];
+            const SnapshotMutationBaselineEntry *entry =
+                snapshot_mutation_lookup_entry(coordinator->baseline,
+                                               write->destination);
+            uint64_t begin_a = 0, end_a = 0;
+            if (entry == NULL || !entry->typed_eligible || entry->protected_addr ||
+                write->size == 0 ||
+                write->size > sizeof(write->value) ||
+                (entry->addr >= SNAPSHOT_PAGE_SIZE &&
+                 !snapshot_mutation_memory_interval(entry, write->size,
+                                                    &end_a))) {
+                return false;
+            }
+            if (wi > 0 &&
+                variant->writes[wi - 1].destination.source_ordinal >=
+                    write->destination.source_ordinal) {
+                return false;
+            }
+            if (snapshot_mutation_token_equal(write->destination,
+                                              family->primary_seed)) {
+                primary_count++;
+                if (write->size != primary->size) return false;
+                if (write->kind != SNAPSHOT_MUTATION_POINTER_FRESH &&
+                    memcmp(write->value, primary->planner_bytes,
+                           write->size) == 0) {
+                    return false;
+                }
+                if (write->kind == SNAPSHOT_MUTATION_POINTER_FRESH) {
+                    for (uint32_t bi = 0; bi < primary->size; bi++) {
+                        if (primary->planner_bytes[bi] != 0) return false;
+                    }
+                }
+            }
+            switch (write->kind) {
+            case SNAPSHOT_MUTATION_BYTES:
+                if (write->target_extent != 0 || write->target_bytes != NULL ||
+                    memcmp(write->value, entry->planner_bytes,
+                           write->size) == 0) {
+                    return false;
+                }
+                break;
+            case SNAPSHOT_MUTATION_POINTER_NULL:
+            case SNAPSHOT_MUTATION_POINTER_OOB:
+                if (entry->size != sizeof(target_ulong) ||
+                    write->size != sizeof(target_ulong) ||
+                    write->target_extent != 0 || write->target_bytes != NULL ||
+                    memcmp(write->value, entry->planner_bytes,
+                           write->size) == 0) {
+                    return false;
+                }
+                break;
+            case SNAPSHOT_MUTATION_POINTER_FRESH:
+                if (entry->size != sizeof(target_ulong) ||
+                    write->size != sizeof(target_ulong) ||
+                    write->target_extent == 0 ||
+                    write->target_extent > SNAPSHOT_PAGE_SIZE ||
+                    write->target_bytes == NULL) {
+                    return false;
+                }
+                break;
+            default:
+                return false;
+            }
+            if (entry->addr < SNAPSHOT_PAGE_SIZE) {
+                if (entry->addr >= CPU_NB_REGS) return false;
+                for (uint32_t other = 0; other < wi; other++) {
+                    const SnapshotMutationProposalWrite *previous =
+                        &variant->writes[other];
+                    const SnapshotMutationBaselineEntry *previous_entry =
+                        snapshot_mutation_lookup_entry(
+                            coordinator->baseline, previous->destination);
+                    if (previous_entry != NULL &&
+                        previous_entry->addr == entry->addr) {
+                        return false;
+                    }
+                }
+            } else {
+                for (uint32_t other = 0; other < wi; other++) {
+                    const SnapshotMutationProposalWrite *previous =
+                        &variant->writes[other];
+                    const SnapshotMutationBaselineEntry *previous_entry =
+                        snapshot_mutation_lookup_entry(
+                            coordinator->baseline, previous->destination);
+                    uint64_t begin_b, end_b;
+                    if (previous_entry == NULL ||
+                        previous_entry->addr < SNAPSHOT_PAGE_SIZE ||
+                        !snapshot_mutation_memory_interval(previous_entry,
+                                                          previous->size,
+                                                          &end_b)) {
+                        continue;
+                    }
+                    begin_a = (uint64_t)entry->addr;
+                    begin_b = (uint64_t)previous_entry->addr;
+                    if (begin_a < end_b && begin_b < end_a) return false;
+                }
+            }
+        }
+        if (primary_count != 1) return false;
+    }
+    return true;
+}
+
+static SnapshotMutationProposalFamily *snapshot_mutation_proposal_copy(
+    const SnapshotMutationProposalFamily *source)
+{
+    SnapshotMutationProposalFamily *copy;
+
+    if (source == NULL) return NULL;
+    copy = snapshot_mutation_try_malloc0(sizeof(*copy));
+    if (copy == NULL) return NULL;
+    *copy = *source;
+    copy->variants = snapshot_mutation_try_malloc0(
+        (size_t)source->variant_count * sizeof(*copy->variants));
+    if (copy->variants == NULL) {
+        snapshot_mutation_proposal_family_free(copy);
+        return NULL;
+    }
+    for (uint32_t vi = 0; vi < source->variant_count; vi++) {
+        const SnapshotMutationProposalVariant *src = &source->variants[vi];
+        SnapshotMutationProposalVariant *dst = &copy->variants[vi];
+        *dst = *src;
+        dst->writes = snapshot_mutation_try_malloc0(
+            (size_t)src->write_count * sizeof(*dst->writes));
+        if (dst->writes == NULL) {
+            snapshot_mutation_proposal_family_free(copy);
+            return NULL;
+        }
+        for (uint32_t wi = 0; wi < src->write_count; wi++) {
+            const SnapshotMutationProposalWrite *src_write = &src->writes[wi];
+            SnapshotMutationProposalWrite *dst_write = &dst->writes[wi];
+            *dst_write = *src_write;
+            dst_write->target_bytes = NULL;
+            if (src_write->kind == SNAPSHOT_MUTATION_POINTER_FRESH) {
+                if (src_write->target_bytes == NULL ||
+                    src_write->target_extent == 0 ||
+                    src_write->target_extent > SIZE_MAX) {
+                    snapshot_mutation_proposal_family_free(copy);
+                    return NULL;
+                }
+                uint8_t *payload = snapshot_mutation_try_malloc(
+                    (size_t)src_write->target_extent);
+                if (payload == NULL) {
+                    snapshot_mutation_proposal_family_free(copy);
+                    return NULL;
+                }
+                memcpy(payload, src_write->target_bytes,
+                       (size_t)src_write->target_extent);
+                dst_write->target_bytes = payload;
+            }
+        }
+    }
+    return copy;
+}
+
+static bool snapshot_mutation_proposal_same_descriptor(
+    const SnapshotMutationProposalFamily *a,
+    const SnapshotMutationProposalFamily *b)
+{
+    if (a == NULL || b == NULL || a->advisor_id != b->advisor_id ||
+        a->family_id != b->family_id ||
+        !snapshot_mutation_token_equal(a->primary_seed, b->primary_seed) ||
+        a->seed_semantics != b->seed_semantics ||
+        a->variant_count != b->variant_count) {
+        return false;
+    }
+    for (uint32_t vi = 0; vi < a->variant_count; vi++) {
+        const SnapshotMutationProposalVariant *av = &a->variants[vi];
+        const SnapshotMutationProposalVariant *bv = &b->variants[vi];
+        if (av->variant_id != bv->variant_id ||
+            av->write_count != bv->write_count) return false;
+        for (uint32_t wi = 0; wi < av->write_count; wi++) {
+            const SnapshotMutationProposalWrite *aw = &av->writes[wi];
+            const SnapshotMutationProposalWrite *bw = &bv->writes[wi];
+            if (!snapshot_mutation_token_equal(aw->destination,
+                                               bw->destination) ||
+                aw->kind != bw->kind || aw->size != bw->size ||
+                memcmp(aw->value, bw->value, sizeof(aw->value)) != 0 ||
+                aw->target_extent != bw->target_extent ||
+                aw->resolved_raw != bw->resolved_raw ||
+                aw->resolved_end != bw->resolved_end) return false;
+            if (aw->target_extent != 0 &&
+                (aw->target_bytes == NULL || bw->target_bytes == NULL ||
+                 memcmp(aw->target_bytes, bw->target_bytes,
+                        (size_t)aw->target_extent) != 0)) return false;
+        }
+    }
+    return true;
+}
+
+static bool snapshot_mutation_sink_submit(
+    SnapshotMutationProposalSink *sink,
+    const SnapshotMutationProposalFamily *family)
+{
+    SnapshotMutationProposalFamily *copy;
+    if (sink == NULL || sink->coordinator == NULL || family == NULL ||
+        family->advisor_id != sink->advisor_id ||
+        family->advisor_priority != sink->advisor_priority ||
+        sink->coordinator->families == NULL ||
+        sink->coordinator->families->len >=
+            SNAPSHOT_MUTATION_MAX_SPECIALIZED_FAMILIES ||
+        !snapshot_mutation_proposal_validate(sink->coordinator, family)) {
+        return false;
+    }
+    for (guint i = 0; i < sink->coordinator->families->len; i++) {
+        SnapshotMutationProposalFamily *existing =
+            g_ptr_array_index(sink->coordinator->families, i);
+        if (snapshot_mutation_proposal_same_descriptor(existing, family)) {
+            return true;
+        }
+    }
+    copy = snapshot_mutation_proposal_copy(family);
+    if (copy == NULL) return false;
+    g_ptr_array_add(sink->coordinator->families, copy);
+    return true;
+}
+
+static void snapshot_mutation_baseline_free(
+    SnapshotMutationBaseline *baseline)
+{
+    if (baseline == NULL) return;
+    g_free(baseline->entries);
+    g_free(baseline);
+}
+
+static void snapshot_mutation_coordinator_clear(
+    SnapshotMutationCoordinator *coordinator)
+{
+    if (coordinator == NULL) return;
+    if (coordinator->families != NULL) {
+        g_ptr_array_free(coordinator->families, TRUE);
+        coordinator->families = NULL;
+    }
+    if (coordinator->staged != NULL) {
+        g_ptr_array_free(coordinator->staged, TRUE);
+        coordinator->staged = NULL;
+    }
+    coordinator->baseline = NULL;
 }
 
 /* Modify guest program's state based on mod_manager. */
@@ -3026,99 +3491,223 @@ static void snapshot_modification_manager_free(ModificationManager *manager)
     g_free(manager);
 }
 
+static void snapshot_mutation_history_free(void)
+{
+    GHashTable *value_tables[] = {
+        g_read_access_tainted_primitives_all,
+        g_read_access_pointers_all,
+    };
+    GHashTable *alias_tables[] = {
+        g_read_access_tainted_primitives_original,
+        g_read_access_pointers_original,
+    };
+    for (size_t ti = 0; ti < G_N_ELEMENTS(value_tables); ti++) {
+        GHashTable *table = value_tables[ti];
+        if (table != NULL) {
+            GHashTableIter iter;
+            gpointer key, value;
+            g_hash_table_iter_init(&iter, table);
+            while (g_hash_table_iter_next(&iter, &key, &value)) {
+                g_free(value);
+            }
+            g_hash_table_destroy(table);
+        }
+        if (ti == 0) g_read_access_tainted_primitives_all = NULL;
+        if (ti == 1) g_read_access_pointers_all = NULL;
+    }
+    if (alias_tables[0] != NULL) {
+        g_hash_table_destroy(alias_tables[0]);
+        g_read_access_tainted_primitives_original = NULL;
+    }
+    if (alias_tables[1] != NULL) {
+        g_hash_table_destroy(alias_tables[1]);
+        g_read_access_pointers_original = NULL;
+    }
+}
+
 static void snapshot_modification_manager_reset(bool analysis_started)
 {
     snapshot_modification_manager_free(mod_manager);
     mod_manager = NULL;
+    snapshot_mutation_baseline_free(snapshot_mutation_baseline);
+    snapshot_mutation_baseline = NULL;
+    snapshot_mutation_history_free();
     mutation_analysis_started = analysis_started;
 }
 
 
-// Called after fork to keep clean initial state.
+static bool snapshot_mutation_writable_span(target_ulong addr,
+                                             uint32_t size)
+{
+    uint64_t end;
+    target_ulong page;
+
+    if (addr < SNAPSHOT_PAGE_SIZE || size == 0 ||
+        (uint64_t)addr > UINT64_MAX - size) return false;
+    end = (uint64_t)addr + size;
+    if (end <= (uint64_t)addr) return false;
+    page = addr & SNAPSHOT_PAGE_MASK;
+    for (;;) {
+        if (!is_valid_address(page, true)) return false;
+        if ((uint64_t)page + SNAPSHOT_PAGE_SIZE >= end) break;
+        if (page > UINT64_MAX - SNAPSHOT_PAGE_SIZE) return false;
+        page += SNAPSHOT_PAGE_SIZE;
+    }
+    return true;
+}
+
+typedef struct SnapshotMutationChildWrite {
+    SnapshotMutationWrite local;
+    target_ulong before_value;
+    target_ulong fresh_target;
+} SnapshotMutationChildWrite;
+
+/* Called after fork to keep clean initial state.  All destination and target
+ * checks happen before a register or cell is published.  Fresh mappings may
+ * exist in a child that is about to terminate, but no partially applied plan
+ * can resume guest execution. */
 static void snapshot_modify_memory(CPUArchState *cpu_env)
 {
+    SnapshotMutationPlan *plan;
+    SnapshotMutationChildWrite *writes;
+
     if (mod_manager == NULL) {
         /* Initial run: no modification. */
         return;
     }
-    Modification *mod = mod_manager->current;
-    if (mod == NULL) {
-        log_msg("ERROR: empty modification\n");
+    plan = mod_manager->current;
+    if (plan == NULL || plan->mods == NULL || plan->num_mods == 0) {
+        log_msg("ERROR: empty mutation plan\n");
+        exit_with_status(1);
+    }
+    writes = g_try_malloc0((size_t)plan->num_mods * sizeof(*writes));
+    if (writes == NULL) {
+        log_msg("[mod] [apply-error] child write staging allocation failed\n");
         exit_with_status(1);
     }
 
-    for (uint32_t i = 0; i < mod->num_mods; i++) {
-        const SnapshotMutationWrite *write = &mod->mods[i];
-        SnapshotMutationWrite local = *write;
-        target_ulong applied_fresh_target = 0;
-        target_ulong before_value = 0;
-
-        if (write->size > 0 && write->size <= sizeof(write->value)) {
-            if (write->addr < CPU_NB_REGS) {
-                before_value = cpu_env->regs[(size_t)write->addr];
-            } else if (write->addr >= SNAPSHOT_PAGE_SIZE) {
-                memcpy(&before_value, g2h(write->addr), write->size);
-            }
-        }
+    /* Phase 1: validate every write and the complete destination tuple. */
+    for (uint32_t i = 0; i < plan->num_mods; i++) {
+        const SnapshotMutationWrite *write = &plan->mods[i];
+        SnapshotMutationChildWrite *prepared = &writes[i];
         if (write->kind != SNAPSHOT_MUTATION_BYTES &&
             write->kind != SNAPSHOT_MUTATION_POINTER_NULL &&
             write->kind != SNAPSHOT_MUTATION_POINTER_OOB &&
             write->kind != SNAPSHOT_MUTATION_POINTER_FRESH) {
-            log_msg("ERROR: invalid mutation kind\n");
+            log_msg("[mod] [apply-error] invalid mutation kind\n");
+            g_free(writes);
+            exit_with_status(1);
+        }
+        if (write->size == 0 || write->size > sizeof(write->value) ||
+            (write->kind != SNAPSHOT_MUTATION_BYTES &&
+             write->size != sizeof(target_ulong))) {
+            log_msg("[mod] [apply-error] invalid mutation width\n");
+            g_free(writes);
             exit_with_status(1);
         }
         if (write->kind == SNAPSHOT_MUTATION_POINTER_FRESH) {
-            target_ulong target = snapshot_alloc_pointer_target(
-                cpu_env, write->target.extent);
-            if (target == (target_ulong)-1 ||
-                !snapshot_apply_fresh_target(cpu_env, target,
-                                             write->target.bytes,
-                                             write->target.extent)) {
-                snapshot_test_observe_write(write, 0, before_value, false);
-                log_msg("[mod-pointer] [apply-error] fresh target failed\n");
+            if (write->target.extent == 0 ||
+                write->target.extent > SNAPSHOT_PAGE_SIZE ||
+                write->target.bytes == NULL) {
+                log_msg("[mod] [apply-error] invalid fresh target\n");
+                g_free(writes);
                 exit_with_status(1);
             }
-            /* The target is fully initialized and its metadata is published
-             * before the child-local pointer cell is changed. */
-            applied_fresh_target = target;
-            memcpy(local.value, &target, sizeof(target));
-        }
-
-        if (local.size == 0 ||
-            local.size > sizeof(local.value)) {
-            log_msg("ERROR: invalid mutation width\n");
+        } else if (write->target.extent != 0 ||
+                   write->target.bytes != NULL) {
+            log_msg("[mod] [apply-error] inactive target is populated\n");
+            g_free(writes);
             exit_with_status(1);
         }
-        if (local.addr < SNAPSHOT_PAGE_SIZE) {
-            if (local.addr >= CPU_NB_REGS) {
-                log_msg("ERROR: invalid mutation register\n");
+        if (write->addr < SNAPSHOT_PAGE_SIZE) {
+            if (write->addr >= CPU_NB_REGS) {
+                log_msg("[mod] [apply-error] invalid mutation register\n");
+                g_free(writes);
                 exit_with_status(1);
             }
-            /* Register writes use a child-local value copy. */
-            target_ulong reg_value = 0;
-            memcpy(&reg_value, local.value, sizeof(reg_value));
-            cpu_env->regs[(size_t)local.addr] = reg_value;
-            sem_reg_overwrite(cpu_env, (int)local.addr, SEM_OP_SNAPSHOT);
-            log_msg("[mod-reg] [register %ld] [size %ld] [total %d]\n",
-                    local.addr, local.size,
-                    g_queue_get_length(mod_manager->modifications));
-            snapshot_test_observe_write(&local, applied_fresh_target,
-                                        before_value, true);
-            continue;
+            for (uint32_t prior = 0; prior < i; prior++) {
+                if (writes[prior].local.addr == write->addr &&
+                    writes[prior].local.addr < SNAPSHOT_PAGE_SIZE) {
+                    log_msg("[mod] [apply-error] duplicate register\n");
+                    g_free(writes);
+                    exit_with_status(1);
+                }
+            }
+        } else if (!snapshot_mutation_writable_span(write->addr,
+                                                    write->size)) {
+            log_msg("[mod] [apply-error] unwritable destination\n");
+            g_free(writes);
+            exit_with_status(1);
         }
-
-        void *target_addr_h = g2h(local.addr);
-        memcpy(target_addr_h, local.value, local.size);
-        /* Provenance: memory overwritten by modification → kill stale
-         * shadow entries before the guest resumes. */
-        sem_mem_overwrite(cpu_env, local.addr, local.size,
-                          SEM_OP_SNAPSHOT);
-        log_msg("[mod] [addr %lx] [size %ld] [total %d]\n",
-                local.addr, local.size,
-                g_queue_get_length(mod_manager->modifications));
-        snapshot_test_observe_write(&local, applied_fresh_target,
-                                        before_value, true);
+        for (uint32_t prior = 0; prior < i; prior++) {
+            const SnapshotMutationWrite *previous = &writes[prior].local;
+            uint64_t previous_end;
+            uint64_t current_end;
+            if (previous->addr < SNAPSHOT_PAGE_SIZE ||
+                write->addr < SNAPSHOT_PAGE_SIZE) continue;
+            previous_end = (uint64_t)previous->addr + previous->size;
+            current_end = (uint64_t)write->addr + write->size;
+            if ((uint64_t)write->addr < previous_end &&
+                (uint64_t)previous->addr < current_end) {
+                log_msg("[mod] [apply-error] overlapping destinations\n");
+                g_free(writes);
+                exit_with_status(1);
+            }
+        }
+        prepared->local = *write;
+        if (write->addr < SNAPSHOT_PAGE_SIZE) {
+            prepared->before_value = cpu_env->regs[(size_t)write->addr];
+        } else {
+            memcpy(&prepared->before_value, g2h(write->addr), write->size);
+        }
     }
+
+    /* Phase 2: allocate and initialize every fresh target while all cells
+     * still have their baseline values. */
+    for (uint32_t i = 0; i < plan->num_mods; i++) {
+        SnapshotMutationChildWrite *prepared = &writes[i];
+        if (prepared->local.kind != SNAPSHOT_MUTATION_POINTER_FRESH) continue;
+        prepared->fresh_target = snapshot_alloc_pointer_target(
+            cpu_env, prepared->local.target.extent);
+        if (prepared->fresh_target == (target_ulong)-1 ||
+            !snapshot_apply_fresh_target(
+                cpu_env, prepared->fresh_target,
+                prepared->local.target.bytes,
+                prepared->local.target.extent)) {
+            snapshot_test_observe_write(&prepared->local, 0,
+                                        prepared->before_value, false);
+            log_msg("[mod-pointer] [apply-error] fresh target failed\n");
+            g_free(writes);
+            exit_with_status(1);
+        }
+        memcpy(prepared->local.value, &prepared->fresh_target,
+               sizeof(prepared->fresh_target));
+    }
+
+    /* Phase 3: publish the complete tuple in canonical plan order. */
+    for (uint32_t i = 0; i < plan->num_mods; i++) {
+        SnapshotMutationChildWrite *prepared = &writes[i];
+        SnapshotMutationWrite *write = &prepared->local;
+        if (write->addr < SNAPSHOT_PAGE_SIZE) {
+            target_ulong reg_value = 0;
+            memcpy(&reg_value, write->value, sizeof(reg_value));
+            cpu_env->regs[(size_t)write->addr] = reg_value;
+            sem_reg_overwrite(cpu_env, (int)write->addr, SEM_OP_SNAPSHOT);
+            log_msg("[mod-reg] [register %ld] [size %ld] [total %d]\n",
+                    write->addr, write->size,
+                    g_queue_get_length(mod_manager->modifications));
+        } else {
+            memcpy(g2h(write->addr), write->value, write->size);
+            sem_mem_overwrite(cpu_env, write->addr, write->size,
+                              SEM_OP_SNAPSHOT);
+            log_msg("[mod] [addr %lx] [size %ld] [total %d]\n",
+                    write->addr, write->size,
+                    g_queue_get_length(mod_manager->modifications));
+        }
+        snapshot_test_observe_write(write, prepared->fresh_target,
+                                    prepared->before_value, true);
+    }
+    g_free(writes);
 }
 
 #ifdef SNAPSHOT_DEBUG
@@ -3243,7 +3832,7 @@ static bool add_modification_primitive(GQueue *modifications,
         return false;
     }
 
-    Modification *batch[3] = {NULL, NULL, NULL};
+    SnapshotMutationPlan *batch[3] = {NULL, NULL, NULL};
     for (uint32_t i = 0; i < count; i++) {
         batch[i] = snapshot_mutation_new(source, SNAPSHOT_MUTATION_BYTES,
                                           values[i], source->size, 0, NULL);
@@ -3259,7 +3848,7 @@ static bool add_untyped_pointer_candidate(GQueue *modifications,
                                           const MutationCandidate *source)
 {
     uint8_t null_value[sizeof(target_ulong)] = {0};
-    Modification *mod = snapshot_mutation_new(
+    SnapshotMutationPlan *mod = snapshot_mutation_new(
         source, SNAPSHOT_MUTATION_POINTER_NULL, null_value, source->size,
         0, NULL);
     if (mod == NULL) {
@@ -3273,11 +3862,14 @@ typedef enum SnapshotPointerSource {
     SNAPSHOT_POINTER_FROM_ACCESS = 1,
 } SnapshotPointerSource;
 /* Resolve one baseline pointer access and enqueue its complete typed batch.
- * typed_allowed is the parent-wide Stage 7.1 record-integrity gate; a sticky
- * overflow or corrupt count disables typed planning for both record families.
- * A resolver/planning/queue failure is typed-unavailable for this access, so
- * the unchanged source candidate is sent through its original generic path.
- * The helper never exposes a partially built typed batch. */
+ * This remains a focused Stage 7 compatibility adapter; production analysis
+ * now emits the same descriptors through the coordinator sink below. */
+static bool add_pointer_typed_candidate(
+    GQueue *modifications, const MutationCandidate *source,
+    const OspreyRuntimeChunkRef *cell,
+    const OspreyRuntimeAddressRef *target_ref, bool typed_allowed,
+    SnapshotPointerSource source_kind) G_GNUC_UNUSED;
+
 static bool add_pointer_typed_candidate(
     GQueue *modifications, const MutationCandidate *source,
     const OspreyRuntimeChunkRef *cell,
@@ -3290,7 +3882,7 @@ static bool add_pointer_typed_candidate(
     uint8_t zero_value[sizeof(target_ulong)] = {0};
     target_ulong concrete_value;
     uint32_t count = 0;
-    Modification *batch[3] = {NULL, NULL, NULL};
+    SnapshotMutationPlan *batch[3] = {NULL, NULL, NULL};
 
     if (!typed_allowed || source == NULL ||
         source->size != sizeof(target_ulong) || cell == NULL ||
@@ -3387,12 +3979,124 @@ generic:
     return add_modification_primitive(modifications, source);
 }
 
-static bool binradar_manager_check_addr(target_ulong addr) {
-    if (snapshot_addr_is_protected(addr)) {
-        log_msg("[binradar] [check-addr] [addr %lx] [hit]\n", addr);
-        return true;
+static bool snapshot_mutation_legacy_emit_family(
+    const SnapshotMutationBaselineEntry *entry,
+    SnapshotMutationProposalSink *sink)
+{
+    const OspreyModel *model;
+    OspreyRuntimePointerResolution resolution;
+    OspreyRuntimeResolveStatus status;
+    SnapshotMutationProposalFamily family;
+    SnapshotMutationProposalVariant variants[3];
+    SnapshotMutationProposalWrite writes[3];
+    uint8_t fills[3][SNAPSHOT_PAGE_SIZE];
+    target_ulong concrete_value;
+    uint32_t count;
+
+    if (entry == NULL || sink == NULL || !entry->typed_eligible ||
+        (entry->source_kind != SNAPSHOT_MUTATION_SOURCE_PRIMITIVE &&
+         entry->source_kind != SNAPSHOT_MUTATION_SOURCE_POINTER) ||
+        entry->size != sizeof(target_ulong) || entry->cell.start.valid != 1 ||
+        entry->cell.size != entry->size ||
+        entry->cell.start.raw != (uint64_t)entry->addr ||
+        g_osprey_ctx == NULL || !g_osprey_ctx->config.enabled ||
+        !osprey_collect_enabled) {
+        return false;
     }
-    return false;
+    model = osprey_model(g_osprey_ctx);
+    if (model == NULL) return false;
+    memcpy(&concrete_value, entry->planner_bytes, sizeof(concrete_value));
+    status = osprey_runtime_resolve_pointer(
+        g_osprey_ctx, model, &entry->cell, concrete_value,
+        entry->target_ref_valid ? &entry->target_ref : NULL, &resolution);
+    if (getenv("BINRADAR_OSPREY_TEST_APPLIED_STATE") != NULL) {
+        log_msg("[osprey] [test-plan] [addr %lx] [value %lx] [status %d] "
+                "[extent %llu] [target-valid %u] [runtime-target %u]\n",
+                (unsigned long)entry->addr, (unsigned long)concrete_value,
+                (int)status, (unsigned long long)resolution.target_extent,
+                resolution.target_valid, resolution.has_runtime_target);
+    }
+    if (status != OSPREY_RUNTIME_RESOLVED || resolution.target_extent == 0 ||
+        resolution.target_extent > SNAPSHOT_PAGE_SIZE) {
+        return false;
+    }
+
+    memset(&family, 0, sizeof(family));
+    memset(variants, 0, sizeof(variants));
+    memset(writes, 0, sizeof(writes));
+    family.advisor_id = 1; /* first in-process advisor: OSPREY type */
+    family.advisor_priority = 0;
+    family.family_id = entry->token.source_ordinal;
+    family.primary_seed = entry->token;
+    family.seed_semantics = SNAPSHOT_MUTATION_SEED_SNAPSHOT_STATE;
+    family.variants = variants;
+    memset(fills, 0, sizeof(fills));
+
+    if (concrete_value == 0) {
+        memset(fills[1], 1, sizeof(fills[1]));
+        memset(fills[2], 0xff, sizeof(fills[2]));
+        count = 3;
+        for (uint32_t i = 0; i < count; i++) {
+            variants[i].variant_id = i;
+            variants[i].write_count = 1;
+            variants[i].writes = &writes[i];
+            writes[i].destination = entry->token;
+            writes[i].kind = SNAPSHOT_MUTATION_POINTER_FRESH;
+            writes[i].size = sizeof(target_ulong);
+            writes[i].target_extent = resolution.target_extent;
+            writes[i].target_bytes = fills[i];
+            memcpy(writes[i].value, entry->planner_bytes,
+                   sizeof(writes[i].value));
+        }
+    } else {
+        uint64_t target_raw;
+        uint64_t target_end;
+        uint64_t oob;
+        target_ulong oob_value;
+
+        if (!resolution.has_runtime_target || !resolution.target_valid ||
+            !entry->target_ref_valid) {
+            return false;
+        }
+        target_raw = resolution.target.raw;
+        if (target_raw > UINT64_MAX - resolution.target_extent) return false;
+        target_end = target_raw + resolution.target_extent;
+        if (target_end <= target_raw || target_end > UINT64_MAX - 0x10u) {
+            return false;
+        }
+        oob = target_end + 0x10u;
+        if (oob < target_end ||
+            (oob >= target_raw && oob < target_end)) return false;
+        oob_value = (target_ulong)oob;
+        if ((uint64_t)oob_value != oob) return false;
+        count = 2;
+        for (uint32_t i = 0; i < count; i++) {
+            variants[i].variant_id = i;
+            variants[i].write_count = 1;
+            variants[i].writes = &writes[i];
+            writes[i].destination = entry->token;
+            writes[i].size = sizeof(target_ulong);
+            writes[i].target_extent = 0;
+            writes[i].target_bytes = NULL;
+            writes[i].resolved_raw = target_raw;
+            writes[i].resolved_end = target_end;
+        }
+        writes[0].kind = SNAPSHOT_MUTATION_POINTER_NULL;
+        writes[1].kind = SNAPSHOT_MUTATION_POINTER_OOB;
+        memcpy(writes[1].value, &oob_value, sizeof(oob_value));
+    }
+    family.variant_count = count;
+    return snapshot_mutation_sink_submit(sink, &family);
+}
+
+static void snapshot_mutation_legacy_advisor(
+    const SnapshotMutationBaseline *baseline,
+    SnapshotMutationProposalSink *sink)
+{
+    if (baseline == NULL || sink == NULL) return;
+    for (uint32_t i = 0; i < baseline->entry_count; i++) {
+        (void)snapshot_mutation_legacy_emit_family(&baseline->entries[i], sink);
+    }
 }
 
 // In parent process, called after child execution
@@ -3421,6 +4125,387 @@ static int select_next_modification(SnapshotExitInfo *exit_info) {
     // Finished: reset shared_trace_data
     memset(shared_trace_data, 0, sizeof(SharedTraceData));
     return g_queue_get_length(mod_manager->modifications) + 1;
+}
+
+static bool snapshot_mutation_baseline_add_history(
+    uint32_t prim_count, uint32_t ptr_count)
+{
+    if (g_read_access_tainted_primitives_original == NULL) {
+        g_read_access_tainted_primitives_original =
+            g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
+        g_read_access_pointers_original =
+            g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
+        g_read_access_tainted_primitives_all =
+            g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
+        g_read_access_pointers_all =
+            g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
+    }
+    for (uint32_t i = 0; i < prim_count; i++) {
+        PrimitiveAccess *copy = g_try_malloc(sizeof(*copy));
+        if (copy == NULL) return false;
+        *copy = shared_trace_data->primitives[i];
+        g_hash_table_insert(g_read_access_tainted_primitives_original,
+                            GSIZE_TO_POINTER(copy->addr), copy);
+        g_hash_table_insert(g_read_access_tainted_primitives_all,
+                            GSIZE_TO_POINTER(copy->addr), copy);
+    }
+    for (uint32_t i = 0; i < ptr_count; i++) {
+        PointerAccess *copy = g_try_malloc(sizeof(*copy));
+        if (copy == NULL) return false;
+        *copy = shared_trace_data->pointers[i];
+        g_hash_table_insert(g_read_access_pointers_original,
+                            GSIZE_TO_POINTER(copy->addr), copy);
+        g_hash_table_insert(g_read_access_pointers_all,
+                            GSIZE_TO_POINTER(copy->addr), copy);
+    }
+    return true;
+}
+
+static void snapshot_mutation_baseline_fill_common(
+    SnapshotMutationBaselineEntry *entry, uint64_t epoch,
+    uint32_t ordinal, SnapshotMutationLane lane,
+    SnapshotMutationSourceKind source_kind, uintptr_t addr, uint32_t size,
+    uintptr_t pc, uint64_t access_id, Expr *expr)
+{
+    memset(entry, 0, sizeof(*entry));
+    entry->token.run_epoch = epoch;
+    entry->token.source_ordinal = ordinal;
+    entry->lane = lane;
+    entry->source_kind = source_kind;
+    entry->access_id = access_id;
+    entry->pc = pc;
+    entry->addr = (target_ulong)addr;
+    entry->size = size;
+    entry->eligible = true;
+    entry->typed_eligible = true;
+    entry->protected_addr = snapshot_addr_is_protected(entry->addr);
+    entry->expr_index = snapshot_expr_index_from_ptr(expr);
+    entry->query_index = -1;
+}
+
+static SnapshotMutationBaseline *snapshot_mutation_baseline_build(
+    const SnapshotExitInfo *exit_info, uint32_t prim_count,
+    uint32_t ptr_count, bool counts_valid, const ArgumentInfo *arg_info,
+    size_t num_arg_regs)
+{
+    size_t argument_count = 0;
+    size_t total;
+    uint64_t epoch;
+    SnapshotMutationBaseline *baseline;
+    uint32_t ordinal = 0;
+
+    if (shared_trace_data == NULL) return NULL;
+    for (size_t i = 0; i < num_arg_regs; i++) {
+        if (arg_info != NULL && arg_info[i].expr != NULL) argument_count++;
+    }
+    total = (size_t)prim_count + (size_t)ptr_count + argument_count;
+    if (total > UINT32_MAX || total > SIZE_MAX / sizeof(*baseline->entries)) {
+        return NULL;
+    }
+    baseline = snapshot_mutation_try_malloc0(sizeof(*baseline));
+    if (baseline == NULL) return NULL;
+    epoch = shared_trace_data->run_epoch;
+    baseline->run_epoch = epoch;
+    baseline->entry_count = (uint32_t)total;
+    baseline->counts_valid = counts_valid;
+    baseline->query_start = snapshot_mutation_query_start;
+    baseline->query_end = (exit_info != NULL &&
+                           exit_info->next_query != NULL &&
+                           query_queue != NULL)
+        ? GET_QUERY_IDX(exit_info->next_query) : -1;
+    baseline->expr_start = snapshot_mutation_expr_start;
+    baseline->expr_end = (exit_info != NULL &&
+                          exit_info->next_free_expr != NULL &&
+                          pool != NULL)
+        ? GET_EXPR_IDX(exit_info->next_free_expr) : -1;
+    if (baseline->query_start > baseline->query_end) {
+        baseline->query_start = -1;
+        baseline->query_end = -1;
+    }
+    if (baseline->expr_start > baseline->expr_end) {
+        baseline->expr_start = -1;
+        baseline->expr_end = -1;
+    }
+    if (total != 0) {
+        baseline->entries = snapshot_mutation_try_malloc0(
+            total * sizeof(*baseline->entries));
+        if (baseline->entries == NULL) {
+            snapshot_mutation_baseline_free(baseline);
+            return NULL;
+        }
+    }
+
+    if (!snapshot_mutation_baseline_add_history(prim_count, ptr_count)) {
+        snapshot_mutation_baseline_free(baseline);
+        snapshot_mutation_history_free();
+        return NULL;
+    }
+
+    for (uint32_t i = 0; i < prim_count; i++, ordinal++) {
+        const PrimitiveAccess *source = &shared_trace_data->primitives[i];
+        SnapshotMutationBaselineEntry *entry = &baseline->entries[ordinal];
+        bool epoch_valid = source->run_epoch == epoch;
+        snapshot_mutation_baseline_fill_common(
+            entry, epoch, ordinal, SNAPSHOT_MUTATION_LANE_PRIMITIVE,
+            SNAPSHOT_MUTATION_SOURCE_PRIMITIVE, source->addr,
+            source->size > 0 ? (uint32_t)source->size : 0, source->pc,
+            source->access_id, source->expr);
+        if (source->size <= 0 ||
+            (uint32_t)source->size > sizeof(entry->planner_bytes)) {
+            entry->eligible = false;
+            entry->typed_eligible = false;
+        } else {
+            memcpy(entry->planner_bytes, g2h(source->addr),
+                   (size_t)source->size);
+        }
+        if (epoch_valid && counts_valid) {
+            entry->cell = source->cell;
+        } else {
+            memset(&entry->cell, 0, sizeof(entry->cell));
+            entry->typed_eligible = false;
+        }
+        log_msg("[analyze] [primitive] [index %u] [addr %lx] [size %d] [id %llu]\n",
+                i, source->addr, source->size,
+                (unsigned long long)source->access_id);
+    }
+    for (uint32_t i = 0; i < ptr_count; i++, ordinal++) {
+        const PointerAccess *source = &shared_trace_data->pointers[i];
+        SnapshotMutationBaselineEntry *entry = &baseline->entries[ordinal];
+        bool epoch_valid = source->run_epoch == epoch;
+        snapshot_mutation_baseline_fill_common(
+            entry, epoch, ordinal, SNAPSHOT_MUTATION_LANE_POINTER,
+            SNAPSHOT_MUTATION_SOURCE_POINTER, source->addr,
+            sizeof(target_ulong), source->pc, source->access_id, source->expr);
+        memcpy(entry->planner_bytes, &source->target,
+               sizeof(target_ulong));
+        if (epoch_valid && counts_valid) {
+            entry->cell = source->cell;
+            entry->target_ref = source->target_ref;
+            entry->target_ref_valid = source->target != 0 &&
+                                      source->target_ref.valid == 1;
+        } else {
+            memset(&entry->cell, 0, sizeof(entry->cell));
+            memset(&entry->target_ref, 0, sizeof(entry->target_ref));
+            entry->target_ref_valid = false;
+            entry->typed_eligible = false;
+        }
+        log_msg("[analyze] [pointer] [index %u] [addr %lx] [target %lx] [id %llu]\n",
+                i, source->addr, source->target,
+                (unsigned long long)source->access_id);
+    }
+    for (size_t i = 0; i < num_arg_regs; i++) {
+        const ArgumentInfo *source = &arg_info[i];
+        SnapshotMutationBaselineEntry *entry;
+        if (source->expr == NULL) continue;
+        entry = &baseline->entries[ordinal];
+        bool pointer = is_valid_address(source->value, false);
+        snapshot_mutation_baseline_fill_common(
+            entry, epoch, ordinal, SNAPSHOT_MUTATION_LANE_ARGUMENT,
+            pointer ? SNAPSHOT_MUTATION_SOURCE_ARGUMENT_POINTER
+                    : SNAPSHOT_MUTATION_SOURCE_ARGUMENT_PRIMITIVE,
+            source->reg, sizeof(target_ulong), 0, i, source->expr);
+        memcpy(entry->planner_bytes, &source->value,
+               sizeof(target_ulong));
+        entry->eligible = !pointer;
+        entry->typed_eligible = false;
+        entry->protected_addr = snapshot_addr_is_protected(entry->addr);
+        log_msg("[analyze] [sym-arg] [%s] [reg %zu] [expr %p]\n",
+                pointer ? "ptr" : "prim", i, (void *)source->expr);
+        ordinal++;
+    }
+    return baseline;
+}
+
+static void snapshot_mutation_candidate_from_entry(
+    const SnapshotMutationBaselineEntry *entry, MutationCandidate *candidate)
+{
+    memset(candidate, 0, sizeof(*candidate));
+    candidate->addr = entry->addr;
+    candidate->size = entry->size;
+    candidate->kind = entry->source_kind == SNAPSHOT_MUTATION_SOURCE_POINTER
+        ? 1 : 0;
+    if (entry->expr_index >= 0 && pool != NULL && next_free_expr != NULL) {
+        uintptr_t index = (uintptr_t)entry->expr_index;
+        uintptr_t count = ((uintptr_t)next_free_expr - (uintptr_t)pool) /
+                          sizeof(Expr);
+        if (index < count) candidate->expr = pool + index;
+    }
+    memcpy(candidate->value, entry->planner_bytes,
+           sizeof(candidate->value));
+}
+
+static gint snapshot_mutation_family_compare(gconstpointer left,
+                                             gconstpointer right,
+                                             gpointer user_data)
+{
+    const SnapshotMutationProposalFamily *a =
+        *(const SnapshotMutationProposalFamily * const *)left;
+    const SnapshotMutationProposalFamily *b =
+        *(const SnapshotMutationProposalFamily * const *)right;
+    const SnapshotMutationBaseline *baseline = user_data;
+    const SnapshotMutationBaselineEntry *ae =
+        snapshot_mutation_lookup_entry(baseline, a->primary_seed);
+    const SnapshotMutationBaselineEntry *be =
+        snapshot_mutation_lookup_entry(baseline, b->primary_seed);
+    if (ae != NULL && be != NULL && ae->token.source_ordinal !=
+                                      be->token.source_ordinal) {
+        return ae->token.source_ordinal < be->token.source_ordinal ? -1 : 1;
+    }
+    if (a->advisor_priority != b->advisor_priority)
+        return a->advisor_priority < b->advisor_priority ? -1 : 1;
+    if (a->family_id != b->family_id)
+        return a->family_id < b->family_id ? -1 : 1;
+    if (a->advisor_id != b->advisor_id)
+        return a->advisor_id < b->advisor_id ? -1 : 1;
+    return 0;
+}
+
+static bool snapshot_mutation_stage_family(
+    SnapshotMutationCoordinator *coordinator,
+    const SnapshotMutationProposalFamily *family)
+{
+    GPtrArray *local;
+    if (coordinator == NULL || family == NULL) return false;
+    local = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)snapshot_mutation_free);
+    if (local == NULL) return false;
+    for (uint32_t vi = 0; vi < family->variant_count; vi++) {
+        const SnapshotMutationProposalVariant *variant = &family->variants[vi];
+        for (uint32_t wi = 0; wi < variant->write_count; wi++) {
+            const SnapshotMutationProposalWrite *write = &variant->writes[wi];
+            const SnapshotMutationBaselineEntry *entry =
+                snapshot_mutation_lookup_entry(coordinator->baseline,
+                                               write->destination);
+            SnapshotMutationPlan *plan;
+            if (entry == NULL) {
+                g_ptr_array_free(local, TRUE);
+                return false;
+            }
+            plan = snapshot_mutation_new_descriptor(
+                entry->addr, write->size, entry->expr_index,
+                entry->query_index, write->kind, write->value,
+                write->target_extent, write->target_bytes);
+            if (plan == NULL) {
+                g_ptr_array_free(local, TRUE);
+                return false;
+            }
+            plan->mods[0].target.resolved_raw = write->resolved_raw;
+            plan->mods[0].target.resolved_end = write->resolved_end;
+            g_ptr_array_add(local, plan);
+        }
+    }
+    for (guint i = 0; i < local->len; i++) {
+        SnapshotMutationPlan *plan = g_ptr_array_index(local, i);
+        g_ptr_array_index(local, i) = NULL;
+        g_ptr_array_add(coordinator->staged, plan);
+    }
+    g_ptr_array_set_size(local, 0);
+    g_ptr_array_free(local, TRUE);
+    return true;
+}
+
+static bool snapshot_mutation_stage_generic(
+    SnapshotMutationCoordinator *coordinator,
+    const SnapshotMutationBaselineEntry *entry)
+{
+    MutationCandidate candidate;
+    GQueue *temporary;
+    bool ok;
+
+    if (entry == NULL || !entry->eligible || entry->protected_addr ||
+        entry->source_kind == SNAPSHOT_MUTATION_SOURCE_ARGUMENT_POINTER) {
+        return true;
+    }
+    snapshot_mutation_candidate_from_entry(entry, &candidate);
+    temporary = g_queue_new();
+    if (temporary == NULL) return false;
+    if (entry->source_kind == SNAPSHOT_MUTATION_SOURCE_POINTER) {
+        ok = add_untyped_pointer_candidate(temporary, &candidate);
+    } else {
+        ok = add_modification_primitive(temporary, &candidate);
+    }
+    if (!ok) {
+        g_queue_free_full(temporary,
+                          (GDestroyNotify)snapshot_mutation_free);
+        return false;
+    }
+    while (!g_queue_is_empty(temporary)) {
+        SnapshotMutationPlan *plan = g_queue_pop_head(temporary);
+        g_ptr_array_add(coordinator->staged, plan);
+    }
+    g_queue_free(temporary);
+    return true;
+}
+
+static bool snapshot_mutation_coordinator_publish(
+    SnapshotMutationCoordinator *coordinator, GQueue *queue)
+{
+    if (coordinator == NULL || coordinator->baseline == NULL ||
+        coordinator->staged == NULL || queue == NULL) return false;
+    if (coordinator->staged->len == 0) return true;
+    SnapshotMutationPlan **plans = (SnapshotMutationPlan **)
+        coordinator->staged->pdata;
+    size_t count = coordinator->staged->len;
+    bool ok = snapshot_mutation_enqueue_plan_array(queue, plans, count);
+    g_ptr_array_set_size(coordinator->staged, 0);
+    return ok;
+}
+
+static bool snapshot_mutation_coordinator_build(
+    SnapshotMutationBaseline *baseline, GQueue *queue)
+{
+    SnapshotMutationCoordinator coordinator;
+    SnapshotMutationProposalSink sink;
+    bool *specialized;
+
+    if (baseline == NULL || queue == NULL) return false;
+    memset(&coordinator, 0, sizeof(coordinator));
+    coordinator.baseline = baseline;
+    coordinator.families = g_ptr_array_new_with_free_func(
+        snapshot_mutation_proposal_family_free);
+    coordinator.staged = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)snapshot_mutation_free);
+    if (coordinator.families == NULL || coordinator.staged == NULL) {
+        snapshot_mutation_coordinator_clear(&coordinator);
+        return false;
+    }
+    sink.coordinator = &coordinator;
+    sink.advisor_id = 1;
+    sink.advisor_priority = 0;
+    snapshot_mutation_legacy_advisor(baseline, &sink);
+
+    g_ptr_array_sort_with_data(coordinator.families,
+                               snapshot_mutation_family_compare, baseline);
+    specialized = g_try_malloc0((size_t)baseline->entry_count *
+                                sizeof(*specialized));
+    if (specialized == NULL && baseline->entry_count != 0) {
+        snapshot_mutation_coordinator_clear(&coordinator);
+        return false;
+    }
+    for (guint fi = 0; fi < coordinator.families->len; fi++) {
+        SnapshotMutationProposalFamily *family =
+            g_ptr_array_index(coordinator.families, fi);
+        const SnapshotMutationBaselineEntry *primary =
+            snapshot_mutation_lookup_entry(baseline, family->primary_seed);
+        bool staged = snapshot_mutation_stage_family(&coordinator, family);
+        if (staged && primary != NULL) {
+            specialized[primary->token.source_ordinal] = true;
+        }
+    }
+    for (uint32_t i = 0; i < baseline->entry_count; i++) {
+        if (!specialized[i] &&
+            !snapshot_mutation_stage_generic(&coordinator,
+                                             &baseline->entries[i])) {
+            g_free(specialized);
+            snapshot_mutation_coordinator_clear(&coordinator);
+            return false;
+        }
+    }
+    g_free(specialized);
+    bool published = snapshot_mutation_coordinator_publish(&coordinator,
+                                                            queue);
+    snapshot_mutation_coordinator_clear(&coordinator);
+    return published;
 }
 
 static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_regs) {
@@ -3479,128 +4564,36 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
     // Sort by access_id
     qsort(shared_trace_data->primitives, prim_count, sizeof(PrimitiveAccess), compare_prim_id_desc);
     qsort(shared_trace_data->pointers, ptr_count, sizeof(PointerAccess), compare_ptr_id_desc);
-    GArray *mod_primitive_candidates = g_array_new(FALSE, FALSE, sizeof(MutationCandidate));
-    // First run: collect all data
+    /* First run: freeze the validated baseline and publish one complete
+     * coordinator plan.  Later iterations only retire the current plan. */
     if (!mutation_analysis_started) {
+        SnapshotMutationBaseline *baseline;
         mod_manager_init(exit_info);
-
         memcpy(&original_exit_info, exit_info, sizeof(SnapshotExitInfo));
-        g_read_access_tainted_primitives_original = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
-        g_read_access_pointers_original = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
-        g_read_access_tainted_primitives_all = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
-        g_read_access_pointers_all = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
-        // TODO: analyze added queries
-        Query *query_top = exit_info->next_query;
-        for (Query *q = next_query; q < query_top; q++) {
-            log_msg("[analyze] [query] [op %s] [addr %lx]\n", opkind_to_str(q->query->opkind), q->address);
-        }
-        // TODO: Add function argument (register) access
-        for (size_t i = 0; i < num_arg_regs; i++) {
-            if (arg_info[i].expr) {
-                if (is_valid_address(arg_info[i].value, false)) {
-                    // Treat as pointer access
-                    log_msg("[analyze] [sym-arg] [ptr] [reg %zu] [expr %lx]\n", i, arg_info[i].expr);
-                } else {
-                    // Treat as primitive access
-                    MutationCandidate mc = {
-                        .addr = (uintptr_t)arg_info[i].reg,
-                        .size = sizeof(target_ulong),
-                        .kind = 0,
-                        .expr = arg_info[i].expr,
-                        .value = {0}
-                    };
-                    memcpy(mc.value, &arg_info[i].value, sizeof(target_ulong));
-                    g_array_append_val(mod_primitive_candidates, mc);
-                    log_msg("[analyze] [sym-arg] [prim] [reg %zu] [expr %lx]\n", i, arg_info[i].expr);
-                }
-            }
-        }
 
-        // Create modification list
-        for (uint32_t i = 0; i < prim_count; i++) {
-            PrimitiveAccess *prim = &shared_trace_data->primitives[i];
-            PrimitiveAccess *prim_data = g_new(PrimitiveAccess, 1);
-            memcpy(prim_data, prim, sizeof(PrimitiveAccess));
-            g_hash_table_insert(g_read_access_tainted_primitives_original, GSIZE_TO_POINTER(prim_data->addr), prim_data);
-            g_hash_table_insert(g_read_access_tainted_primitives_all, GSIZE_TO_POINTER(prim_data->addr), prim_data);
-            log_msg("[analyze] [primitive] [index %d] [addr %lx] [size %d] [id %ld]\n", i, prim->addr, prim->size, prim->access_id);
-            MutationCandidate mod = {
-                .addr = prim->addr,
-                .size = prim->size,
-                .kind = 0,
-                .expr = prim->expr,
-                .value = {0}
-            };
-            if (binradar_manager_check_addr(mod.addr)) {
-                log_msg("[binradar] [skip-mod] [addr %lx]\n", mod.addr);
-                continue;
-            }
-            // Get actual value
-            if (prim->size <= 8) {
-                void *ptr_h = g2h(prim->addr);
-                memcpy(mod.value, ptr_h, prim->size);
-            }
-            if (mod.size > 0 && mod.size <= sizeof(mod.value) &&
-                !add_pointer_typed_candidate(
-                    mod_manager->modifications, &mod, &prim->cell, NULL,
-                    counts_valid, SNAPSHOT_POINTER_FROM_PRIMITIVE)) {
-                log_msg("[analyze] [mutation-error] primitive plan allocation failed\n");
-                exit_with_status(1);
-            }
+        baseline = snapshot_mutation_baseline_build(
+            exit_info, prim_count, ptr_count, counts_valid, arg_info,
+            num_arg_regs);
+        if (baseline == NULL) {
+            log_msg("[analyze] [mutation-error] baseline allocation failed\n");
+            exit_with_status(1);
         }
-        for (uint32_t i = 0; i < ptr_count; i++) {
-            PointerAccess *ptr = &shared_trace_data->pointers[i];
-            PointerAccess *ptr_data = g_new(PointerAccess, 1);
-            memcpy(ptr_data, ptr, sizeof(PointerAccess));
-            g_hash_table_insert(g_read_access_pointers_original, GSIZE_TO_POINTER(ptr_data->addr), ptr_data);
-            g_hash_table_insert(g_read_access_pointers_all, GSIZE_TO_POINTER(ptr_data->addr), ptr_data);
-            log_msg("[analyze] [pointer] [index %d] [addr %lx] [target %lx] [id %ld]\n", i, ptr->addr, ptr->target, ptr->access_id);
-            MutationCandidate mod = {
-                .addr = ptr->addr,
-                .size = sizeof(target_ulong),
-                .kind = 1,
-                .expr = ptr->expr,
-                .value = {0}
-            };
-            if (binradar_manager_check_addr(mod.addr)) {
-                log_msg("[binradar] [skip-mod] [addr %lx]\n", mod.addr);
-                continue;
-            }
-            // Get actual value
-            /* The parent retains the pre-snapshot memory image.  The
-             * pointer value observed by the baseline child is therefore the
-             * authoritative cell bytes for planning; reading g2h(ptr->addr)
-             * here would turn every child-written pointer into NULL. */
-            target_ulong actual_value = (target_ulong)ptr->target;
-            memcpy(mod.value, &actual_value, sizeof(target_ulong));
-            if (!add_pointer_typed_candidate(
-                    mod_manager->modifications, &mod, &ptr->cell,
-                    &ptr->target_ref, counts_valid,
-                    SNAPSHOT_POINTER_FROM_ACCESS)) {
-                log_msg("[analyze] [mutation-error] pointer plan allocation failed\n");
-                exit_with_status(1);
-            }
+        snapshot_mutation_baseline_free(snapshot_mutation_baseline);
+        snapshot_mutation_baseline = baseline;
+        if (!snapshot_mutation_coordinator_build(
+                snapshot_mutation_baseline, mod_manager->modifications)) {
+            log_msg("[analyze] [mutation-error] coordinator publication failed\n");
+            exit_with_status(1);
         }
-
-        for (int i = 0; i < mod_primitive_candidates->len; i++) {
-            MutationCandidate mod = g_array_index(mod_primitive_candidates, MutationCandidate, i);
-            if (binradar_manager_check_addr(mod.addr)) {
-                log_msg("[binradar] [skip-mod] [addr %lx]\n", mod.addr);
-                continue;
-            }
-            if (!add_modification_primitive(mod_manager->modifications,
-                                            &mod)) {
-                log_msg("[analyze] [mutation-error] register plan allocation failed\n");
-                exit_with_status(1);
-            }
-        }
-        log_msg("[analyze] [queue] [len %d]\n", g_queue_get_length(mod_manager->modifications));
-        g_array_free(mod_primitive_candidates, true);
+        log_msg("[analyze] [baseline] [epoch %llu] [entries %u] "
+                "[counts-valid %s] [query-end %lld] [expr-end %lld]\n",
+                (unsigned long long)baseline->run_epoch,
+                baseline->entry_count, baseline->counts_valid ? "true" : "false",
+                (long long)baseline->query_end,
+                (long long)baseline->expr_end);
+        log_msg("[analyze] [queue] [len %d]\n",
+                g_queue_get_length(mod_manager->modifications));
         return select_next_modification(exit_info);
-    } else {
-        /* Feedback loop not implemented; no new modifications
-         * are generated on subsequent iterations. */
-        g_array_free(mod_primitive_candidates, true);
     }
     return select_next_modification(exit_info);
 }
@@ -3782,6 +4775,21 @@ static void binradar_manager_reset_line_buf(BinradarManager *manager) {
     if (manager == NULL) return;
     manager->line_idx = 0;
     memset(manager->line_buf, 0, sizeof(manager->line_buf));
+}
+
+static void snapshot_prepare_mutation_epoch(void)
+{
+    uint64_t epoch;
+    if (shared_trace_data == NULL) return;
+    snapshot_mutation_query_start =
+        (query_queue != NULL && next_query != NULL)
+            ? GET_QUERY_IDX(next_query) : -1;
+    snapshot_mutation_expr_start =
+        (pool != NULL && next_free_expr != NULL)
+            ? GET_EXPR_IDX(next_free_expr) : -1;
+    epoch = ++next_snapshot_mutation_epoch;
+    if (epoch == 0) epoch = ++next_snapshot_mutation_epoch;
+    shared_trace_data->run_epoch = epoch;
 }
 
 static int64_t forkserver_child_timeout_ms(void) {
@@ -4074,6 +5082,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
             osprey_shared_run_prepare(g_osprey_ctx, g_osprey_shared_run,
                                       (uint64_t)binradar_iter);
         }
+        snapshot_prepare_mutation_epoch();
         child_pid = fork();
         if (child_pid < 0) exit_with_status(4);
 
