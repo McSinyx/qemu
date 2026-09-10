@@ -91,8 +91,25 @@ typedef struct OspreyRuntimeChunkRef {
 /* Configuration                                                       */
 /* ------------------------------------------------------------------ */
 
+typedef enum OspreyAnalysisMode {
+    /* Zero preserves the direct-configuration contract used by the
+     * research/unit callers.  Environment configuration explicitly selects
+     * mutation mode by default; full mode is opt-in there. */
+    OSPREY_ANALYSIS_MODE_FULL = 0,
+    OSPREY_ANALYSIS_MODE_MUTATION = 1,
+} OspreyAnalysisMode;
+
+typedef enum OspreyMutationAggregateKind {
+    OSPREY_MUTATION_AGGREGATE_ARRAY = 1,
+    OSPREY_MUTATION_AGGREGATE_STRUCT = 2,
+} OspreyMutationAggregateKind;
+
+#define OSPREY_MUTATION_MAX_EXTENT UINT64_C(4096)
+
 typedef struct OspreyConfig {
     bool enabled;
+    uint8_t analysis_mode;      /* OspreyAnalysisMode */
+    uint8_t reserved_mode[7];
     uint64_t shared_bytes;      /* BINRADAR_OSPREY_SHARED_MB * 1 MiB */
     uint64_t max_facts;         /* total unique facts per sample */
     uint64_t max_chunks_per_region;
@@ -108,6 +125,11 @@ typedef struct OspreyConfig {
     uint64_t max_parent_facts;      /* BINRADAR_OSPREY_MAX_PARENT_FACTS */
     uint64_t max_parent_chunks;     /* BINRADAR_OSPREY_MAX_PARENT_CHUNKS */
     uint64_t max_parent_regions;    /* BINRADAR_OSPREY_MAX_PARENT_REGIONS */
+    /* Mutation-mode limits.  Zero means unlimited for direct/unit callers;
+     * environment configuration supplies bounded defaults. */
+    uint64_t max_mutation_input;    /* BINRADAR_OSPREY_MAX_MUTATION_INPUT */
+    uint64_t max_mutation_work;     /* BINRADAR_OSPREY_MAX_MUTATION_WORK */
+    uint64_t max_mutation_bytes;    /* BINRADAR_OSPREY_MAX_MUTATION_BYTES */
     double report_threshold;
     char dump_file[512];        /* BINRADAR_OSPREY_DUMP_FILE: canonical
                                  * fact dump written after each
@@ -125,6 +147,7 @@ typedef struct OspreyConfig {
 typedef struct OspreyContext OspreyContext;
 typedef struct OspreySharedRun OspreySharedRun;
 typedef struct OspreyModel OspreyModel;
+typedef struct OspreyMutationModel OspreyMutationModel;
 
 typedef enum OspreyStatus {
     OSPREY_OK = 0,
@@ -253,6 +276,13 @@ OspreyStatus osprey_analyze(OspreyContext *ctx);
  * transaction is OSPREY_OK.  Fail-closed: a rejected transaction never
  * exposes a model, not even a previously installed one. */
 const OspreyModel *osprey_model(const OspreyContext *ctx);
+
+/* B1 facts-only mutation advisor.  The returned model is immutable and is
+ * visible only after a successful compact transaction.  A rejected build
+ * hides any prior allocation until the next successful publication. */
+OspreyStatus osprey_mutation_model_build(OspreyContext *ctx);
+const OspreyMutationModel *osprey_mutation_model(const OspreyContext *ctx);
+void osprey_mutation_model_clear(OspreyContext *ctx);
 
 /* Decoded-object lookup by canonical chunk. */
 const OspreyDecodedObject *osprey_lookup_chunk(const OspreyModel *model,

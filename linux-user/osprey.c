@@ -63,6 +63,9 @@ static const char *g_pre_sample_reason;
 #define OSPREY_DEFAULT_MAX_PARENT_FACTS 1048576ULL
 #define OSPREY_DEFAULT_MAX_PARENT_CHUNKS 1048576ULL
 #define OSPREY_DEFAULT_MAX_PARENT_REGIONS 65536ULL
+#define OSPREY_DEFAULT_MAX_MUTATION_INPUT 1048576ULL
+#define OSPREY_DEFAULT_MAX_MUTATION_WORK 10000000ULL
+#define OSPREY_DEFAULT_MAX_MUTATION_BYTES (64ULL * 1024ULL * 1024ULL)
 #define OSPREY_DEFAULT_REPORT_THRESHOLD 0.6
 
 /* Diagnostic sink (snapshot.c). */
@@ -113,6 +116,10 @@ bool osprey_config_from_env(OspreyConfig *config) {
     if (config == NULL) return false;
     memset(config, 0, sizeof(*config));
     config->enabled = false;
+    /* Environment-configured tracers use the bounded facts-only path.  A
+     * zeroed direct OspreyConfig remains full mode for existing research
+     * unit callers; those callers must opt into mutation explicitly. */
+    config->analysis_mode = OSPREY_ANALYSIS_MODE_MUTATION;
     config->shared_bytes = OSPREY_DEFAULT_SHARED_MB * 1024u * 1024u;
     config->max_facts = OSPREY_DEFAULT_MAX_FACTS;
     config->max_chunks_per_region = OSPREY_DEFAULT_MAX_CHUNKS_PER_REGION;
@@ -130,10 +137,27 @@ bool osprey_config_from_env(OspreyConfig *config) {
     config->max_parent_facts = OSPREY_DEFAULT_MAX_PARENT_FACTS;
     config->max_parent_chunks = OSPREY_DEFAULT_MAX_PARENT_CHUNKS;
     config->max_parent_regions = OSPREY_DEFAULT_MAX_PARENT_REGIONS;
+    config->max_mutation_input = OSPREY_DEFAULT_MAX_MUTATION_INPUT;
+    config->max_mutation_work = OSPREY_DEFAULT_MAX_MUTATION_WORK;
+    config->max_mutation_bytes = OSPREY_DEFAULT_MAX_MUTATION_BYTES;
     config->report_threshold = OSPREY_DEFAULT_REPORT_THRESHOLD;
 
     const char *v = getenv("BINRADAR_OSPREY_ENABLE");
     config->enabled = (v != NULL && v[0] != '\0' && atoi(v) != 0);
+
+    v = getenv("BINRADAR_OSPREY_ANALYSIS_MODE");
+    if (v != NULL && v[0] != '\0') {
+        if (strcmp(v, "mutation") == 0) {
+            config->analysis_mode = OSPREY_ANALYSIS_MODE_MUTATION;
+        } else if (strcmp(v, "full") == 0) {
+            config->analysis_mode = OSPREY_ANALYSIS_MODE_FULL;
+        } else {
+            fprintf(stderr,
+                    "[osprey] [config] [invalid] [var BINRADAR_OSPREY_ANALYSIS_MODE] [value %s]\n",
+                    v);
+            return false;
+        }
+    }
 
     uint64_t tmp = 0;
     if (!osprey_parse_u64("BINRADAR_OSPREY_SHARED_MB", &tmp)) return false;
@@ -167,6 +191,12 @@ bool osprey_config_from_env(OspreyConfig *config) {
     if (tmp != 0) config->max_parent_chunks = tmp;
     if (!osprey_parse_u64("BINRADAR_OSPREY_MAX_PARENT_REGIONS", &tmp)) return false;
     if (tmp != 0) config->max_parent_regions = tmp;
+    if (!osprey_parse_u64("BINRADAR_OSPREY_MAX_MUTATION_INPUT", &tmp)) return false;
+    if (tmp != 0) config->max_mutation_input = tmp;
+    if (!osprey_parse_u64("BINRADAR_OSPREY_MAX_MUTATION_WORK", &tmp)) return false;
+    if (tmp != 0) config->max_mutation_work = tmp;
+    if (!osprey_parse_u64("BINRADAR_OSPREY_MAX_MUTATION_BYTES", &tmp)) return false;
+    if (tmp != 0) config->max_mutation_bytes = tmp;
 
     if (!osprey_parse_u64("BINRADAR_OSPREY_MAX_EXACT_CLIQUE_VARS", &tmp)) return false;
     if (tmp != 0) {
@@ -889,15 +919,21 @@ OspreyContext *osprey_new(const OspreyConfig *config) {
     ctx->tx_reason = NULL;
     ctx->tx_model_ready = false;
     ctx->analysis_started_us = -1;
-    log_msg("[osprey] [config] [mode %s] [work_limit %llu] "
-            "[deadline_ms %llu] [parent_facts %llu] [parent_chunks %llu] "
-            "[parent_regions %llu]\n",
-            config->enabled ? "enabled" : "disabled",
+    log_msg("[osprey] [config] [enabled %s] [analysis-mode %s] "
+            "[work_limit %llu] [deadline_ms %llu] [parent_facts %llu] "
+            "[parent_chunks %llu] [parent_regions %llu] "
+            "[mutation_input %llu] [mutation_work %llu] [mutation_bytes %llu]\n",
+            config->enabled ? "true" : "false",
+            config->analysis_mode == OSPREY_ANALYSIS_MODE_MUTATION
+                ? "mutation" : "full",
             (unsigned long long)config->max_analysis_work,
             (unsigned long long)config->analysis_deadline_ms,
             (unsigned long long)config->max_parent_facts,
             (unsigned long long)config->max_parent_chunks,
-            (unsigned long long)config->max_parent_regions);
+            (unsigned long long)config->max_parent_regions,
+            (unsigned long long)config->max_mutation_input,
+            (unsigned long long)config->max_mutation_work,
+            (unsigned long long)config->max_mutation_bytes);
     ctx->staged_graph = NULL;
     ctx->staged_model = NULL;
     osprey_ctx_ref_set(ctx);
@@ -918,6 +954,7 @@ void osprey_free(OspreyContext *ctx) {
     g_array_free(ctx->mayarray_facts, TRUE);
     g_array_free(ctx->runtime_regions, TRUE);
     osprey_runtime_index_clear(ctx);
+    osprey_mutation_model_clear(ctx);
     g_array_free(ctx->region_instances, TRUE);
     g_array_free(ctx->logical_access_facts, TRUE);
     if (ctx->relations != NULL) {

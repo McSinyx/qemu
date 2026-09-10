@@ -800,6 +800,12 @@ struct OspreyContext {
      * runtime resolution is unavailable for this baseline. */
     OspreyRuntimeIndex *runtime_index;
 
+    /* B1: compact facts-only advice.  The allocation remains owned after a
+     * rejected transaction so diagnostics/debuggers can inspect its address,
+     * but it is hidden until a later successful publication. */
+    OspreyMutationModel *mutation_model;
+    bool mutation_model_ready;
+
     /* Origin shadows, keyed by CPUArchState* (per-thread). */
     GHashTable *cpu_origins;   /* env* -> OspreyCpuOriginState* */
 
@@ -1748,6 +1754,57 @@ struct OspreyModel {
      * semantic counts.  The ledger itself is embedded and immutable. */
     OspreyModelAllocation ledger[OSPREY_MODEL_LEDGER_COUNT];
 };
+
+#define OSPREY_MUTATION_MODEL_VERSION 1u
+
+typedef enum OspreyMutationAbstentionReason {
+    OSPREY_MUTATION_ABSTAIN_NONE = 0,
+    OSPREY_MUTATION_ABSTAIN_TARGET_TIE,
+    OSPREY_MUTATION_ABSTAIN_NO_SHAPE,
+    OSPREY_MUTATION_ABSTAIN_KIND_CONFLICT,
+    OSPREY_MUTATION_ABSTAIN_GEOMETRY_CONFLICT,
+    OSPREY_MUTATION_ABSTAIN_F05_MISSING,
+    OSPREY_MUTATION_ABSTAIN_F05_CONFLICT,
+    OSPREY_MUTATION_ABSTAIN_LAYOUT_CONFLICT,
+    OSPREY_MUTATION_ABSTAIN_EXTENT_INVALID,
+    OSPREY_MUTATION_ABSTAIN_TARGET_BASE_MISMATCH,
+    OSPREY_MUTATION_ABSTAIN_COUNT,
+    OSPREY_MUTATION_ABSTAIN_REASON_COUNT,
+} OspreyMutationAbstentionReason;
+
+typedef struct OspreyMutationStats {
+    uint64_t input_facts;
+    uint64_t eligible_cells;
+    uint64_t published_entries;
+    uint64_t work_units;
+    uint64_t owned_bytes;
+    uint64_t abstentions[OSPREY_MUTATION_ABSTAIN_REASON_COUNT];
+} OspreyMutationStats;
+
+typedef struct OspreyMutationEntry {
+    OspreyChunk cell;
+    OspreyAddress target_base;
+    uint64_t extent;
+    uint64_t support;
+    uint32_t ordinal;
+    uint8_t kind;               /* OspreyMutationAggregateKind */
+    uint8_t reserved[3];
+} OspreyMutationEntry;
+
+struct OspreyMutationModel {
+    uint32_t version;
+    uint32_t entry_count;
+    uint8_t publication_valid;
+    uint8_t reserved[3];
+    OspreyMutationEntry *entries; /* sorted by complete cell chunk */
+    OspreyMutationStats stats;
+};
+
+const char *osprey_mutation_abstention_reason(
+    OspreyMutationAbstentionReason reason);
+bool osprey_mutation_model_validate(const OspreyMutationModel *model);
+const OspreyMutationEntry *osprey_mutation_lookup(
+    const OspreyMutationModel *model, const OspreyChunk *cell);
 
 /* Stage 6.1: canonical, fully owned projection of final graph beliefs.
  * This boundary does not select roles or build/install a model. */

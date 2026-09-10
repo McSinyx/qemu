@@ -980,6 +980,10 @@ BASE_ENV = {
     "E9_TRAMPOLINE_RANGE": "0x0-0x0",
     "E9_LOADER_RANGE": "0x0-0x0",
     "BINRADAR_OSPREY_ENABLE": "1",
+    # The historical graph/inference fixtures assert full-mode rows.  The
+    # production environment defaults to bounded mutation mode; keep this
+    # legacy harness explicit so its oracle remains unchanged.
+    "BINRADAR_OSPREY_ANALYSIS_MODE": "full",
     "BINRADAR_OSPREY_REPORT_THRESHOLD": "0.2",
 }
 

@@ -3066,6 +3066,10 @@ void osprey_tx_begin(OspreyContext *ctx) {
     ctx->tx_stage = NULL;
     ctx->tx_reason = NULL;
     ctx->tx_model_ready = false;
+    /* A new baseline invalidates compact advice until B1 publishes a
+     * complete replacement.  The previous allocation remains owned but
+     * hidden so a rejected transaction cannot consume stale advice. */
+    ctx->mutation_model_ready = false;
     ctx->last_status = OSPREY_OK;
     osprey_budget_begin(ctx);
 }
@@ -4595,6 +4599,16 @@ OspreyStatus osprey_analyze(OspreyContext *ctx) {
     }
     ctx->tx_model_ready = false;
     if (!ctx->analysis_active) osprey_budget_begin(ctx);
+
+    /* BinRadar's bounded production path consumes only the compact B1
+     * pointer/type/extent index.  Never enter relation, graph, inference,
+     * or decoder stages in this mode; B0 remains responsible for generic
+     * fallback when compact entries abstain. */
+    if (ctx->config.analysis_mode == OSPREY_ANALYSIS_MODE_MUTATION) {
+        OspreyStatus mutation_status = osprey_mutation_model_build(ctx);
+        osprey_budget_finish(ctx, mutation_status);
+        return mutation_status;
+    }
 
     /* Stage 3.1 is independent of predicate/factor construction.  Build
      * its immutable parent-local relations first so later rule stages do

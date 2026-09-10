@@ -28,6 +28,7 @@ OSPREY_OBJS := ../../build/x86_64-linux-user/linux-user/osprey.o \
                ../../build/x86_64-linux-user/linux-user/osprey-decode.o \
                ../../build/x86_64-linux-user/linux-user/osprey-relations.o \
                ../../build/x86_64-linux-user/linux-user/osprey-runtime.o \
+               ../../build/x86_64-linux-user/linux-user/osprey-mutation.o \
                ../../build/x86_64-linux-user/linux-user/provenance.o \
                ../../build/x86_64-linux-user/linux-user/sem-events.o
 UNIT_BIN   := $(WORK)/osprey_unit
@@ -52,6 +53,7 @@ OSPREY_SRCS := ../../linux-user/osprey.c \
                ../../linux-user/osprey-decode.c \
                ../../linux-user/osprey-relations.c \
                ../../linux-user/osprey-runtime.c \
+               ../../linux-user/osprey-mutation.c \
                ../../linux-user/provenance.c \
                ../../linux-user/sem-events.c
 OSPREY_HEADERS := ../../linux-user/osprey.h \
@@ -90,20 +92,23 @@ PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))
         unit-stage5-bp unit-stage5-bp-asan \
         unit-stage6-decode unit-stage6-decode-asan \
         unit-stage7-mutation unit-stage7-mutation-asan \
-        unit-stage7-runtime unit-stage7-runtime-asan guests plts clean
+        unit-stage7-runtime unit-stage7-runtime-asan \
+        unit-b1-mutation unit-b1-mutation-asan guests plts clean
 check: inventory run unit unit-asan-osprey unit-stage3-relations \
        unit-stage3-relations-asan unit-stage3-graph unit-stage3-graph-asan \
        unit-stage3-rules unit-stage3-rules-asan unit-stage4-exact \
        unit-stage4-exact-asan unit-stage5-bp unit-stage5-bp-asan \
        unit-stage6-decode unit-stage6-decode-asan \
        unit-stage7-mutation unit-stage7-mutation-asan \
-       unit-stage7-runtime unit-stage7-runtime-asan
+       unit-stage7-runtime unit-stage7-runtime-asan \
+       unit-b1-mutation unit-b1-mutation-asan
 run unit unit-asan-osprey unit-stage3-relations unit-stage3-relations-asan \
 unit-stage3-graph unit-stage3-graph-asan unit-stage3-rules \
 unit-stage3-rules-asan unit-stage4-exact unit-stage4-exact-asan \
 unit-stage5-bp unit-stage5-bp-asan unit-stage6-decode \
 unit-stage6-decode-asan unit-stage7-mutation \
-unit-stage7-mutation-asan unit-stage7-runtime unit-stage7-runtime-asan: inventory
+unit-stage7-mutation-asan unit-stage7-runtime unit-stage7-runtime-asan \
+unit-b1-mutation unit-b1-mutation-asan: inventory
 inventory:
 	@python3 $(INVENTORY)
 run: guests plts
@@ -402,3 +407,24 @@ $(RUNTIME_ASAN_BIN): stage7_runtime_test.c stage7_mutation_reference.c \
 	$(CC) $(ASAN_CFLAGS) -o $@ stage7_runtime_test.c \
 		stage7_mutation_reference.c stage3_test_support.c \
 		$(OSPREY_ASAN_OBJS) -lglib-2.0 -lpthread -lm
+
+# B1 focused runner: facts-only compact model construction.  It links no
+# snapshot.c/B0 coordinator; all facts are parent-owned test GArrays.
+B1_UNIT_BIN := $(WORK)/b1_mutation
+B1_ASAN_BIN := $(WORK)/b1_mutation_asan
+
+unit-b1-mutation: $(B1_UNIT_BIN)
+	@$(B1_UNIT_BIN)
+
+$(B1_UNIT_BIN): b1_mutation_test.c stage3_test_support.c \
+		$(OSPREY_OBJS) $(OSPREY_HEADERS) | $(WORK)
+	$(CC) $(UNIT_CFLAGS) -o $@ b1_mutation_test.c \
+		stage3_test_support.c $(OSPREY_OBJS) -lglib-2.0 -lpthread -lm
+
+unit-b1-mutation-asan: $(B1_ASAN_BIN)
+	@ASAN_OPTIONS=detect_leaks=1 $(B1_ASAN_BIN)
+
+$(B1_ASAN_BIN): b1_mutation_test.c stage3_test_support.c \
+		$(OSPREY_ASAN_OBJS) $(OSPREY_HEADERS) | $(WORK)
+	$(CC) $(ASAN_CFLAGS) -o $@ b1_mutation_test.c \
+		stage3_test_support.c $(OSPREY_ASAN_OBJS) -lglib-2.0 -lpthread -lm
