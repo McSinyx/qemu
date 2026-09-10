@@ -102,6 +102,12 @@ typedef struct OspreyConfig {
     uint64_t max_exact_clique_vars;
     uint64_t max_exact_table_bytes; /* BINRADAR_OSPREY_MAX_EXACT_TABLE_MB * 1 MiB */
     uint64_t max_bp_table_bytes;    /* BINRADAR_OSPREY_MAX_BP_TABLE_MB * 1 MiB */
+    /* Parent-only analysis limits; never copied into OspreySharedRun. */
+    uint64_t max_analysis_work;     /* BINRADAR_OSPREY_MAX_ANALYSIS_WORK */
+    uint64_t analysis_deadline_ms;  /* optional monotonic guard; 0 = off */
+    uint64_t max_parent_facts;      /* BINRADAR_OSPREY_MAX_PARENT_FACTS */
+    uint64_t max_parent_chunks;     /* BINRADAR_OSPREY_MAX_PARENT_CHUNKS */
+    uint64_t max_parent_regions;    /* BINRADAR_OSPREY_MAX_PARENT_REGIONS */
     double report_threshold;
     char dump_file[512];        /* BINRADAR_OSPREY_DUMP_FILE: canonical
                                  * fact dump written after each

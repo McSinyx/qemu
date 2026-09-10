@@ -768,7 +768,7 @@ static bool same_copy_bucket(const RelationCopyEntry *a,
                                        &b->fact.destination.address.region);
 }
 
-static bool build_r10(const OspreyContext *ctx, OspreyRelations *relations)
+static bool build_r10(OspreyContext *ctx, OspreyRelations *relations)
 {
     GArray *copies = g_array_new(FALSE, FALSE, sizeof(RelationCopyEntry));
     for (guint i = 0; i < ctx->copy_facts->len; i++) {
@@ -810,6 +810,11 @@ static bool build_r10(const OspreyContext *ctx, OspreyRelations *relations)
             const RelationCopyEntry *first = &g_array_index(
                 copies, RelationCopyEntry, i);
             for (guint j = i + 1; j < bucket_end; j++) {
+                if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_RELATIONS,
+                                          OSPREY_BUDGET_RELATION_PROBE, 1)) {
+                    g_array_free(copies, TRUE);
+                    return false;
+                }
                 const RelationCopyEntry *second = &g_array_index(
                     copies, RelationCopyEntry, j);
                 int64_t source_delta;
@@ -892,7 +897,8 @@ static bool same_access_pair_group(const RelationAccessPair *a,
            a->skew == b->skew;
 }
 
-static bool build_access_pairs(const OspreyRelations *relations,
+static bool build_access_pairs(OspreyContext *ctx,
+                               const OspreyRelations *relations,
                                GArray *pairs)
 {
     for (guint i = 0; i < relations->r01_accessed->len; i++) {
@@ -902,6 +908,10 @@ static bool build_access_pairs(const OspreyRelations *relations,
             const OspreyInsnChunkRelation *second = &g_array_index(
                 relations->r01_accessed, OspreyInsnChunkRelation, j);
             if (first->pc != second->pc) break;
+            if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_RELATIONS,
+                                      OSPREY_BUDGET_RELATION_PROBE, 1)) {
+                return false;
+            }
             if (chunk_equal_relation(&first->chunk, &second->chunk)) continue;
             RelationAccessPair pair;
             memset(&pair, 0, sizeof(pair));
@@ -922,10 +932,10 @@ static bool build_access_pairs(const OspreyRelations *relations,
     return true;
 }
 
-static bool build_r11(const OspreyRelations *relations)
+static bool build_r11(OspreyContext *ctx, const OspreyRelations *relations)
 {
     GArray *pairs = g_array_new(FALSE, FALSE, sizeof(RelationAccessPair));
-    if (!build_access_pairs(relations, pairs)) {
+    if (!build_access_pairs(ctx, relations, pairs)) {
         g_array_free(pairs, TRUE);
         return false;
     }
@@ -943,6 +953,11 @@ static bool build_r11(const OspreyRelations *relations)
             const RelationAccessPair *first = &g_array_index(
                 pairs, RelationAccessPair, i);
             for (guint j = i + 1; j < group_end; j++) {
+                if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_RELATIONS,
+                                          OSPREY_BUDGET_RELATION_PROBE, 1)) {
+                    g_array_free(pairs, TRUE);
+                    return false;
+                }
                 const RelationAccessPair *second = &g_array_index(
                     pairs, RelationAccessPair, j);
                 if (first->pc == second->pc) continue;
@@ -1080,7 +1095,7 @@ static guint base_upper_bound(const GArray *bases,
     return low;
 }
 
-static bool build_r12(const OspreyContext *ctx, OspreyRelations *relations)
+static bool build_r12(OspreyContext *ctx, OspreyRelations *relations)
 {
     GArray *bases = g_array_new(FALSE, FALSE, sizeof(RelationBaseEntry));
     GArray *points = g_array_new(FALSE, FALSE, sizeof(RelationPointEntry));
@@ -1142,6 +1157,12 @@ static bool build_r12(const OspreyContext *ctx, OspreyRelations *relations)
         }
         for (guint a = i; a < end; a++) {
             for (guint b = a + 1; b < end; b++) {
+                if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_RELATIONS,
+                                          OSPREY_BUDGET_RELATION_PROBE, 1)) {
+                    g_array_free(bases, TRUE);
+                    g_array_free(points, TRUE);
+                    return false;
+                }
                 OspreyAddress target1 = g_array_index(
                     points, RelationPointEntry, a).target;
                 OspreyAddress target2 = g_array_index(
@@ -1158,6 +1179,13 @@ static bool build_r12(const OspreyContext *ctx, OspreyRelations *relations)
                 guint destination_begin = base_lower_bound(bases, &target2);
                 guint destination_end = base_upper_bound(bases, &target2);
                 for (guint bs = source_begin; bs < source_end; bs++) {
+                    if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_RELATIONS,
+                                              OSPREY_BUDGET_RELATION_PROBE,
+                                              1)) {
+                        g_array_free(bases, TRUE);
+                        g_array_free(points, TRUE);
+                        return false;
+                    }
                     const RelationBaseEntry *source = &g_array_index(
                         bases, RelationBaseEntry, bs);
                     if (!osprey_relation_same_region(
@@ -1178,6 +1206,13 @@ static bool build_r12(const OspreyContext *ctx, OspreyRelations *relations)
                     }
                     for (guint bd = destination_begin; bd < destination_end;
                          bd++) {
+                        if (!osprey_budget_charge(
+                                ctx, OSPREY_ANALYSIS_RELATIONS,
+                                OSPREY_BUDGET_RELATION_PROBE, 1)) {
+                            g_array_free(bases, TRUE);
+                            g_array_free(points, TRUE);
+                            return false;
+                        }
                         const RelationBaseEntry *destination = &g_array_index(
                             bases, RelationBaseEntry, bd);
                         if (!osprey_relation_same_region(
@@ -1251,23 +1286,68 @@ static void build_indexes(const OspreyContext *ctx, OspreyRelations *relations)
     }
 }
 
+static bool relations_charge_cubic(OspreyContext *ctx, guint count)
+{
+    uint64_t n = count;
+    uint64_t units = n;
+    if (n != 0 && units > UINT64_MAX / n) units = UINT64_MAX;
+    else units *= n;
+    if (n != 0 && units > UINT64_MAX / n) units = UINT64_MAX;
+    else units *= n;
+    return units == 0 || osprey_budget_charge(
+        ctx, OSPREY_ANALYSIS_RELATIONS, OSPREY_BUDGET_RELATION_PROBE,
+        units);
+}
+
 OspreyStatus osprey_relations_build(OspreyContext *ctx)
 {
     if (ctx == NULL || !ctx->config.enabled) return OSPREY_DISABLED;
+    if (!relations_charge_cubic(ctx, ctx->logical_access_facts->len)) {
+        return OSPREY_LIMIT_EXCEEDED;
+    }
     OspreyRelations *relations = relations_new();
+#define CHARGE_RELATION_ARRAY(_array)                                      \
+    do {                                                                   \
+        if (!osprey_budget_charge(                                        \
+                ctx, OSPREY_ANALYSIS_RELATIONS,                           \
+                OSPREY_BUDGET_RELATION_PROBE, (uint64_t)(_array)->len)) { \
+            osprey_relations_free(relations);                             \
+            return OSPREY_LIMIT_EXCEEDED;                                 \
+        }                                                                      \
+    } while (0)
+    CHARGE_RELATION_ARRAY(ctx->logical_access_facts);
+    CHARGE_RELATION_ARRAY(ctx->access_facts);
+    CHARGE_RELATION_ARRAY(ctx->base_facts);
+    CHARGE_RELATION_ARRAY(ctx->copy_facts);
+    CHARGE_RELATION_ARRAY(ctx->points_facts);
+    CHARGE_RELATION_ARRAY(ctx->alloc_facts);
+    CHARGE_RELATION_ARRAY(ctx->mayarray_facts);
     copy_logical_accesses(ctx, relations);
+    CHARGE_RELATION_ARRAY(relations->r01_accessed);
+    CHARGE_RELATION_ARRAY(relations->r02_accessed);
+    CHARGE_RELATION_ARRAY(relations->r03_single_chunk);
+    CHARGE_RELATION_ARRAY(relations->r08_constant_alloc);
     build_r01_r02(relations);
     build_r03_r07(relations);
     if (!build_r08_r09(ctx, relations) || !build_r10(ctx, relations) ||
-        !build_r11(relations) || !build_r12(ctx, relations)) {
+        !build_r11(ctx, relations) || !build_r12(ctx, relations)) {
         osprey_relations_free(relations);
-        return OSPREY_RELATION_ARITHMETIC;
+        return ctx->tx_status == OSPREY_LIMIT_EXCEEDED
+            ? OSPREY_LIMIT_EXCEEDED : OSPREY_RELATION_ARITHMETIC;
     }
+    CHARGE_RELATION_ARRAY(relations->r10_data_flow);
+    CHARGE_RELATION_ARRAY(relations->r11_unified_access);
+    CHARGE_RELATION_ARRAY(relations->r12_points_to);
+    CHARGE_RELATION_ARRAY(relations->r01_accessed);
+    CHARGE_RELATION_ARRAY(ctx->alloc_facts);
+    CHARGE_RELATION_ARRAY(ctx->base_facts);
+    CHARGE_RELATION_ARRAY(ctx->points_facts);
     build_indexes(ctx, relations);
 
     OspreyRelations *old = ctx->relations;
     ctx->relations = relations;
     osprey_relations_free(old);
+#undef CHARGE_RELATION_ARRAY
     return OSPREY_OK;
 }
 

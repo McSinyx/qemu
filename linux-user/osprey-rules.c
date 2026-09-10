@@ -81,10 +81,12 @@ static bool support_ratio(OspreyContext *ctx, uint32_t sample_support,
 /* R10-R12 hint extraction                                             */
 /* ------------------------------------------------------------------ */
 
-static void hint_add(OspreyContext *ctx, OspreyAddress a1, OspreyAddress a2,
+static bool hint_add(OspreyContext *ctx, OspreyAddress a1, OspreyAddress a2,
                      int64_t s, uint8_t kind, uint64_t instances) {
     OspreyGraph *g = ctx->graph;
     for (guint i = 0; i < g->hints->len; i++) {
+        if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                  OSPREY_BUDGET_RULE_PROBE, 1)) return false;
         OspreyHint *e = &g_array_index(g->hints, OspreyHint, i);
         if (e->kind == kind && e->size == s &&
             address_equal(&e->a1, &a1) && address_equal(&e->a2, &a2)) {
@@ -98,7 +100,7 @@ static void hint_add(OspreyContext *ctx, OspreyAddress a1, OspreyAddress a2,
             } else {
                 g->hint_instances += instances;
             }
-            return;
+            return true;
         }
     }
     OspreyHint h;
@@ -114,39 +116,55 @@ static void hint_add(OspreyContext *ctx, OspreyAddress a1, OspreyAddress a2,
     } else {
         g->hint_instances += instances;
     }
+    return true;
 }
 
 /* R10-R12 are materialized by osprey-relations.c.  The graph stage only
  * transfers those immutable hint rows; it must not reconstruct them from
  * class-specific F01 rows or from insertion order. */
-static void closure_r10(OspreyContext *ctx) {
-    if (ctx->relations == NULL) return;
+static bool closure_r10(OspreyContext *ctx) {
+    if (ctx->relations == NULL) return true;
     for (guint i = 0; i < ctx->relations->r10_data_flow->len; i++) {
+        if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                  OSPREY_BUDGET_RULE_PROBE, 1)) return false;
         const OspreyHintRelation *r = &g_array_index(
             ctx->relations->r10_data_flow, OspreyHintRelation, i);
-        hint_add(ctx, r->a1, r->a2, r->size,
-                 OSPREY_RELATION_DATA_FLOW, r->witness_count);
+        if (!hint_add(ctx, r->a1, r->a2, r->size,
+                      OSPREY_RELATION_DATA_FLOW, r->witness_count)) {
+            return false;
+        }
     }
+    return true;
 }
 
-static void closure_r11(OspreyContext *ctx) {
-    if (ctx->relations == NULL) return;
+static bool closure_r11(OspreyContext *ctx) {
+    if (ctx->relations == NULL) return true;
     for (guint i = 0; i < ctx->relations->r11_unified_access->len; i++) {
+        if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                  OSPREY_BUDGET_RULE_PROBE, 1)) return false;
         const OspreyHintRelation *r = &g_array_index(
             ctx->relations->r11_unified_access, OspreyHintRelation, i);
-        hint_add(ctx, r->a1, r->a2, r->size,
-                 OSPREY_RELATION_UNIFIED_ACCESS, r->witness_count);
+        if (!hint_add(ctx, r->a1, r->a2, r->size,
+                      OSPREY_RELATION_UNIFIED_ACCESS, r->witness_count)) {
+            return false;
+        }
     }
+    return true;
 }
 
-static void closure_r12(OspreyContext *ctx) {
-    if (ctx->relations == NULL) return;
+static bool closure_r12(OspreyContext *ctx) {
+    if (ctx->relations == NULL) return true;
     for (guint i = 0; i < ctx->relations->r12_points_to->len; i++) {
+        if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                  OSPREY_BUDGET_RULE_PROBE, 1)) return false;
         const OspreyHintRelation *r = &g_array_index(
             ctx->relations->r12_points_to, OspreyHintRelation, i);
-        hint_add(ctx, r->a1, r->a2, r->size,
-                 OSPREY_RELATION_POINTS_TO, r->witness_count);
+        if (!hint_add(ctx, r->a1, r->a2, r->size,
+                      OSPREY_RELATION_POINTS_TO, r->witness_count)) {
+            return false;
+        }
     }
+    return true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -163,6 +181,22 @@ static OspreyStatus rules_error(OspreyContext *ctx, OspreyStatus status)
         ctx->last_status = status;
     }
     return status;
+}
+
+/* Several CA/CB rules perform a pair scan whose membership predicates scan a
+ * second relation family.  Reserve the conservative cubic upper bound before
+ * entering that work; this keeps the parent liveness guard effective even
+ * when a single pair's predicate would otherwise hide many operations. */
+static bool rules_charge_cubic(OspreyContext *ctx, guint count)
+{
+    uint64_t n = count;
+    uint64_t units = n;
+    if (n != 0 && units > UINT64_MAX / n) units = UINT64_MAX;
+    else units *= n;
+    if (n != 0 && units > UINT64_MAX / n) units = UINT64_MAX;
+    else units *= n;
+    return units == 0 || osprey_budget_charge(
+        ctx, OSPREY_ANALYSIS_STAGE3, OSPREY_BUDGET_RULE_PROBE, units);
 }
 
 static uint32_t rule_var_id(OspreyContext *ctx, uint8_t kind,
@@ -338,6 +372,10 @@ static OspreyStatus compile_ca02_ca03(OspreyContext *ctx)
         const OspreyChunkRelation *left = &g_array_index(
             relations->r02_accessed, OspreyChunkRelation, i);
         for (guint j = i + 1; j < relations->r02_accessed->len; j++) {
+            if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                      OSPREY_BUDGET_RULE_PROBE, 1)) {
+                return OSPREY_LIMIT_EXCEEDED;
+            }
             const OspreyChunkRelation *right = &g_array_index(
                 relations->r02_accessed, OspreyChunkRelation, j);
             const OspreyChunk *a = &left->chunk;
@@ -425,6 +463,10 @@ static OspreyStatus compile_ca04_ca05(OspreyContext *ctx)
         /* For each existing P02 at this instruction, connect to this R01
          * chunk.  Do not require the P02 chunk to equal the target chunk. */
         for (guint j = 0; j < relations->r01_accessed->len; j++) {
+            if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                      OSPREY_BUDGET_RULE_PROBE, 1)) {
+                return OSPREY_LIMIT_EXCEEDED;
+            }
             const OspreyInsnChunkRelation *source = &g_array_index(
                 relations->r01_accessed, OspreyInsnChunkRelation, j);
             if (source->pc != target->pc) continue;
@@ -453,6 +495,10 @@ static OspreyStatus collect_ca06(OspreyContext *ctx, GArray *proposals)
         const OspreyInsnRegionRelation *group = &g_array_index(
             relations->r03_single_chunk, OspreyInsnRegionRelation, i);
         for (guint j = 0; j < relations->logical_accesses->len; j++) {
+            if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                      OSPREY_BUDGET_RULE_PROBE, 1)) {
+                return OSPREY_LIMIT_EXCEEDED;
+            }
             const OspreyLogicalAccess *row = &g_array_index(
                 relations->logical_accesses, OspreyLogicalAccess, j);
             if (row->pc != group->pc ||
@@ -480,6 +526,10 @@ static OspreyStatus compile_ca06(OspreyContext *ctx)
         const OspreyInsnRegionRelation *group = &g_array_index(
             relations->r03_single_chunk, OspreyInsnRegionRelation, i);
         for (guint j = 0; j < relations->logical_accesses->len; j++) {
+            if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                      OSPREY_BUDGET_RULE_PROBE, 1)) {
+                return OSPREY_LIMIT_EXCEEDED;
+            }
             const OspreyLogicalAccess *row = &g_array_index(
                 relations->logical_accesses, OspreyLogicalAccess, j);
             if (row->pc != group->pc ||
@@ -524,6 +574,10 @@ static OspreyStatus compile_ca07(OspreyContext *ctx)
             continue;
         }
         for (guint j = i + 1; j < relations->logical_accesses->len; j++) {
+            if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                      OSPREY_BUDGET_RULE_PROBE, 1)) {
+                return OSPREY_LIMIT_EXCEEDED;
+            }
             const OspreyLogicalAccess *b = &g_array_index(
                 relations->logical_accesses, OspreyLogicalAccess, j);
             if (a->pc == b->pc ||
@@ -849,6 +903,10 @@ static OspreyStatus collect_cb07_cb08(OspreyContext *ctx,
             continue;
         }
         for (guint j = 0; j < relations->logical_accesses->len; j++) {
+            if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                      OSPREY_BUDGET_RULE_PROBE, 1)) {
+                return OSPREY_LIMIT_EXCEEDED;
+            }
             const OspreyLogicalAccess *logical = &g_array_index(
                 relations->logical_accesses, OspreyLogicalAccess, j);
             if (logical->pc != most->pc ||
@@ -900,6 +958,10 @@ static OspreyStatus compile_cb07_cb08(OspreyContext *ctx)
             continue;
         }
         for (guint j = 0; j < relations->logical_accesses->len; j++) {
+            if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                      OSPREY_BUDGET_RULE_PROBE, 1)) {
+                return OSPREY_LIMIT_EXCEEDED;
+            }
             const OspreyLogicalAccess *logical = &g_array_index(
                 relations->logical_accesses, OspreyLogicalAccess, j);
             if (logical->pc != most->pc ||
@@ -940,6 +1002,10 @@ static OspreyStatus compile_cb09(OspreyContext *ctx)
         const OspreyLogicalAccess *a = &g_array_index(
             relations->logical_accesses, OspreyLogicalAccess, i);
         for (guint j = i + 1; j < relations->logical_accesses->len; j++) {
+            if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                      OSPREY_BUDGET_RULE_PROBE, 1)) {
+                return OSPREY_LIMIT_EXCEEDED;
+            }
             const OspreyLogicalAccess *b = &g_array_index(
                 relations->logical_accesses, OspreyLogicalAccess, j);
             if (a->pc != b->pc ||
@@ -1239,6 +1305,10 @@ static OspreyStatus collect_cd06(OspreyContext *ctx, GArray *proposals)
             continue;
         }
         for (guint j = 0; j < relations->r02_accessed->len; j++) {
+            if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                      OSPREY_BUDGET_RULE_PROBE, 1)) {
+                return OSPREY_LIMIT_EXCEEDED;
+            }
             const OspreyChunkRelation *target = &g_array_index(
                 relations->r02_accessed, OspreyChunkRelation, j);
             if (!address_equal(&target->chunk.address, &base->base) ||
@@ -1282,6 +1352,10 @@ static OspreyStatus compile_cd06(OspreyContext *ctx)
             return rules_error(ctx, OSPREY_INVALID_GRAPH);
         }
         for (guint j = 0; j < relations->r02_accessed->len; j++) {
+            if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                      OSPREY_BUDGET_RULE_PROBE, 1)) {
+                return OSPREY_LIMIT_EXCEEDED;
+            }
             const OspreyChunkRelation *target = &g_array_index(
                 relations->r02_accessed, OspreyChunkRelation, j);
             if (!address_equal(&target->chunk.address, &base->base) ||
@@ -1332,6 +1406,10 @@ static OspreyStatus collect_cd11(OspreyContext *ctx, GArray *proposals)
             continue;
         }
         for (guint j = 0; j < relations->r02_accessed->len; j++) {
+            if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                      OSPREY_BUDGET_RULE_PROBE, 1)) {
+                return OSPREY_LIMIT_EXCEEDED;
+            }
             const OspreyChunkRelation *target = &g_array_index(
                 relations->r02_accessed, OspreyChunkRelation, j);
             if (!address_equal(&target->chunk.address, &points->target)) {
@@ -1366,6 +1444,10 @@ static OspreyStatus compile_cd11(OspreyContext *ctx)
             return rules_error(ctx, OSPREY_INVALID_GRAPH);
         }
         for (guint j = 0; j < relations->r02_accessed->len; j++) {
+            if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                      OSPREY_BUDGET_RULE_PROBE, 1)) {
+                return OSPREY_LIMIT_EXCEEDED;
+            }
             const OspreyChunkRelation *target = &g_array_index(
                 relations->r02_accessed, OspreyChunkRelation, j);
             if (!address_equal(&target->chunk.address, &points->target)) {
@@ -1407,6 +1489,10 @@ static OspreyStatus compile_cd10(OspreyContext *ctx)
         const OspreyVar *first = &g_array_index(graph->vars, OspreyVar, i);
         if (first->kind != OSPREY_PRED_FIELD_OF) continue;
         for (guint j = i + 1; j < graph->vars->len; j++) {
+            if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                      OSPREY_BUDGET_RULE_PROBE, 1)) {
+                return OSPREY_LIMIT_EXCEEDED;
+            }
             const OspreyVar *second = &g_array_index(graph->vars,
                                                      OspreyVar, j);
             if (second->kind != OSPREY_PRED_FIELD_OF ||
@@ -1677,6 +1763,11 @@ static OspreyStatus cd04_round(OspreyContext *ctx, GHashTable *pair_seen,
         const OspreyVar *first = &g_array_index(
             graph->vars, OspreyVar, g_array_index(ids, uint32_t, i));
         for (guint j = i + 1; j < ids->len && status == OSPREY_OK; j++) {
+            if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                      OSPREY_BUDGET_RULE_PROBE, 1)) {
+                status = OSPREY_LIMIT_EXCEEDED;
+                break;
+            }
             const OspreyVar *second = &g_array_index(
                 graph->vars, OspreyVar, g_array_index(ids, uint32_t, j));
             status = cd04_try_pair(ctx, first, second, false, pair_seen,
@@ -2217,6 +2308,11 @@ static OspreyStatus secondary_array_round(OspreyContext *ctx,
         const OspreyVar *first = &g_array_index(ctx->graph->vars,
                                                 OspreyVar, first_id);
         for (guint j = i + 1; j < arrays->len; j++) {
+            if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                      OSPREY_BUDGET_RULE_PROBE, 1)) {
+                status = OSPREY_LIMIT_EXCEEDED;
+                break;
+            }
             uint32_t second_id = g_array_index(arrays, uint32_t, j);
             const OspreyVar *second = &g_array_index(ctx->graph->vars,
                                                      OspreyVar, second_id);
@@ -2235,6 +2331,11 @@ static OspreyStatus secondary_array_round(OspreyContext *ctx,
         const OspreyVar *array = &g_array_index(ctx->graph->vars,
                                                 OspreyVar, array_id);
         for (guint j = 0; j < scalars->len; j++) {
+            if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                      OSPREY_BUDGET_RULE_PROBE, 1)) {
+                status = OSPREY_LIMIT_EXCEEDED;
+                break;
+            }
             uint32_t scalar_id = g_array_index(scalars, uint32_t, j);
             const OspreyVar *scalar = &g_array_index(ctx->graph->vars,
                                                      OspreyVar, scalar_id);
@@ -2648,6 +2749,11 @@ static OspreyStatus cd08_round(OspreyContext *ctx, GHashTable *seen,
             }
             for (guint fi = 0; fi < fields->len && status == OSPREY_OK;
                  fi++) {
+                if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                          OSPREY_BUDGET_RULE_PROBE, 1)) {
+                    status = OSPREY_LIMIT_EXCEEDED;
+                    break;
+                }
                 uint32_t field_id = g_array_index(fields, uint32_t, fi);
                 const OspreyVar *field = &g_array_index(
                     graph->vars, OspreyVar, field_id);
@@ -2684,6 +2790,11 @@ static OspreyStatus cd08_round(OspreyContext *ctx, GHashTable *seen,
                 }
                 for (guint ai = 0; ai < ctx->relations->r02_accessed->len;
                      ai++) {
+                    if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                              OSPREY_BUDGET_RULE_PROBE, 1)) {
+                        status = OSPREY_LIMIT_EXCEEDED;
+                        break;
+                    }
                     const OspreyChunkRelation *access = &g_array_index(
                         ctx->relations->r02_accessed,
                         OspreyChunkRelation, ai);
@@ -2930,6 +3041,11 @@ OspreyStatus osprey_secondary_static_closure(OspreyContext *ctx,
     OspreyStatus status = OSPREY_OK;
     for (;;) {
         bool changed = false;
+        if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                  OSPREY_BUDGET_CLOSURE, 1)) {
+            status = OSPREY_LIMIT_EXCEEDED;
+            break;
+        }
         status = secondary_array_round(ctx, array_processed, &changed);
         if (status != OSPREY_OK || !changed) break;
     }
@@ -2968,6 +3084,11 @@ OspreyStatus osprey_secondary_static_closure(OspreyContext *ctx,
         g_bytes_hash, g_bytes_equal, (GDestroyNotify)g_bytes_unref, NULL);
     for (;;) {
         bool changed = false;
+        if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                  OSPREY_BUDGET_CLOSURE, 1)) {
+            status = OSPREY_LIMIT_EXCEEDED;
+            break;
+        }
         status = cd04_round(ctx, cd04_pairs, cd04_unions, &changed);
         if (status != OSPREY_OK || !changed) break;
     }
@@ -2979,6 +3100,11 @@ OspreyStatus osprey_secondary_static_closure(OspreyContext *ctx,
         g_bytes_hash, g_bytes_equal, (GDestroyNotify)g_bytes_unref, NULL);
     for (;;) {
         bool changed = false;
+        if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                                  OSPREY_BUDGET_CLOSURE, 1)) {
+            status = OSPREY_LIMIT_EXCEEDED;
+            break;
+        }
         status = cd08_round(ctx, cd08_seen, &changed);
         if (status != OSPREY_OK || !changed) break;
     }
@@ -3084,10 +3210,30 @@ OspreyStatus osprey_stage3_base(OspreyContext *ctx)
     if (ctx->graph == NULL) ctx->graph = osprey_graph_new();
     OspreyGraph *graph = ctx->graph;
     osprey_graph_set_stage(graph, OSPREY_GRAPH_BASE_CA);
+    if (!rules_charge_cubic(ctx, ctx->relations->logical_accesses->len)) {
+        return OSPREY_LIMIT_EXCEEDED;
+    }
+    if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                              OSPREY_BUDGET_RULE_PROBE,
+                              (uint64_t)ctx->relations->logical_accesses->len) ||
+        !osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                              OSPREY_BUDGET_RULE_PROBE,
+                              (uint64_t)ctx->relations->r01_accessed->len) ||
+        !osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                              OSPREY_BUDGET_RULE_PROBE,
+                              (uint64_t)ctx->base_facts->len) ||
+        !osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                              OSPREY_BUDGET_RULE_PROBE,
+                              (uint64_t)ctx->points_facts->len) ||
+        !osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                              OSPREY_BUDGET_RULE_PROBE,
+                              (uint64_t)ctx->graph->vars->len)) {
+        return OSPREY_LIMIT_EXCEEDED;
+    }
 
-    closure_r10(ctx);
-    closure_r11(ctx);
-    closure_r12(ctx);
+    if (!closure_r10(ctx) || !closure_r11(ctx) || !closure_r12(ctx)) {
+        return OSPREY_LIMIT_EXCEEDED;
+    }
 
     GArray *proposals = g_array_new(FALSE, FALSE,
                                     sizeof(OspreyCandidateProposal));

@@ -3067,6 +3067,7 @@ void osprey_tx_begin(OspreyContext *ctx) {
     ctx->tx_reason = NULL;
     ctx->tx_model_ready = false;
     ctx->last_status = OSPREY_OK;
+    osprey_budget_begin(ctx);
 }
 
 /* Reject the current transaction: record the first failure (status,
@@ -3084,6 +3085,12 @@ void osprey_tx_reject(OspreyContext *ctx, OspreyStatus st,
         log_msg("[osprey] [reject] [status %d] [stage %s] [reason %s]\n",
                 (int)st, stage != NULL ? stage : "?",
                 reason != NULL ? reason : "?");
+        /* A merge rejection has no later analyze() call in the forkserver
+         * path.  Close its parent-only accounting window here; analysis-stage
+         * rejections finish explicitly from osprey_analyze(). */
+        if (stage != NULL && strcmp(stage, "merge") == 0) {
+            osprey_budget_finish(ctx, st);
+        }
     }
 }
 
@@ -3467,7 +3474,7 @@ static void merge_logical_accesses(OspreyContext *ctx,
  * counters are always summed with saturation (a fact observed both
  * before the snapshot and in the child suffix is one sample with the
  * sum of its observations). */
-static void merge_access_family(OspreyContext *ctx, const OspreySharedRun *run,
+static bool merge_access_family(OspreyContext *ctx, const OspreySharedRun *run,
                                 int table, int peer, guint sample_from) {
     OspreyRunIter it;
     const void *rec;
@@ -3497,9 +3504,10 @@ static void merge_access_family(OspreyContext *ctx, const OspreySharedRun *run,
             g_array_append_val(ctx->access_facts, *f);
         }
     }
+    return true;
 }
 
-static void merge_base_family(OspreyContext *ctx, const OspreySharedRun *run,
+static bool merge_base_family(OspreyContext *ctx, const OspreySharedRun *run,
                               int table, int peer, guint sample_from) {
     OspreyRunIter it;
     const void *rec;
@@ -3534,9 +3542,10 @@ static void merge_base_family(OspreyContext *ctx, const OspreySharedRun *run,
             g_array_append_val(ctx->base_facts, *f);
         }
     }
+    return true;
 }
 
-static void merge_copy_facts(OspreyContext *ctx, const OspreySharedRun *run,
+static bool merge_copy_facts(OspreyContext *ctx, const OspreySharedRun *run,
                              int table, int peer, guint sample_from) {
     OspreyRunIter it;
     const void *rec;
@@ -3564,9 +3573,10 @@ static void merge_copy_facts(OspreyContext *ctx, const OspreySharedRun *run,
             g_array_append_val(ctx->copy_facts, *f);
         }
     }
+    return true;
 }
 
-static void merge_points_facts(OspreyContext *ctx,
+static bool merge_points_facts(OspreyContext *ctx,
                                const OspreySharedRun *run,
                                int table, int peer, guint sample_from) {
     OspreyRunIter it;
@@ -3597,9 +3607,10 @@ static void merge_points_facts(OspreyContext *ctx,
             g_array_append_val(ctx->points_facts, *f);
         }
     }
+    return true;
 }
 
-static void merge_alloc_facts(OspreyContext *ctx,
+static bool merge_alloc_facts(OspreyContext *ctx,
                               const OspreySharedRun *run,
                               int table, int peer, guint sample_from) {
     OspreyRunIter it;
@@ -3628,9 +3639,10 @@ static void merge_alloc_facts(OspreyContext *ctx,
             g_array_append_val(ctx->alloc_facts, *f);
         }
     }
+    return true;
 }
 
-static void merge_mayarray_facts(OspreyContext *ctx,
+static bool merge_mayarray_facts(OspreyContext *ctx,
                                  const OspreySharedRun *run,
                                  int table, int peer, guint sample_from) {
     OspreyRunIter it;
@@ -3659,9 +3671,10 @@ static void merge_mayarray_facts(OspreyContext *ctx,
             g_array_append_val(ctx->mayarray_facts, *f);
         }
     }
+    return true;
 }
 
-static void merge_region_instances(OspreyContext *ctx,
+static bool merge_region_instances(OspreyContext *ctx,
                                    const OspreySharedRun *run,
                                    int table, int peer, guint sample_from) {
     OspreyRunIter it;
@@ -3692,6 +3705,346 @@ static void merge_region_instances(OspreyContext *ctx,
             g_array_append_val(ctx->region_instances, *f);
         }
     }
+    return true;
+}
+
+static bool osprey_u64_add_checked(uint64_t *value, uint64_t add)
+{
+    if (value == NULL || add > UINT64_MAX - *value) return false;
+    *value += add;
+    return true;
+}
+
+/* Semantic wrapper hashes/equality functions used by parent preflight. */
+#define OSPREY_PARENT_HASH_WRAPPER(_name, _type, _hash) \
+    static guint _name(gconstpointer value) { \
+        uint64_t h = _hash((const _type *)value); \
+        return (guint)(h ^ (h >> 32)); \
+    }
+#define OSPREY_PARENT_EQ_WRAPPER(_name, _type, _eq) \
+    static gboolean _name(gconstpointer left, gconstpointer right) { \
+        return _eq((const _type *)left, (const _type *)right); \
+    }
+
+OSPREY_PARENT_HASH_WRAPPER(parent_access_hash, OspreyAccessFact,
+                           osprey_access_hash)
+OSPREY_PARENT_EQ_WRAPPER(parent_access_eq, OspreyAccessFact, osprey_access_eq)
+OSPREY_PARENT_HASH_WRAPPER(parent_base_hash, OspreyBaseFact, osprey_base_hash)
+OSPREY_PARENT_EQ_WRAPPER(parent_base_eq, OspreyBaseFact, osprey_base_eq)
+OSPREY_PARENT_HASH_WRAPPER(parent_copy_hash, OspreyCopyFact, osprey_copy_hash)
+OSPREY_PARENT_EQ_WRAPPER(parent_copy_eq, OspreyCopyFact, osprey_copy_eq)
+OSPREY_PARENT_HASH_WRAPPER(parent_points_hash, OspreyPointsToFact,
+                           osprey_points_hash)
+OSPREY_PARENT_EQ_WRAPPER(parent_points_eq, OspreyPointsToFact, osprey_points_eq)
+OSPREY_PARENT_HASH_WRAPPER(parent_alloc_hash, OspreyMallocFact, osprey_alloc_hash)
+OSPREY_PARENT_EQ_WRAPPER(parent_alloc_eq, OspreyMallocFact, osprey_alloc_eq)
+OSPREY_PARENT_HASH_WRAPPER(parent_mayarray_hash, OspreyMayArrayFact,
+                           osprey_mayarray_hash)
+OSPREY_PARENT_EQ_WRAPPER(parent_mayarray_eq, OspreyMayArrayFact,
+                         osprey_mayarray_eq)
+OSPREY_PARENT_HASH_WRAPPER(parent_region_hash, OspreyRegionInstance,
+                           osprey_region_instance_hash)
+OSPREY_PARENT_EQ_WRAPPER(parent_region_eq, OspreyRegionInstance,
+                         osprey_region_instance_eq)
+OSPREY_PARENT_HASH_WRAPPER(parent_chunk_hash, OspreyCensusChunk,
+                           osprey_census_chunk_hash)
+OSPREY_PARENT_EQ_WRAPPER(parent_chunk_eq, OspreyCensusChunk,
+                         osprey_census_chunk_eq)
+
+static gpointer osprey_parent_record_copy(const void *record, gsize size)
+{
+    gpointer copy = g_malloc(size);
+    memcpy(copy, record, size);
+    return copy;
+}
+
+/* Count the union of one committed fact family and both run families.  The
+ * semantic hash/equality pair is the same pair used by the merge itself, so
+ * duplicate-heavy samples do not consume parent capacity prematurely. */
+static bool osprey_parent_projected_family(
+    OspreyContext *ctx, const GArray *committed,
+    const OspreySharedRun *run, int primary_table, int prefix_table,
+    gsize record_size, GHashFunc hash, GEqualFunc equal, uint64_t *out)
+{
+    GHashTable *seen;
+    const int tables[2] = { prefix_table, primary_table };
+
+    if (ctx == NULL || committed == NULL || run == NULL || out == NULL) {
+        return false;
+    }
+    seen = g_hash_table_new_full(hash, equal, g_free, NULL);
+    for (guint i = 0; i < committed->len; i++) {
+        const uint8_t *record = (const uint8_t *)committed->data +
+                                (size_t)i * record_size;
+        if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_MERGE,
+                                  OSPREY_BUDGET_PARENT_PREFLIGHT, 1)) {
+            g_hash_table_destroy(seen);
+            return false;
+        }
+        if (!g_hash_table_contains(seen, record)) {
+            g_hash_table_add(seen,
+                             osprey_parent_record_copy(record, record_size));
+        }
+    }
+    for (size_t t = 0; t < G_N_ELEMENTS(tables); t++) {
+        OspreyRunIter it = { .run = run, .table = tables[t] };
+        const void *record;
+        while (osprey_run_iter_next(&it, &record)) {
+            if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_MERGE,
+                                      OSPREY_BUDGET_PARENT_PREFLIGHT, 1)) {
+                g_hash_table_destroy(seen);
+                return false;
+            }
+            if (!g_hash_table_contains(seen, record)) {
+                g_hash_table_add(seen,
+                                 osprey_parent_record_copy(record,
+                                                           record_size));
+            }
+        }
+    }
+    *out = (uint64_t)g_hash_table_size(seen);
+    g_hash_table_destroy(seen);
+    return true;
+}
+
+static bool osprey_parent_projected_chunk_add(
+    OspreyContext *ctx, GHashTable *seen, const OspreyChunk *chunk)
+{
+    OspreyCensusChunk key;
+    if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_MERGE,
+                              OSPREY_BUDGET_PARENT_PREFLIGHT, 1)) {
+        return false;
+    }
+    memset(&key, 0, sizeof(key));
+    key.chunk = *chunk;
+    if (!g_hash_table_contains(seen, &key)) {
+        g_hash_table_add(seen, osprey_parent_record_copy(&key, sizeof(key)));
+    }
+    return true;
+}
+
+static bool osprey_parent_projected_chunks(OspreyContext *ctx,
+                                           const OspreySharedRun *run,
+                                           uint64_t *out)
+{
+    GHashTable *seen;
+    const int tables[8] = {
+        OSPREY_TABLE_PREFIX_ACCESS, OSPREY_TABLE_ACCESS,
+        OSPREY_TABLE_PREFIX_BASE, OSPREY_TABLE_BASE,
+        OSPREY_TABLE_PREFIX_COPY, OSPREY_TABLE_COPY,
+        OSPREY_TABLE_PREFIX_POINTS, OSPREY_TABLE_POINTS,
+    };
+
+    if (ctx == NULL || run == NULL || out == NULL) return false;
+    seen = g_hash_table_new_full(parent_chunk_hash, parent_chunk_eq, g_free,
+                                 NULL);
+#define ADD_COMMITTED_CHUNK(_array, _type, _member) \
+    do { \
+        for (guint _i = 0; _i < (_array)->len; _i++) { \
+            const _type *_fact = &g_array_index((_array), _type, _i); \
+            if (!osprey_parent_projected_chunk_add(ctx, seen, \
+                                                   &_fact->_member)) { \
+                g_hash_table_destroy(seen); \
+                return false; \
+            } \
+        } \
+    } while (0)
+    ADD_COMMITTED_CHUNK(ctx->access_facts, OspreyAccessFact, chunk);
+    ADD_COMMITTED_CHUNK(ctx->base_facts, OspreyBaseFact, chunk);
+    ADD_COMMITTED_CHUNK(ctx->copy_facts, OspreyCopyFact, source);
+    ADD_COMMITTED_CHUNK(ctx->copy_facts, OspreyCopyFact, destination);
+    ADD_COMMITTED_CHUNK(ctx->points_facts, OspreyPointsToFact, pointer_chunk);
+#undef ADD_COMMITTED_CHUNK
+
+    for (size_t t = 0; t < G_N_ELEMENTS(tables); t++) {
+        OspreyRunIter it = { .run = run, .table = tables[t] };
+        const void *record;
+        while (osprey_run_iter_next(&it, &record)) {
+            if (tables[t] == OSPREY_TABLE_PREFIX_ACCESS ||
+                tables[t] == OSPREY_TABLE_ACCESS) {
+                const OspreyAccessFact *fact = record;
+                if (!osprey_parent_projected_chunk_add(ctx, seen,
+                                                       &fact->chunk)) {
+                    g_hash_table_destroy(seen);
+                    return false;
+                }
+            } else if (tables[t] == OSPREY_TABLE_PREFIX_BASE ||
+                       tables[t] == OSPREY_TABLE_BASE) {
+                const OspreyBaseFact *fact = record;
+                if (!osprey_parent_projected_chunk_add(ctx, seen,
+                                                       &fact->chunk)) {
+                    g_hash_table_destroy(seen);
+                    return false;
+                }
+            } else if (tables[t] == OSPREY_TABLE_PREFIX_COPY ||
+                       tables[t] == OSPREY_TABLE_COPY) {
+                const OspreyCopyFact *fact = record;
+                if (!osprey_parent_projected_chunk_add(ctx, seen,
+                                                       &fact->source) ||
+                    !osprey_parent_projected_chunk_add(ctx, seen,
+                                                       &fact->destination)) {
+                    g_hash_table_destroy(seen);
+                    return false;
+                }
+            } else {
+                const OspreyPointsToFact *fact = record;
+                if (!osprey_parent_projected_chunk_add(ctx, seen,
+                                                       &fact->pointer_chunk)) {
+                    g_hash_table_destroy(seen);
+                    return false;
+                }
+            }
+        }
+    }
+    *out = (uint64_t)g_hash_table_size(seen);
+    g_hash_table_destroy(seen);
+    return true;
+}
+
+static bool osprey_parent_preflight_caps(OspreyContext *ctx,
+                                         const OspreySharedRun *run)
+{
+    uint64_t facts = 0;
+    uint64_t chunks = 0;
+    uint64_t regions = 0;
+    uint64_t family_count;
+
+    if (ctx == NULL || run == NULL) return false;
+    if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_MERGE,
+                              OSPREY_BUDGET_PARENT_PREFLIGHT, 3)) {
+        return false;
+    }
+#define COUNT_FAMILY(_array, _primary, _prefix, _size, _hash, _eq) \
+    do { \
+        if (!osprey_parent_projected_family( \
+                ctx, (_array), run, (_primary), (_prefix), (_size), \
+                (_hash), (_eq), &family_count) || \
+            !osprey_u64_add_checked(&facts, family_count)) { \
+            if (osprey_tx_status(ctx) == OSPREY_LIMIT_EXCEEDED) return false; \
+            goto overflow; \
+        } \
+    } while (0)
+    COUNT_FAMILY(ctx->access_facts, OSPREY_TABLE_ACCESS,
+                 OSPREY_TABLE_PREFIX_ACCESS, sizeof(OspreyAccessFact),
+                 parent_access_hash, parent_access_eq);
+    COUNT_FAMILY(ctx->base_facts, OSPREY_TABLE_BASE,
+                 OSPREY_TABLE_PREFIX_BASE, sizeof(OspreyBaseFact),
+                 parent_base_hash, parent_base_eq);
+    COUNT_FAMILY(ctx->copy_facts, OSPREY_TABLE_COPY,
+                 OSPREY_TABLE_PREFIX_COPY, sizeof(OspreyCopyFact),
+                 parent_copy_hash, parent_copy_eq);
+    COUNT_FAMILY(ctx->points_facts, OSPREY_TABLE_POINTS,
+                 OSPREY_TABLE_PREFIX_POINTS, sizeof(OspreyPointsToFact),
+                 parent_points_hash, parent_points_eq);
+    COUNT_FAMILY(ctx->alloc_facts, OSPREY_TABLE_ALLOC,
+                 OSPREY_TABLE_PREFIX_ALLOC, sizeof(OspreyMallocFact),
+                 parent_alloc_hash, parent_alloc_eq);
+    COUNT_FAMILY(ctx->mayarray_facts, OSPREY_TABLE_MAYARR,
+                 OSPREY_TABLE_PREFIX_MAYARR, sizeof(OspreyMayArrayFact),
+                 parent_mayarray_hash, parent_mayarray_eq);
+    COUNT_FAMILY(ctx->region_instances, OSPREY_TABLE_REGION,
+                 OSPREY_TABLE_PREFIX_REGION, sizeof(OspreyRegionInstance),
+                 parent_region_hash, parent_region_eq);
+    regions = family_count;
+#undef COUNT_FAMILY
+    if (!osprey_parent_projected_chunks(ctx, run, &chunks)) return false;
+    if (ctx->config.max_parent_facts != 0 &&
+        facts > ctx->config.max_parent_facts) {
+        osprey_tx_reject(ctx, OSPREY_LIMIT_EXCEEDED, "merge",
+                         "analysis-parent-facts-cap");
+        return false;
+    }
+    if (ctx->config.max_parent_chunks != 0 &&
+        chunks > ctx->config.max_parent_chunks) {
+        osprey_tx_reject(ctx, OSPREY_LIMIT_EXCEEDED, "merge",
+                         "analysis-parent-chunks-cap");
+        return false;
+    }
+    if (ctx->config.max_parent_regions != 0 &&
+        regions > ctx->config.max_parent_regions) {
+        osprey_tx_reject(ctx, OSPREY_LIMIT_EXCEEDED, "merge",
+                         "analysis-parent-regions-cap");
+        return false;
+    }
+    log_msg("[osprey] [merge] [parent-preflight] [facts %llu] "
+            "[chunks %llu] [regions %llu]\n",
+            (unsigned long long)facts, (unsigned long long)chunks,
+            (unsigned long long)regions);
+    return true;
+
+overflow:
+    osprey_tx_reject(ctx, OSPREY_LIMIT_EXCEEDED, "merge",
+                     "analysis-parent-facts-cap");
+    return false;
+}
+
+/* Reserve all worst-case committed-array comparisons before any family is
+ * mutated.  The actual merge can then use its existing linear equality scans
+ * without a mid-merge rejection leaving partially updated support counters. */
+static bool osprey_parent_merge_work_reserve(OspreyContext *ctx,
+                                             const OspreySharedRun *run)
+{
+    const GArray *families[OSPREY_TABLE_PRIMARY_COUNT] = {
+        ctx->access_facts, ctx->base_facts, ctx->copy_facts,
+        ctx->points_facts, ctx->alloc_facts, ctx->mayarray_facts,
+        ctx->region_instances,
+    };
+    uint64_t work = 0;
+    for (int table = 0; table < OSPREY_TABLE_PRIMARY_COUNT; table++) {
+        int prefix_table = OSPREY_TABLE_PREFIX_ACCESS + table;
+        uint64_t primary_incoming = table_used_count(run, table);
+        uint64_t prefix_incoming = table_used_count(run, prefix_table);
+        uint64_t incoming = primary_incoming + prefix_incoming;
+        uint64_t committed = (uint64_t)families[table]->len;
+        uint64_t family_work = 0;
+
+        /* Equality scans: incoming record j scans committed_start + j
+         * entries (the committed array grows by one per append). */
+        if (incoming != 0 && committed > UINT64_MAX / incoming) {
+            work = UINT64_MAX;
+            break;
+        }
+        family_work = incoming * committed;
+        if (incoming > 1) {
+            if (incoming - 1 > UINT64_MAX / incoming) {
+                work = UINT64_MAX;
+                break;
+            }
+            uint64_t quadratic = incoming * (incoming - 1) / 2;
+            if (quadratic > UINT64_MAX - family_work) {
+                work = UINT64_MAX;
+                break;
+            }
+            family_work += quadratic;
+        }
+        if (family_work > UINT64_MAX - work) {
+            work = UINT64_MAX;
+            break;
+        }
+        work += family_work;
+
+        /* Prefix rows that match a committed entry probe the primary
+         * open-addressed table; this is only possible once the committed
+         * family is nonempty (sample_from > 0).  At most one committed
+         * entry can match each prefix row. */
+        if (prefix_incoming != 0 && committed != 0) {
+            uint64_t peer_capacity = table_cap_of(run, table);
+            uint64_t peer_probes = prefix_incoming < committed
+                ? prefix_incoming : committed;
+            if (peer_capacity > UINT64_MAX / peer_probes) {
+                work = UINT64_MAX;
+                break;
+            }
+            peer_probes *= peer_capacity;
+            if (peer_probes > UINT64_MAX - work) {
+                work = UINT64_MAX;
+                break;
+            }
+            work += peer_probes;
+        }
+    }
+    return work == 0 || osprey_budget_charge(
+        ctx, OSPREY_ANALYSIS_MERGE, OSPREY_BUDGET_PARENT_PREFLIGHT, work);
 }
 
 /* Merge one completed sample (patch-0/iter-1 child run) into the
@@ -3782,6 +4135,12 @@ OspreyStatus osprey_parent_merge_sample(OspreyContext *ctx,
         osprey_tx_reject(ctx, OSPREY_INCOMPLETE_FACTS, "merge",
                          "invalid allocator fact record");
         return OSPREY_INCOMPLETE_FACTS;
+    }
+    if (!osprey_parent_preflight_caps(ctx, run)) {
+        return OSPREY_LIMIT_EXCEEDED;
+    }
+    if (!osprey_parent_merge_work_reserve(ctx, run)) {
+        return OSPREY_LIMIT_EXCEEDED;
     }
 
     /* Construct this before mutating any committed array.  The full
@@ -4229,16 +4588,29 @@ OspreyStatus osprey_analyze(OspreyContext *ctx) {
      * fully OSPREY_OK transaction installs the graph/model.  Any
      * non-OK status rejects the transaction and leaves no model
      * exposed (Stage 0). */
-    if (!osprey_tx_ok(ctx)) return osprey_tx_status(ctx);
+    if (!osprey_tx_ok(ctx)) {
+        OspreyStatus rejected = osprey_tx_status(ctx);
+        osprey_budget_finish(ctx, rejected);
+        return rejected;
+    }
     ctx->tx_model_ready = false;
+    if (!ctx->analysis_active) osprey_budget_begin(ctx);
 
     /* Stage 3.1 is independent of predicate/factor construction.  Build
      * its immutable parent-local relations first so later rule stages do
      * not rescan class-specific F01 rows. */
+    osprey_budget_stage_begin(ctx, OSPREY_ANALYSIS_RELATIONS);
     OspreyStatus relation_status = osprey_relations_build(ctx);
+    osprey_budget_stage_end(ctx, OSPREY_ANALYSIS_RELATIONS, relation_status,
+                            ctx->relations != NULL &&
+                            ctx->relations->logical_accesses != NULL
+                                ? ctx->relations->logical_accesses->len : 0);
     if (relation_status != OSPREY_OK) {
         osprey_tx_reject(ctx, relation_status, "relations",
-                         "deterministic relation construction failed");
+                         relation_status == OSPREY_LIMIT_EXCEEDED
+                             ? ctx->tx_reason
+                             : "deterministic relation construction failed");
+        osprey_budget_finish(ctx, relation_status);
         return relation_status;
     }
 
@@ -4248,9 +4620,15 @@ OspreyStatus osprey_analyze(OspreyContext *ctx) {
     ctx->staged_graph = osprey_graph_new();
     ctx->graph = ctx->staged_graph;
 
+    osprey_budget_stage_begin(ctx, OSPREY_ANALYSIS_STAGE3);
     OspreyStatus st = osprey_stage3_build(ctx);
     if (st != OSPREY_OK && st != OSPREY_DISABLED) {
-        osprey_tx_reject(ctx, st, "closure", "stage-3 construction failed");
+        osprey_tx_reject(ctx, st, "closure",
+                         st == OSPREY_LIMIT_EXCEEDED
+                             ? ctx->tx_reason : "stage-3 construction failed");
+        osprey_budget_stage_end(ctx, OSPREY_ANALYSIS_STAGE3, st,
+                                ctx->graph != NULL && ctx->graph->vars != NULL
+                                    ? ctx->graph->vars->len : 0);
         goto fail;
     }
     if (ctx->config.graph_dump_file[0] != '\0' &&
@@ -4258,10 +4636,20 @@ OspreyStatus osprey_analyze(OspreyContext *ctx) {
         osprey_tx_reject(ctx, OSPREY_INVALID_GRAPH, "graph",
                          "canonical graph dump failed");
         st = OSPREY_INVALID_GRAPH;
+        osprey_budget_stage_end(ctx, OSPREY_ANALYSIS_STAGE3, st,
+                                ctx->graph != NULL && ctx->graph->vars != NULL
+                                    ? ctx->graph->vars->len : 0);
         goto fail;
     }
+    osprey_budget_stage_end(ctx, OSPREY_ANALYSIS_STAGE3, st,
+                            ctx->graph != NULL && ctx->graph->vars != NULL
+                                ? ctx->graph->vars->len : 0);
     /* Stage 3b: exact base inference plus complete BP/CC07 closure. */
+    osprey_budget_stage_begin(ctx, OSPREY_ANALYSIS_INFER);
     st = osprey_infer(ctx);
+    osprey_budget_stage_end(ctx, OSPREY_ANALYSIS_INFER, st,
+                            ctx->graph != NULL && ctx->graph->vars != NULL
+                                ? ctx->graph->vars->len : 0);
     if (st != OSPREY_OK && st != OSPREY_DISABLED) {
         const char *infer_reason = ctx->tx_reason;
         if (infer_reason == NULL) {
@@ -4279,7 +4667,10 @@ OspreyStatus osprey_analyze(OspreyContext *ctx) {
         goto fail;
     }
     /* Stage 4: consistent decoding into the OspreyModel. */
+    osprey_budget_stage_begin(ctx, OSPREY_ANALYSIS_DECODE);
     st = osprey_decode(ctx);
+    osprey_budget_stage_end(ctx, OSPREY_ANALYSIS_DECODE, st,
+                            ctx->staged_model != NULL ? 1 : 0);
     if (st != OSPREY_OK && st != OSPREY_DISABLED) {
         osprey_tx_reject(ctx, st, "decode",
                          ctx->tx_reason != NULL ? ctx->tx_reason :
@@ -4305,12 +4696,14 @@ OspreyStatus osprey_analyze(OspreyContext *ctx) {
     }
     log_msg("[osprey] [done] [status %d] [stages relations+base+secondary+infer+decode]\n",
             (int)st);
+    osprey_budget_finish(ctx, st);
     return st;
 
 fail:
     /* Detach the staged graph, then abort (frees staged graph/model). */
     ctx->graph = old_graph;
     osprey_tx_abort(ctx);
+    osprey_budget_finish(ctx, st);
     return st;
 }
 

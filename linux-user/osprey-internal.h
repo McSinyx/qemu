@@ -15,6 +15,42 @@
 
 #include "osprey.h"
 
+/* Parent-only analysis accounting.  These enums and counters never enter
+ * OspreySharedRun or any forkserver message. */
+typedef enum OspreyAnalysisStage {
+    OSPREY_ANALYSIS_MERGE = 0,
+    OSPREY_ANALYSIS_RELATIONS,
+    OSPREY_ANALYSIS_STAGE3,
+    OSPREY_ANALYSIS_INFER,
+    OSPREY_ANALYSIS_DECODE,
+    OSPREY_ANALYSIS_STAGE_COUNT
+} OspreyAnalysisStage;
+
+typedef enum OspreyBudgetUnit {
+    OSPREY_BUDGET_RELATION_PROBE = 0,
+    OSPREY_BUDGET_RULE_PROBE,
+    OSPREY_BUDGET_CANDIDATE,
+    OSPREY_BUDGET_PREDICATE,
+    OSPREY_BUDGET_FACTOR,
+    OSPREY_BUDGET_EDGE,
+    OSPREY_BUDGET_GRAPH_GROWTH,
+    OSPREY_BUDGET_UNION_FIND_GROWTH,
+    OSPREY_BUDGET_CLOSURE,
+    OSPREY_BUDGET_INFERENCE_UPDATE,
+    OSPREY_BUDGET_DECODE_OBJECT,
+    OSPREY_BUDGET_PARENT_PREFLIGHT,
+    OSPREY_BUDGET_UNIT_COUNT
+} OspreyBudgetUnit;
+
+void osprey_budget_begin(OspreyContext *ctx);
+bool osprey_budget_charge(OspreyContext *ctx, OspreyAnalysisStage stage,
+                          OspreyBudgetUnit unit, uint64_t units);
+bool osprey_budget_checkpoint(OspreyContext *ctx,
+                              OspreyAnalysisStage stage);
+void osprey_budget_stage_begin(OspreyContext *ctx, OspreyAnalysisStage stage);
+void osprey_budget_stage_end(OspreyContext *ctx, OspreyAnalysisStage stage,
+                             OspreyStatus status, uint64_t retained);
+void osprey_budget_finish(OspreyContext *ctx, OspreyStatus status);
 
 /* ------------------------------------------------------------------ */
 /* Canonical keys (full-field equality; hashes are bucket selectors)  */
@@ -770,6 +806,19 @@ struct OspreyContext {
     /* Image normalization base (== symbolic_start_code). */
     target_ulong image_base;
     bool image_base_set;
+
+    /* Parent-only deterministic analysis accounting.  None of these fields
+     * are shared with child fact collection or forkserver protocol state. */
+    bool analysis_active;
+    bool analysis_budget_exhausted;
+    uint64_t analysis_epoch;
+    uint64_t analysis_work_used;
+    uint64_t analysis_stage_work[OSPREY_ANALYSIS_STAGE_COUNT];
+    uint64_t analysis_unit_work[OSPREY_BUDGET_UNIT_COUNT];
+    int64_t analysis_started_us;
+    int64_t analysis_stage_started_us[OSPREY_ANALYSIS_STAGE_COUNT];
+    uint64_t analysis_stage_start_work[OSPREY_ANALYSIS_STAGE_COUNT];
+    const char *analysis_budget_reason;
 
     /* Committed model (installed only by a successful transaction). */
     OspreyModel *model;

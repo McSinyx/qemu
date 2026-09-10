@@ -6320,12 +6320,59 @@ OspreyStatus osprey_decode(OspreyContext *ctx)
           ctx->graph->factors->len > ctx->config.max_factors))) {
         return OSPREY_LIMIT_EXCEEDED;
     }
+    uint64_t decode_units = 0;
+    if (ctx->graph != NULL && ctx->graph->vars != NULL) {
+        decode_units += ctx->graph->vars->len;
+    }
+    if (ctx->graph != NULL && ctx->graph->factors != NULL &&
+        decode_units <= UINT64_MAX - ctx->graph->factors->len) {
+        decode_units += ctx->graph->factors->len;
+    } else if (ctx->graph != NULL && ctx->graph->factors != NULL) {
+        return OSPREY_LIMIT_EXCEEDED;
+    }
+    if (decode_units != 0 &&
+        !osprey_budget_charge(ctx, OSPREY_ANALYSIS_DECODE,
+                              OSPREY_BUDGET_DECODE_OBJECT, decode_units)) {
+        return OSPREY_LIMIT_EXCEEDED;
+    }
     status = osprey_decode_input_build(ctx, &input);
     if (status != OSPREY_OK) goto fail;
+    uint64_t input_units = (uint64_t)input->primitive_count +
+                           (uint64_t)input->scalar_count +
+                           (uint64_t)input->array_count +
+                           (uint64_t)input->field_count +
+                           (uint64_t)input->pointer_count +
+                           (uint64_t)input->chunk_candidate_count +
+                           (uint64_t)input->chunk_range_count +
+                           (uint64_t)input->field_base_range_count;
+    if (input_units != 0 &&
+        !osprey_budget_charge(ctx, OSPREY_ANALYSIS_DECODE,
+                              OSPREY_BUDGET_DECODE_OBJECT, input_units)) {
+        status = OSPREY_LIMIT_EXCEEDED;
+        goto fail;
+    }
     status = osprey_decode_roles(ctx, input, &plan);
     if (status != OSPREY_OK) goto fail;
+    uint64_t role_units = (uint64_t)plan->decision_count +
+                          (uint64_t)plan->role_loss_count +
+                          (uint64_t)plan->field_group_count;
+    if (role_units != 0 &&
+        !osprey_budget_charge(ctx, OSPREY_ANALYSIS_DECODE,
+                              OSPREY_BUDGET_DECODE_OBJECT, role_units)) {
+        status = OSPREY_LIMIT_EXCEEDED;
+        goto fail;
+    }
     status = osprey_decode_select_arrays(ctx, input, plan);
     if (status != OSPREY_OK) goto fail;
+    uint64_t model_units = (uint64_t)plan->decision_count +
+                           (uint64_t)input->array_count +
+                           (uint64_t)input->field_count;
+    if (model_units != 0 &&
+        !osprey_budget_charge(ctx, OSPREY_ANALYSIS_DECODE,
+                              OSPREY_BUDGET_DECODE_OBJECT, model_units)) {
+        status = OSPREY_LIMIT_EXCEEDED;
+        goto fail;
+    }
     status = osprey_model_build(ctx, plan, &model);
     if (status != OSPREY_OK) goto fail;
     if (osprey_decode_prevalidate_hook != NULL) {

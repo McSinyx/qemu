@@ -2044,6 +2044,10 @@ void snapshot_init(void) {
         if (osprey_config_from_env(&osprey_config)) {
             g_osprey_ctx = osprey_new(&osprey_config);
             osprey_collect_enabled = osprey_config.enabled ? 1 : 0;
+        } else {
+            /* Keep forkserver startup and generic mutation fallback alive, but
+             * make a rejected OSPREY configuration observable. */
+            log_msg("[osprey] [config] [disabled] [reason parse-failure]\n");
         }
     }
     if (g_osprey_ctx != NULL && g_osprey_ctx->config.enabled &&

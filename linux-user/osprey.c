@@ -59,7 +59,14 @@ static const char *g_pre_sample_reason;
 #define OSPREY_MAX_EXACT_TABLE_MB 4096u
 #define OSPREY_DEFAULT_MAX_BP_TABLE_MB 256u
 #define OSPREY_MAX_BP_TABLE_MB 4096u
+#define OSPREY_DEFAULT_MAX_ANALYSIS_WORK 10000000ULL
+#define OSPREY_DEFAULT_MAX_PARENT_FACTS 1048576ULL
+#define OSPREY_DEFAULT_MAX_PARENT_CHUNKS 1048576ULL
+#define OSPREY_DEFAULT_MAX_PARENT_REGIONS 65536ULL
 #define OSPREY_DEFAULT_REPORT_THRESHOLD 0.6
+
+/* Diagnostic sink (snapshot.c). */
+void log_msg(const char *fmt, ...);
 
 static bool osprey_parse_u64(const char *name, uint64_t *out) {
     if (out == NULL) {
@@ -118,6 +125,11 @@ bool osprey_config_from_env(OspreyConfig *config) {
         (uint64_t)OSPREY_DEFAULT_MAX_EXACT_TABLE_MB * 1024u * 1024u;
     config->max_bp_table_bytes =
         (uint64_t)OSPREY_DEFAULT_MAX_BP_TABLE_MB * 1024u * 1024u;
+    config->max_analysis_work = OSPREY_DEFAULT_MAX_ANALYSIS_WORK;
+    config->analysis_deadline_ms = 0;
+    config->max_parent_facts = OSPREY_DEFAULT_MAX_PARENT_FACTS;
+    config->max_parent_chunks = OSPREY_DEFAULT_MAX_PARENT_CHUNKS;
+    config->max_parent_regions = OSPREY_DEFAULT_MAX_PARENT_REGIONS;
     config->report_threshold = OSPREY_DEFAULT_REPORT_THRESHOLD;
 
     const char *v = getenv("BINRADAR_OSPREY_ENABLE");
@@ -144,6 +156,18 @@ bool osprey_config_from_env(OspreyConfig *config) {
     if (tmp != 0) config->max_variables = tmp;
     if (!osprey_parse_u64("BINRADAR_OSPREY_MAX_FACTORS", &tmp)) return false;
     if (tmp != 0) config->max_factors = tmp;
+
+    if (!osprey_parse_u64("BINRADAR_OSPREY_MAX_ANALYSIS_WORK", &tmp)) return false;
+    if (tmp != 0) config->max_analysis_work = tmp;
+    if (!osprey_parse_u64("BINRADAR_OSPREY_ANALYSIS_DEADLINE_MS", &tmp)) return false;
+    config->analysis_deadline_ms = tmp;
+    if (!osprey_parse_u64("BINRADAR_OSPREY_MAX_PARENT_FACTS", &tmp)) return false;
+    if (tmp != 0) config->max_parent_facts = tmp;
+    if (!osprey_parse_u64("BINRADAR_OSPREY_MAX_PARENT_CHUNKS", &tmp)) return false;
+    if (tmp != 0) config->max_parent_chunks = tmp;
+    if (!osprey_parse_u64("BINRADAR_OSPREY_MAX_PARENT_REGIONS", &tmp)) return false;
+    if (tmp != 0) config->max_parent_regions = tmp;
+
     if (!osprey_parse_u64("BINRADAR_OSPREY_MAX_EXACT_CLIQUE_VARS", &tmp)) return false;
     if (tmp != 0) {
         uint64_t width_bits = (uint64_t)sizeof(size_t) * 8u;
@@ -220,6 +244,151 @@ bool osprey_config_from_env(OspreyConfig *config) {
         return false;
     }
     return true;
+}
+
+static const char *osprey_budget_stage_name(OspreyAnalysisStage stage)
+{
+    static const char *const names[OSPREY_ANALYSIS_STAGE_COUNT] = {
+        "merge", "relations", "stage3", "infer", "decode"
+    };
+    return stage < OSPREY_ANALYSIS_STAGE_COUNT ? names[stage] : "unknown";
+}
+
+static const char *osprey_budget_unit_name(OspreyBudgetUnit unit)
+{
+    static const char *const names[OSPREY_BUDGET_UNIT_COUNT] = {
+        "relation-probe", "rule-probe", "candidate", "predicate",
+        "factor", "edge", "graph-growth", "union-find-growth", "closure",
+        "inference-update", "decode-object", "parent-preflight"
+    };
+    return unit < OSPREY_BUDGET_UNIT_COUNT ? names[unit] : "unknown";
+}
+
+static uint64_t osprey_elapsed_ms(int64_t start_us, int64_t end_us)
+{
+    if (start_us < 0 || end_us <= start_us) return 0;
+    return (uint64_t)(end_us - start_us) / 1000u;
+}
+
+static void osprey_budget_reject(OspreyContext *ctx,
+                                 OspreyAnalysisStage stage,
+                                 const char *reason)
+{
+    if (ctx == NULL || ctx->analysis_budget_exhausted) return;
+    ctx->analysis_budget_exhausted = true;
+    ctx->analysis_budget_reason = reason;
+    osprey_tx_reject(ctx, OSPREY_LIMIT_EXCEEDED,
+                     osprey_budget_stage_name(stage), reason);
+}
+
+void osprey_budget_begin(OspreyContext *ctx)
+{
+    if (ctx == NULL) return;
+    memset(ctx->analysis_stage_work, 0, sizeof(ctx->analysis_stage_work));
+    memset(ctx->analysis_unit_work, 0, sizeof(ctx->analysis_unit_work));
+    memset(ctx->analysis_stage_started_us, 0,
+           sizeof(ctx->analysis_stage_started_us));
+    memset(ctx->analysis_stage_start_work, 0,
+           sizeof(ctx->analysis_stage_start_work));
+    ctx->analysis_active = true;
+    ctx->analysis_budget_exhausted = false;
+    ctx->analysis_budget_reason = NULL;
+    ctx->analysis_work_used = 0;
+    ctx->analysis_started_us = g_get_monotonic_time();
+    if (ctx->analysis_epoch != UINT64_MAX) ctx->analysis_epoch++;
+}
+
+bool osprey_budget_checkpoint(OspreyContext *ctx,
+                              OspreyAnalysisStage stage)
+{
+    if (ctx == NULL || !ctx->analysis_active) return true;
+    if (ctx->analysis_budget_exhausted || !osprey_tx_ok(ctx)) return false;
+    if (ctx->config.analysis_deadline_ms != 0) {
+        int64_t now = g_get_monotonic_time();
+        int64_t elapsed = now - ctx->analysis_started_us;
+        uint64_t deadline_us = ctx->config.analysis_deadline_ms >
+                               INT64_MAX / 1000
+            ? UINT64_MAX
+            : ctx->config.analysis_deadline_ms * 1000;
+        if (elapsed >= 0 && (uint64_t)elapsed >= deadline_us) {
+            osprey_budget_reject(ctx, stage, "analysis-deadline");
+            return false;
+        }
+    }
+    return true;
+}
+
+bool osprey_budget_charge(OspreyContext *ctx, OspreyAnalysisStage stage,
+                          OspreyBudgetUnit unit, uint64_t units)
+{
+    if (ctx == NULL || !ctx->analysis_active) return true;
+    if (!osprey_budget_checkpoint(ctx, stage)) return false;
+    if (stage >= OSPREY_ANALYSIS_STAGE_COUNT ||
+        unit >= OSPREY_BUDGET_UNIT_COUNT || units == 0) {
+        return units == 0;
+    }
+    if (units > UINT64_MAX - ctx->analysis_work_used ||
+        units > UINT64_MAX - ctx->analysis_stage_work[stage] ||
+        units > UINT64_MAX - ctx->analysis_unit_work[unit]) {
+        osprey_budget_reject(ctx, stage, "analysis-work-budget");
+        return false;
+    }
+    if (ctx->config.max_analysis_work != 0 &&
+        units > ctx->config.max_analysis_work - ctx->analysis_work_used) {
+        log_msg("[osprey] [budget] [exhausted] [stage %s] [unit %s] "
+                "[used %llu] [limit %llu]\n",
+                osprey_budget_stage_name(stage), osprey_budget_unit_name(unit),
+                (unsigned long long)ctx->analysis_work_used,
+                (unsigned long long)ctx->config.max_analysis_work);
+        osprey_budget_reject(ctx, stage, "analysis-work-budget");
+        return false;
+    }
+    ctx->analysis_work_used += units;
+    ctx->analysis_stage_work[stage] += units;
+    ctx->analysis_unit_work[unit] += units;
+    /* Avoid a clock read on every unit while still checking cooperatively. */
+    if ((ctx->analysis_work_used & 1023u) == 0 &&
+        !osprey_budget_checkpoint(ctx, stage)) return false;
+    return true;
+}
+
+void osprey_budget_stage_begin(OspreyContext *ctx, OspreyAnalysisStage stage)
+{
+    if (ctx == NULL || stage >= OSPREY_ANALYSIS_STAGE_COUNT) return;
+    if (!ctx->analysis_active) osprey_budget_begin(ctx);
+    ctx->analysis_stage_started_us[stage] = g_get_monotonic_time();
+    ctx->analysis_stage_start_work[stage] = ctx->analysis_work_used;
+}
+
+void osprey_budget_stage_end(OspreyContext *ctx, OspreyAnalysisStage stage,
+                             OspreyStatus status, uint64_t retained)
+{
+    if (ctx == NULL || stage >= OSPREY_ANALYSIS_STAGE_COUNT) return;
+    int64_t now = g_get_monotonic_time();
+    int64_t started = ctx->analysis_stage_started_us[stage];
+    uint64_t start_work = ctx->analysis_stage_start_work[stage];
+    uint64_t work = ctx->analysis_work_used >= start_work
+        ? ctx->analysis_work_used - start_work : 0;
+    log_msg("[osprey] [analysis] [stage %s] [elapsed_ms %llu] [work %llu] "
+            "[retained %llu] [status %d] [reason %s]\n",
+            osprey_budget_stage_name(stage),
+            (unsigned long long)osprey_elapsed_ms(started, now),
+            (unsigned long long)work, (unsigned long long)retained,
+            (int)status,
+            ctx->tx_reason != NULL ? ctx->tx_reason : "none");
+}
+
+void osprey_budget_finish(OspreyContext *ctx, OspreyStatus status)
+{
+    if (ctx == NULL || !ctx->analysis_active) return;
+    int64_t now = g_get_monotonic_time();
+    ctx->last_analyze_time_ms = osprey_elapsed_ms(ctx->analysis_started_us, now);
+    log_msg("[osprey] [analysis] [total] [elapsed_ms %llu] [work %llu] "
+            "[status %d] [reason %s]\n",
+            (unsigned long long)ctx->last_analyze_time_ms,
+            (unsigned long long)ctx->analysis_work_used, (int)status,
+            ctx->tx_reason != NULL ? ctx->tx_reason : "none");
+    ctx->analysis_active = false;
 }
 
 /* ------------------------------------------------------------------ */
@@ -719,6 +888,16 @@ OspreyContext *osprey_new(const OspreyConfig *config) {
     ctx->tx_stage = NULL;
     ctx->tx_reason = NULL;
     ctx->tx_model_ready = false;
+    ctx->analysis_started_us = -1;
+    log_msg("[osprey] [config] [mode %s] [work_limit %llu] "
+            "[deadline_ms %llu] [parent_facts %llu] [parent_chunks %llu] "
+            "[parent_regions %llu]\n",
+            config->enabled ? "enabled" : "disabled",
+            (unsigned long long)config->max_analysis_work,
+            (unsigned long long)config->analysis_deadline_ms,
+            (unsigned long long)config->max_parent_facts,
+            (unsigned long long)config->max_parent_chunks,
+            (unsigned long long)config->max_parent_regions);
     ctx->staged_graph = NULL;
     ctx->staged_model = NULL;
     osprey_ctx_ref_set(ctx);

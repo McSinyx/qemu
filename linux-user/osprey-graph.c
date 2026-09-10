@@ -424,6 +424,15 @@ OspreyInternResult osprey_intern_var(OspreyContext *ctx, uint8_t kind,
         graph_set_error(ctx, OSPREY_LIMIT_EXCEEDED);
         return result;
     }
+    if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                              OSPREY_BUDGET_PREDICATE, 1) ||
+        !osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                              OSPREY_BUDGET_GRAPH_GROWTH, 1) ||
+        !osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                              OSPREY_BUDGET_UNION_FIND_GROWTH, 1)) {
+        graph_set_error(ctx, OSPREY_LIMIT_EXCEEDED);
+        return result;
+    }
 
     OspreyVar variable;
     memset(&variable, 0, sizeof(variable));
@@ -637,6 +646,13 @@ static OspreyFactorResult factor_add_typed(OspreyContext *ctx, uint16_t rule,
     }
     if (graph->factors->len >= ctx->config.max_factors ||
         graph->factors->len >= UINT32_MAX) {
+        return factor_error(ctx, OSPREY_LIMIT_EXCEEDED);
+    }
+    if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                              OSPREY_BUDGET_FACTOR, 1) ||
+        !osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                              OSPREY_BUDGET_EDGE,
+                              num_vars > 0 ? num_vars - 1 : 0)) {
         return factor_error(ctx, OSPREY_LIMIT_EXCEEDED);
     }
 
@@ -1457,6 +1473,12 @@ OspreyStatus osprey_candidate_select(OspreyContext *ctx,
     if (count > G_MAXUINT ||
         count > SIZE_MAX / sizeof(CandidateEntry) ||
         count > SIZE_MAX / sizeof(CandidateBucketDelta)) {
+        graph_set_error(ctx, OSPREY_LIMIT_EXCEEDED);
+        return OSPREY_LIMIT_EXCEEDED;
+    }
+    if (count != 0 &&
+        !osprey_budget_charge(ctx, OSPREY_ANALYSIS_STAGE3,
+                              OSPREY_BUDGET_CANDIDATE, (uint64_t)count)) {
         graph_set_error(ctx, OSPREY_LIMIT_EXCEEDED);
         return OSPREY_LIMIT_EXCEEDED;
     }

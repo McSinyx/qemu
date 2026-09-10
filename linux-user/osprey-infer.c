@@ -1955,6 +1955,11 @@ OspreyStatus osprey_exact_topology_build(
     topology->factor_count = base->factor_refs->len;
 
     for (guint i = 0; i < base->components->len; i++) {
+        if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                                  OSPREY_BUDGET_INFERENCE_UPDATE, 1)) {
+            status = OSPREY_LIMIT_EXCEEDED;
+            goto fail;
+        }
         OspreyExactTopologyComponent *component = g_new0(
             OspreyExactTopologyComponent, 1);
         status = exact_component_topology_build(
@@ -1980,6 +1985,11 @@ OspreyStatus osprey_exact_topology_build(
         OspreyExactTopologyComponent *component = g_ptr_array_index(
             topology->components, i);
         for (guint j = 0; j < component->cliques->len; j++) {
+            if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                                      OSPREY_BUDGET_INFERENCE_UPDATE, 1)) {
+                status = OSPREY_LIMIT_EXCEEDED;
+                goto fail;
+            }
             OspreyExactClique *clique = g_ptr_array_index(component->cliques,
                                                            j);
             if (topology->clique_count >= UINT32_MAX) {
@@ -2021,6 +2031,11 @@ OspreyStatus osprey_exact_topology_build(
                 base->factor_refs, OspreyExactFactorRef, ref_id);
             OspreyExactClique *owner = NULL;
             for (guint k = 0; k < component->cliques->len; k++) {
+                if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                                          OSPREY_BUDGET_INFERENCE_UPDATE, 1)) {
+                    status = OSPREY_LIMIT_EXCEEDED;
+                    goto fail;
+                }
                 OspreyExactClique *candidate = g_ptr_array_index(
                     component->cliques, k);
                 if (!exact_clique_contains_all(candidate, ref)) continue;
@@ -2796,7 +2811,7 @@ static bool exact_numeric_order_build(
 }
 
 static bool exact_numeric_workspace_init(
-    const OspreyExactTopologyComponent *component,
+    OspreyContext *ctx, const OspreyExactTopologyComponent *component,
     OspreyExactNumericWorkspace *work)
 {
     if (component == NULL || work == NULL || component->cliques == NULL ||
@@ -2842,6 +2857,10 @@ static bool exact_numeric_workspace_init(
         work->clique_potentials[i] = exact_try_malloc(bytes);
         if (work->clique_potentials[i] == NULL) return false;
         for (uint64_t j = 0; j < clique->assignment_cells; j++) {
+            if ((j & 1023u) == 0 &&
+                !osprey_budget_checkpoint(ctx, OSPREY_ANALYSIS_INFER)) {
+                return false;
+            }
             work->clique_potentials[i][(size_t)j] = 0.0;
         }
     }
@@ -2849,7 +2868,8 @@ static bool exact_numeric_workspace_init(
         const OspreyExactTreeEdge *edge = &g_array_index(
             component->tree_edges, OspreyExactTreeEdge, i);
         size_t bytes;
-        if (!exact_double_table_size(edge->separator_cells, &bytes) ||
+        if (!osprey_budget_checkpoint(ctx, OSPREY_ANALYSIS_INFER) ||
+            !exact_double_table_size(edge->separator_cells, &bytes) ||
             !exact_numeric_edge_map_build(component, edge,
                                           &work->edge_maps[i])) return false;
         work->messages[i].cells = edge->separator_cells;
@@ -2860,10 +2880,15 @@ static bool exact_numeric_workspace_init(
         if (work->messages[i].parent_to_child == NULL ||
             work->messages[i].child_to_parent == NULL) return false;
         for (uint64_t j = 0; j < edge->separator_cells; j++) {
+            if ((j & 1023u) == 0 &&
+                !osprey_budget_checkpoint(ctx, OSPREY_ANALYSIS_INFER)) {
+                return false;
+            }
             work->messages[i].parent_to_child[(size_t)j] = -INFINITY;
             work->messages[i].child_to_parent[(size_t)j] = -INFINITY;
         }
     }
+    if (!osprey_budget_checkpoint(ctx, OSPREY_ANALYSIS_INFER)) return false;
     return exact_numeric_order_build(component, work);
 }
 
@@ -2871,7 +2896,7 @@ static bool exact_numeric_workspace_init(
  * sorted clique local_vars[j].  Separator bit j is separator[j], with
  * edge maps translating that canonical order at each endpoint. */
 static bool exact_numeric_build_clique_potential(
-    const OspreyGraph *graph, const OspreyExactBase *base,
+    OspreyContext *ctx, const OspreyGraph *graph, const OspreyExactBase *base,
     const OspreyExactTopologyComponent *component,
     const OspreyExactClique *clique, double *potential)
 {
@@ -2903,6 +2928,10 @@ static bool exact_numeric_build_clique_potential(
         }
         for (uint64_t assignment = 0;
              assignment < clique->assignment_cells; assignment++) {
+            if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                                      OSPREY_BUDGET_INFERENCE_UPDATE, 1)) {
+                return false;
+            }
             uint8_t factor_assignment[OSPREY_FACTOR_MAX_ARITY];
             double term;
             for (uint32_t j = 0; j < ref->num_vars; j++) {
@@ -2922,7 +2951,7 @@ static bool exact_numeric_build_clique_potential(
 }
 
 static bool exact_numeric_add_incoming(
-    const OspreyExactTopologyComponent *component,
+    OspreyContext *ctx, const OspreyExactTopologyComponent *component,
     const OspreyExactNumericWorkspace *work, uint32_t source,
     uint32_t excluded_edge, uint64_t assignment, double *value)
 {
@@ -2936,6 +2965,10 @@ static bool exact_numeric_add_incoming(
 
         if (i == excluded_edge ||
             (edge->parent != source && edge->child != source)) continue;
+        if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                                  OSPREY_BUDGET_INFERENCE_UPDATE, 1)) {
+            return false;
+        }
         if (edge->parent == source) {
             message = work->messages[i].child_to_parent;
             positions = map->parent_positions;
@@ -2956,7 +2989,7 @@ static bool exact_numeric_add_incoming(
 }
 
 static OspreyStatus exact_numeric_compute_message(
-    const OspreyExactTopologyComponent *component,
+    OspreyContext *ctx, const OspreyExactTopologyComponent *component,
     OspreyExactNumericWorkspace *work, uint32_t edge_id,
     bool parent_to_child)
 {
@@ -2997,21 +3030,37 @@ static OspreyStatus exact_numeric_compute_message(
     cells = message->cells;
     if (source_clique == NULL || source_positions == NULL || output == NULL ||
         *ready || cells == 0) return OSPREY_INVALID_GRAPH;
+    if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                              OSPREY_BUDGET_INFERENCE_UPDATE, cells)) {
+        return OSPREY_LIMIT_EXCEEDED;
+    }
     for (uint64_t i = 0; i < cells; i++) output[(size_t)i] = -INFINITY;
 
     for (uint64_t assignment = 0;
          assignment < source_clique->assignment_cells; assignment++) {
         uint64_t index;
-        double value = work->clique_potentials[source][(size_t)assignment];
-        if (!exact_log_value_valid(value) ||
-            !exact_numeric_add_incoming(component, work, source, edge_id,
-                                        assignment, &value) ||
-            !exact_message_index(source_positions, map->count, assignment,
+        double value;
+        if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                                  OSPREY_BUDGET_INFERENCE_UPDATE, 1)) {
+            return OSPREY_LIMIT_EXCEEDED;
+        }
+        value = work->clique_potentials[source][(size_t)assignment];
+        if (!exact_log_value_valid(value)) return OSPREY_INVALID_GRAPH;
+        if (!exact_numeric_add_incoming(ctx, component, work, source,
+                                        edge_id, assignment, &value)) {
+            return osprey_tx_status(ctx) == OSPREY_LIMIT_EXCEEDED
+                ? OSPREY_LIMIT_EXCEEDED : OSPREY_INVALID_GRAPH;
+        }
+        if (!exact_message_index(source_positions, map->count, assignment,
                                  cells, &index) ||
             !osprey_logaddexp(output[(size_t)index], value,
-                                    &output[(size_t)index])) {
+                              &output[(size_t)index])) {
             return OSPREY_INVALID_GRAPH;
         }
+    }
+    if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                              OSPREY_BUDGET_INFERENCE_UPDATE, cells)) {
+        return OSPREY_LIMIT_EXCEEDED;
     }
     if (!osprey_log_normalize(output, (size_t)cells, &log_norm)) {
         return OSPREY_INVALID_MODEL;
@@ -3022,7 +3071,7 @@ static OspreyStatus exact_numeric_compute_message(
 }
 
 static OspreyStatus exact_numeric_build_clique_belief(
-    const OspreyExactTopologyComponent *component,
+    OspreyContext *ctx, const OspreyExactTopologyComponent *component,
     const OspreyExactNumericWorkspace *work, uint32_t clique_id,
     double *belief, double *log_norm)
 {
@@ -3034,22 +3083,34 @@ static OspreyStatus exact_numeric_build_clique_belief(
     if (clique == NULL) return OSPREY_INVALID_GRAPH;
     for (uint64_t assignment = 0;
          assignment < clique->assignment_cells; assignment++) {
-        double value = belief[(size_t)assignment];
-        if (!exact_log_value_valid(value) ||
-            !exact_numeric_add_incoming(component, work, clique_id,
+        double value;
+        if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                                  OSPREY_BUDGET_INFERENCE_UPDATE, 1)) {
+            return OSPREY_LIMIT_EXCEEDED;
+        }
+        value = belief[(size_t)assignment];
+        if (!exact_log_value_valid(value)) return OSPREY_INVALID_GRAPH;
+        if (!exact_numeric_add_incoming(ctx, component, work, clique_id,
                                         UINT32_MAX, assignment, &value)) {
-            return OSPREY_INVALID_GRAPH;
+            return osprey_tx_status(ctx) == OSPREY_LIMIT_EXCEEDED
+                ? OSPREY_LIMIT_EXCEEDED : OSPREY_INVALID_GRAPH;
         }
         belief[(size_t)assignment] = value;
     }
+    if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                              OSPREY_BUDGET_INFERENCE_UPDATE,
+                              clique->assignment_cells)) {
+        return OSPREY_LIMIT_EXCEEDED;
+    }
     return osprey_log_normalize(belief,
-                                      (size_t)clique->assignment_cells,
-                                      log_norm)
+                                (size_t)clique->assignment_cells,
+                                log_norm)
         ? OSPREY_OK
         : OSPREY_INVALID_MODEL;
 }
 
-static bool exact_numeric_binary_marginal(const double *belief, uint64_t cells,
+static bool exact_numeric_binary_marginal(OspreyContext *ctx,
+                                          const double *belief, uint64_t cells,
                                           uint32_t position, double *out)
 {
     double zero = -INFINITY;
@@ -3060,6 +3121,10 @@ static bool exact_numeric_binary_marginal(const double *belief, uint64_t cells,
     if (belief == NULL || out == NULL || cells == 0 ||
         position >= sizeof(uint64_t) * 8u) return false;
     for (uint64_t assignment = 0; assignment < cells; assignment++) {
+        if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                                  OSPREY_BUDGET_INFERENCE_UPDATE, 1)) {
+            return false;
+        }
         double *accumulator = ((assignment >> position) & 1u) != 0
             ? &one : &zero;
         if (!osprey_logaddexp(*accumulator,
@@ -3087,7 +3152,7 @@ static bool exact_numeric_binary_marginal(const double *belief, uint64_t cells,
 }
 
 static OspreyStatus exact_numeric_component(
-    const OspreyGraph *graph, const OspreyExactBase *base,
+    OspreyContext *ctx, const OspreyGraph *graph, const OspreyExactBase *base,
     const OspreyExactTopologyComponent *component, double *marginals,
     double *logz_out)
 {
@@ -3099,12 +3164,43 @@ static OspreyStatus exact_numeric_component(
     if (graph == NULL || base == NULL || component == NULL ||
         marginals == NULL || logz_out == NULL) return status;
     memset(&work, 0, sizeof(work));
-    if (!exact_numeric_workspace_init(component, &work)) goto out;
+    for (guint i = 0; i < component->cliques->len; i++) {
+        const OspreyExactClique *clique = g_ptr_array_index(
+            component->cliques, i);
+        if (clique == NULL ||
+            !osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                                  OSPREY_BUDGET_INFERENCE_UPDATE,
+                                  clique->assignment_cells)) {
+            status = osprey_tx_status(ctx) == OSPREY_LIMIT_EXCEEDED
+                ? OSPREY_LIMIT_EXCEEDED : OSPREY_INVALID_GRAPH;
+            goto out;
+        }
+    }
+    for (guint i = 0; i < component->tree_edges->len; i++) {
+        const OspreyExactTreeEdge *edge = &g_array_index(
+            component->tree_edges, OspreyExactTreeEdge, i);
+        if (edge->separator_cells > UINT64_MAX / 2 ||
+            !osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                                  OSPREY_BUDGET_INFERENCE_UPDATE,
+                                  edge->separator_cells * 2)) {
+            status = osprey_tx_status(ctx) == OSPREY_LIMIT_EXCEEDED
+                ? OSPREY_LIMIT_EXCEEDED : OSPREY_INVALID_GRAPH;
+            goto out;
+        }
+    }
+    if (!exact_numeric_workspace_init(ctx, component, &work)) {
+        status = osprey_tx_status(ctx) == OSPREY_LIMIT_EXCEEDED
+            ? OSPREY_LIMIT_EXCEEDED : OSPREY_INVALID_GRAPH;
+        goto out;
+    }
     for (uint32_t i = 0; i < work.clique_count; i++) {
         const OspreyExactClique *clique = g_ptr_array_index(
             component->cliques, i);
         if (!exact_numeric_build_clique_potential(
-                graph, base, component, clique, work.clique_potentials[i])) {
+                ctx, graph, base, component, clique,
+                work.clique_potentials[i])) {
+            status = osprey_tx_status(ctx) == OSPREY_LIMIT_EXCEEDED
+                ? OSPREY_LIMIT_EXCEEDED : OSPREY_INVALID_GRAPH;
             goto out;
         }
     }
@@ -3116,7 +3212,7 @@ static OspreyStatus exact_numeric_component(
         uint32_t edge = work.parent_edge[clique];
         if (edge == UINT32_MAX) goto out;
         OspreyStatus message_status = exact_numeric_compute_message(
-            component, &work, edge, false);
+            ctx, component, &work, edge, false);
         if (message_status != OSPREY_OK) {
             status = message_status;
             goto out;
@@ -3127,7 +3223,7 @@ static OspreyStatus exact_numeric_component(
         uint32_t edge = work.parent_edge[clique];
         if (edge == UINT32_MAX) goto out;
         OspreyStatus message_status = exact_numeric_compute_message(
-            component, &work, edge, true);
+            ctx, component, &work, edge, true);
         if (message_status != OSPREY_OK) {
             status = message_status;
             goto out;
@@ -3151,7 +3247,7 @@ static OspreyStatus exact_numeric_component(
         OspreyStatus belief_status;
         if (clique == NULL || belief == NULL) goto out;
         belief_status = exact_numeric_build_clique_belief(
-            component, &work, clique_id, belief, &clique_log_norm);
+            ctx, component, &work, clique_id, belief, &clique_log_norm);
         if (belief_status != OSPREY_OK) {
             status = belief_status;
             goto out;
@@ -3163,10 +3259,11 @@ static OspreyStatus exact_numeric_component(
                                            position);
             double marginal;
             if (local >= base->graph_var_ids->len ||
-                !exact_numeric_binary_marginal(belief,
+                !exact_numeric_binary_marginal(ctx, belief,
                                                clique->assignment_cells,
                                                position, &marginal)) {
-                status = OSPREY_INVALID_GRAPH;
+                status = osprey_tx_status(ctx) == OSPREY_LIMIT_EXCEEDED
+                    ? OSPREY_LIMIT_EXCEEDED : OSPREY_INVALID_GRAPH;
                 goto out;
             }
             if (isnan(marginals[local])) {
@@ -3182,6 +3279,11 @@ static OspreyStatus exact_numeric_component(
     if (!isfinite(root_log_norm)) goto out;
     logz = root_log_norm;
     for (uint32_t i = 0; i < work.edge_count; i++) {
+        if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                                  OSPREY_BUDGET_INFERENCE_UPDATE, 1)) {
+            status = OSPREY_LIMIT_EXCEEDED;
+            goto out;
+        }
         if (!osprey_log_product_add(logz,
                                    work.messages[i].child_to_parent_log_norm,
                                    &logz)) goto out;
@@ -3214,6 +3316,11 @@ static OspreyStatus exact_numeric_infer(OspreyContext *ctx,
     if (!exact_double_table_size(local_count, &marginal_bytes)) {
         return exact_projection_failure(ctx, status);
     }
+    if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                              OSPREY_BUDGET_INFERENCE_UPDATE, local_count)) {
+        status = OSPREY_LIMIT_EXCEEDED;
+        goto out;
+    }
     marginals = exact_try_malloc(marginal_bytes);
     if (marginals == NULL) goto out;
     for (uint32_t i = 0; i < local_count; i++) marginals[i] = NAN;
@@ -3223,7 +3330,7 @@ static OspreyStatus exact_numeric_infer(OspreyContext *ctx,
             topology->components, i);
         double component_logz;
         OspreyStatus component_status = exact_numeric_component(
-            ctx->graph, base, component, marginals, &component_logz);
+            ctx, ctx->graph, base, component, marginals, &component_logz);
         if (component_status != OSPREY_OK || !isfinite(component_logz) ||
             !isfinite(total_logz + component_logz)) {
             status = component_status == OSPREY_OK
@@ -3233,9 +3340,21 @@ static OspreyStatus exact_numeric_infer(OspreyContext *ctx,
         }
         total_logz += component_logz;
     }
+    if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                              OSPREY_BUDGET_INFERENCE_UPDATE,
+                              local_count)) {
+        status = OSPREY_LIMIT_EXCEEDED;
+        goto out;
+    }
     for (uint32_t local = 0; local < local_count; local++) {
         if (!isfinite(marginals[local]) || marginals[local] < 0.0 ||
             marginals[local] > 1.0) goto out;
+    }
+    if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                              OSPREY_BUDGET_INFERENCE_UPDATE,
+                              base->graph_var_count)) {
+        status = OSPREY_LIMIT_EXCEEDED;
+        goto out;
     }
     for (uint32_t graph_id = 0; graph_id < base->graph_var_count;
          graph_id++) {
@@ -3249,6 +3368,12 @@ static OspreyStatus exact_numeric_infer(OspreyContext *ctx,
     /* This is the only graph mutation in Stage 4.3.  All component tables,
      * messages, marginals, and log-partition values have succeeded above. */
     ctx->last_exact_logz = total_logz;
+    if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                              OSPREY_BUDGET_INFERENCE_UPDATE,
+                              base->graph_var_count)) {
+        status = OSPREY_LIMIT_EXCEEDED;
+        goto out;
+    }
     for (uint32_t graph_id = 0; graph_id < base->graph_var_count; graph_id++) {
         uint32_t local = base->local_by_graph[graph_id];
         OspreyVar *variable = &g_array_index(ctx->graph->vars, OspreyVar,
@@ -3769,6 +3894,13 @@ OspreyStatus osprey_bp_graph_build(OspreyContext *ctx,
         return bp_build_failure(ctx, OSPREY_LIMIT_EXCEEDED,
                                 "graph count limit");
     }
+    if (!osprey_budget_charge(
+            ctx, OSPREY_ANALYSIS_INFER, OSPREY_BUDGET_GRAPH_GROWTH,
+            (uint64_t)variable_count + (uint64_t)factor_count)) {
+        status = OSPREY_LIMIT_EXCEEDED;
+        reason = "analysis-work-budget";
+        goto fail;
+    }
 
     graph = bp_try_alloc0(sizeof(*graph));
     if (graph == NULL) {
@@ -3806,6 +3938,12 @@ OspreyStatus osprey_bp_graph_build(OspreyContext *ctx,
         goto fail;
     }
     for (uint32_t i = 0; i < variable_count; i++) {
+        if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                                  OSPREY_BUDGET_PREDICATE, 1)) {
+            status = OSPREY_LIMIT_EXCEEDED;
+            reason = "analysis-work-budget";
+            goto fail;
+        }
         graph->local_by_graph_var[i] = UINT32_MAX;
         OspreyVar *variable = &g_array_index(source->vars, OspreyVar, i);
         if (variable->id != i || variable->kind <= OSPREY_PRED_NONE ||
@@ -3877,6 +4015,12 @@ OspreyStatus osprey_bp_graph_build(OspreyContext *ctx,
         goto fail;
     }
     for (uint32_t i = 0; i < factor_count; i++) {
+        if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                                  OSPREY_BUDGET_FACTOR, 1)) {
+            status = OSPREY_LIMIT_EXCEEDED;
+            reason = "analysis-work-budget";
+            goto fail;
+        }
         OspreyFactor *factor = g_array_index(source->factors,
                                              OspreyFactor *, i);
         if (factor == NULL || factor->id != i ||
@@ -3885,6 +4029,12 @@ OspreyStatus osprey_bp_graph_build(OspreyContext *ctx,
             goto fail;
         }
         for (uint32_t j = 0; j < factor->num_vars; j++) {
+            if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                                      OSPREY_BUDGET_EDGE, 1)) {
+                status = OSPREY_LIMIT_EXCEEDED;
+                reason = "analysis-work-budget";
+                goto fail;
+            }
             if (factor->var_ids[j] >= variable_count ||
                 graph->local_by_graph_var[factor->var_ids[j]] == UINT32_MAX) {
                 reason = "factor variable map";
@@ -3924,6 +4074,12 @@ OspreyStatus osprey_bp_graph_build(OspreyContext *ctx,
     }
     for (uint32_t local_factor = 0; local_factor < factor_count;
          local_factor++) {
+        if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                                  OSPREY_BUDGET_FACTOR, 1)) {
+            status = OSPREY_LIMIT_EXCEEDED;
+            reason = "analysis-work-budget";
+            goto fail;
+        }
         const OspreyBpFactorBuild *ordered = &factor_builds[local_factor];
         OspreyFactor *factor = g_array_index(source->factors,
                                              OspreyFactor *,
@@ -3936,6 +4092,12 @@ OspreyStatus osprey_bp_graph_build(OspreyContext *ctx,
         graph->local_by_graph_factor[ordered->graph_factor_id] = local_factor;
         g_array_append_val(graph->factors, ref);
         for (uint32_t position = 0; position < factor->num_vars; position++) {
+            if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                                      OSPREY_BUDGET_EDGE, 1)) {
+                status = OSPREY_LIMIT_EXCEEDED;
+                reason = "analysis-work-budget";
+                goto fail;
+            }
             uint32_t graph_var_id = factor->var_ids[position];
             uint32_t local_var = graph->local_by_graph_var[graph_var_id];
             const OspreyVar *variable = &g_array_index(source->vars,
@@ -4068,6 +4230,12 @@ OspreyStatus osprey_bp_graph_build(OspreyContext *ctx,
                 const OspreyBpVarRef *variable = &g_array_index(
                     graph->vars, OspreyBpVarRef, local_var);
                 for (uint32_t i = 0; i < variable->var_edge_count; i++) {
+                    if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                                              OSPREY_BUDGET_EDGE, 1)) {
+                        status = OSPREY_LIMIT_EXCEEDED;
+                        reason = "analysis-work-budget";
+                        goto fail;
+                    }
                     uint32_t edge_id = g_array_index(
                         graph->var_edges, uint32_t,
                         variable->var_edge_begin + i);
@@ -4088,6 +4256,12 @@ OspreyStatus osprey_bp_graph_build(OspreyContext *ctx,
                 const OspreyBpFactorRef *factor = &g_array_index(
                     graph->factors, OspreyBpFactorRef, local_factor);
                 for (uint32_t i = 0; i < factor->factor_edge_count; i++) {
+                    if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                                              OSPREY_BUDGET_EDGE, 1)) {
+                        status = OSPREY_LIMIT_EXCEEDED;
+                        reason = "analysis-work-budget";
+                        goto fail;
+                    }
                     uint32_t edge_id = factor->factor_edge_begin + i;
                     const OspreyBpEdge *edge = &g_array_index(
                         graph->edges, OspreyBpEdge, edge_id);
@@ -4734,15 +4908,20 @@ bool osprey_bp_graph_dump_file(const OspreyContext *ctx,
 /* Stage 5.2: one-round normalized sum-product                         */
 /* ------------------------------------------------------------------ */
 
-static void bp_round_clear_next(OspreyBpMessages *messages,
+static bool bp_round_clear_next(const OspreyContext *ctx,
+                                OspreyBpMessages *messages,
                                 uint64_t value_count)
 {
     if (messages == NULL || messages->vf_next == NULL ||
-        messages->fv_next == NULL) return;
+        messages->fv_next == NULL) return true;
     for (uint64_t i = 0; i < value_count; i++) {
+        if ((i & 1023u) == 0 &&
+            !osprey_budget_checkpoint((OspreyContext *)ctx,
+                                      OSPREY_ANALYSIS_INFER)) return false;
         messages->vf_next[(size_t)i] = NAN;
         messages->fv_next[(size_t)i] = NAN;
     }
+    return true;
 }
 
 /* Validate only the immutable projection needed by the round.  The full
@@ -5025,15 +5204,29 @@ static OspreyStatus bp_compute_round_internal(
     OspreyStatus status;
 
     if (stats != NULL) memset(stats, 0, sizeof(*stats));
+    if (graph != NULL && graph->message_values != 0 &&
+        !osprey_budget_charge((OspreyContext *)ctx, OSPREY_ANALYSIS_INFER,
+                              OSPREY_BUDGET_INFERENCE_UPDATE,
+                              graph->message_values)) {
+        return OSPREY_LIMIT_EXCEEDED;
+    }
     if (!bp_round_graph_valid(ctx, graph, &edge_count) ||
         !bp_round_messages_valid(graph, messages, edge_count)) {
         return OSPREY_INVALID_GRAPH;
     }
-    bp_round_clear_next(messages, messages->value_count);
+    if (!bp_round_clear_next(ctx, messages, messages->value_count)) {
+        return OSPREY_LIMIT_EXCEEDED;
+    }
 
     /* Variable -> factor: the destination edge is excluded from the
      * incoming factor-message product.  An empty product is neutral. */
     for (uint32_t edge_id = 0; edge_id < edge_count; edge_id++) {
+        if (!osprey_budget_charge((OspreyContext *)ctx,
+                                  OSPREY_ANALYSIS_INFER,
+                                  OSPREY_BUDGET_INFERENCE_UPDATE, 1)) {
+            status = OSPREY_LIMIT_EXCEEDED;
+            goto fail;
+        }
         const OspreyBpEdge *edge = &g_array_index(graph->edges,
                                                   OspreyBpEdge, edge_id);
         const OspreyBpVarRef *variable = &g_array_index(
@@ -5041,6 +5234,12 @@ static OspreyStatus bp_compute_round_internal(
         double output[2] = { 0.0, 0.0 };
 
         for (uint32_t i = 0; i < variable->var_edge_count; i++) {
+            if (!osprey_budget_charge((OspreyContext *)ctx,
+                                      OSPREY_ANALYSIS_INFER,
+                                      OSPREY_BUDGET_INFERENCE_UPDATE, 1)) {
+                status = OSPREY_LIMIT_EXCEEDED;
+                goto fail;
+            }
             uint32_t incoming_id = g_array_index(
                 graph->var_edges, uint32_t,
                 variable->var_edge_begin + i);
@@ -5057,6 +5256,12 @@ static OspreyStatus bp_compute_round_internal(
                 goto fail;
             }
         }
+        if (!osprey_budget_charge((OspreyContext *)ctx,
+                                  OSPREY_ANALYSIS_INFER,
+                                  OSPREY_BUDGET_INFERENCE_UPDATE, 2)) {
+            status = OSPREY_LIMIT_EXCEEDED;
+            goto fail;
+        }
         status = bp_round_normalize_pair(output);
         if (status != OSPREY_OK) goto fail;
         messages->vf_next[(size_t)edge_id * 2u] = output[0];
@@ -5064,8 +5269,21 @@ static OspreyStatus bp_compute_round_internal(
         variable_messages++;
     }
     if (damp_between_phases) {
+        if (!osprey_budget_charge((OspreyContext *)ctx,
+                                  OSPREY_ANALYSIS_INFER,
+                                  OSPREY_BUDGET_INFERENCE_UPDATE,
+                                  edge_count)) {
+            status = OSPREY_LIMIT_EXCEEDED;
+            goto fail;
+        }
         for (uint32_t edge_id = 0; edge_id < edge_count; edge_id++) {
             size_t index = (size_t)edge_id * 2u;
+            if ((edge_id & 1023u) == 0 &&
+                !osprey_budget_checkpoint((OspreyContext *)ctx,
+                                          OSPREY_ANALYSIS_INFER)) {
+                status = OSPREY_LIMIT_EXCEEDED;
+                goto fail;
+            }
             if (!osprey_bp_damp_pair(
                     &messages->vf_current[index], &messages->vf_next[index],
                     damping, &messages->vf_next[index])) {
@@ -5079,6 +5297,12 @@ static OspreyStatus bp_compute_round_internal(
      * The factor's semantic order and head index are preserved by passing
      * the assignment directly to the shared factor evaluator. */
     for (uint32_t edge_id = 0; edge_id < edge_count; edge_id++) {
+        if (!osprey_budget_charge((OspreyContext *)ctx,
+                                  OSPREY_ANALYSIS_INFER,
+                                  OSPREY_BUDGET_INFERENCE_UPDATE, 1)) {
+            status = OSPREY_LIMIT_EXCEEDED;
+            goto fail;
+        }
         const OspreyBpEdge *edge = &g_array_index(graph->edges,
                                                   OspreyBpEdge, edge_id);
         const OspreyBpFactorRef *factor_ref = &g_array_index(
@@ -5093,18 +5317,43 @@ static OspreyStatus bp_compute_round_internal(
         for (uint32_t recipient_state = 0; recipient_state < 2;
              recipient_state++) {
             double raw = -INFINITY;
+            if (!osprey_budget_charge((OspreyContext *)ctx,
+                                      OSPREY_ANALYSIS_INFER,
+                                      OSPREY_BUDGET_INFERENCE_UPDATE, 1)) {
+                status = OSPREY_LIMIT_EXCEEDED;
+                goto fail;
+            }
             for (uint32_t compact = 0; compact < alternatives; compact++) {
+                if (!osprey_budget_charge((OspreyContext *)ctx,
+                                          OSPREY_ANALYSIS_INFER,
+                                          OSPREY_BUDGET_INFERENCE_UPDATE, 1)) {
+                    status = OSPREY_LIMIT_EXCEEDED;
+                    goto fail;
+                }
                 uint8_t assignment[OSPREY_FACTOR_MAX_ARITY];
                 uint32_t compact_bit = 0;
                 double term;
 
                 for (uint32_t position = 0; position < arity; position++) {
+                    if (!osprey_budget_charge((OspreyContext *)ctx,
+                                              OSPREY_ANALYSIS_INFER,
+                                              OSPREY_BUDGET_INFERENCE_UPDATE,
+                                              1)) {
+                        status = OSPREY_LIMIT_EXCEEDED;
+                        goto fail;
+                    }
                     if (position == edge->factor_position) {
                         assignment[position] = recipient_state;
                     } else {
                         assignment[position] = (uint8_t)((compact >>
                                                           compact_bit++) & 1u);
                     }
+                }
+                if (!osprey_budget_charge((OspreyContext *)ctx,
+                                          OSPREY_ANALYSIS_INFER,
+                                          OSPREY_BUDGET_INFERENCE_UPDATE, 1)) {
+                    status = OSPREY_LIMIT_EXCEEDED;
+                    goto fail;
                 }
                 if (!osprey_factor_log_weight(factor, assignment, &term)) {
                     status = OSPREY_INVALID_GRAPH;
@@ -5114,6 +5363,13 @@ static OspreyStatus bp_compute_round_internal(
                     uint32_t incoming_id;
                     const double *incoming;
                     if (position == edge->factor_position) continue;
+                    if (!osprey_budget_charge((OspreyContext *)ctx,
+                                              OSPREY_ANALYSIS_INFER,
+                                              OSPREY_BUDGET_INFERENCE_UPDATE,
+                                              1)) {
+                        status = OSPREY_LIMIT_EXCEEDED;
+                        goto fail;
+                    }
                     incoming_id = factor_ref->factor_edge_begin + position;
                     if (incoming_id >= edge_count) {
                         status = OSPREY_INVALID_GRAPH;
@@ -5126,12 +5382,24 @@ static OspreyStatus bp_compute_round_internal(
                         goto fail;
                     }
                 }
+                if (!osprey_budget_charge((OspreyContext *)ctx,
+                                          OSPREY_ANALYSIS_INFER,
+                                          OSPREY_BUDGET_INFERENCE_UPDATE, 1)) {
+                    status = OSPREY_LIMIT_EXCEEDED;
+                    goto fail;
+                }
                 if (!osprey_logaddexp(raw, term, &raw)) {
                     status = OSPREY_INVALID_GRAPH;
                     goto fail;
                 }
             }
             output[recipient_state] = raw;
+        }
+        if (!osprey_budget_charge((OspreyContext *)ctx,
+                                  OSPREY_ANALYSIS_INFER,
+                                  OSPREY_BUDGET_INFERENCE_UPDATE, 2)) {
+            status = OSPREY_LIMIT_EXCEEDED;
+            goto fail;
         }
         status = bp_round_normalize_pair(output);
         if (status != OSPREY_OK) goto fail;
@@ -5140,8 +5408,21 @@ static OspreyStatus bp_compute_round_internal(
         factor_messages++;
     }
     if (damp_between_phases) {
+        if (!osprey_budget_charge((OspreyContext *)ctx,
+                                  OSPREY_ANALYSIS_INFER,
+                                  OSPREY_BUDGET_INFERENCE_UPDATE,
+                                  edge_count)) {
+            status = OSPREY_LIMIT_EXCEEDED;
+            goto fail;
+        }
         for (uint32_t edge_id = 0; edge_id < edge_count; edge_id++) {
             size_t index = (size_t)edge_id * 2u;
+            if ((edge_id & 1023u) == 0 &&
+                !osprey_budget_checkpoint((OspreyContext *)ctx,
+                                          OSPREY_ANALYSIS_INFER)) {
+                status = OSPREY_LIMIT_EXCEEDED;
+                goto fail;
+            }
             if (!osprey_bp_damp_pair(
                     &messages->fv_current[index], &messages->fv_next[index],
                     damping, &messages->fv_next[index])) {
@@ -5157,7 +5438,7 @@ static OspreyStatus bp_compute_round_internal(
     return OSPREY_OK;
 
 fail:
-    bp_round_clear_next(messages, messages->value_count);
+    (void)bp_round_clear_next(ctx, messages, messages->value_count);
     return status;
 }
 
@@ -5264,7 +5545,8 @@ bool osprey_bp_damp_pair(const double current[2], const double raw[2],
            (out[0] = mixed[0], out[1] = mixed[1], true);
 }
 
-static OspreyStatus bp_belief_from_buffer(const OspreyBpGraph *graph,
+static OspreyStatus bp_belief_from_buffer(const OspreyContext *ctx,
+                                           const OspreyBpGraph *graph,
                                            const double *factor_messages,
                                            uint32_t local, double *out)
 {
@@ -5289,6 +5571,11 @@ static OspreyStatus bp_belief_from_buffer(const OspreyBpGraph *graph,
                                          variable->var_edge_begin + i);
         const double *incoming;
         if (edge_id >= graph->edges->len) return OSPREY_INVALID_GRAPH;
+        if (!osprey_budget_charge((OspreyContext *)ctx,
+                                  OSPREY_ANALYSIS_INFER,
+                                  OSPREY_BUDGET_INFERENCE_UPDATE, 1)) {
+            return OSPREY_LIMIT_EXCEEDED;
+        }
         incoming = &factor_messages[(size_t)edge_id * 2u];
         if (!osprey_log_product_add(pair[0], incoming[0], &pair[0]) ||
             !osprey_log_product_add(pair[1], incoming[1], &pair[1])) {
@@ -5297,6 +5584,11 @@ static OspreyStatus bp_belief_from_buffer(const OspreyBpGraph *graph,
     }
     if (pair[0] == -INFINITY && pair[1] == -INFINITY) {
         return OSPREY_INVALID_MODEL;
+    }
+    if (!osprey_budget_charge((OspreyContext *)ctx,
+                              OSPREY_ANALYSIS_INFER,
+                              OSPREY_BUDGET_INFERENCE_UPDATE, 2)) {
+        return OSPREY_LIMIT_EXCEEDED;
     }
     if (!osprey_log_normalize(pair, 2, &log_norm) ||
         !isfinite(log_norm)) {
@@ -5308,11 +5600,12 @@ static OspreyStatus bp_belief_from_buffer(const OspreyBpGraph *graph,
     return OSPREY_OK;
 }
 
-static OspreyStatus bp_belief_from_next(const OspreyBpGraph *graph,
+static OspreyStatus bp_belief_from_next(const OspreyContext *ctx,
+                                         const OspreyBpGraph *graph,
                                          uint32_t local, double *out)
 {
-    return bp_belief_from_buffer(graph, graph == NULL ? NULL :
-                                  graph->msg_fv_next, local, out);
+    return bp_belief_from_buffer(ctx, graph, graph == NULL ? NULL :
+                                 graph->msg_fv_next, local, out);
 }
 
 typedef struct OspreyBpSemanticFactorKey {
@@ -6231,7 +6524,7 @@ static OspreyStatus bp_graph_migrate_internal(
                 belief = variable->base_seed_valid
                     ? variable->base_seed[1] : 0.5;
             } else {
-                status = bp_belief_from_buffer(new_graph,
+                status = bp_belief_from_buffer(ctx, new_graph,
                                                new_graph->msg_fv_current,
                                                local, &belief);
                 if (status != OSPREY_OK) goto migration_failure;
@@ -6593,7 +6886,7 @@ OspreyStatus osprey_stage5_static_replay(OspreyContext *ctx,
 }
 
 static OspreyStatus bp_compute_next_beliefs(
-    const OspreyBpGraph *graph, double *beliefs, double *max_delta_out,
+    const OspreyContext *ctx, const OspreyBpGraph *graph, double *beliefs, double *max_delta_out,
     uint32_t *unstable_component_out, bool *all_stable_out)
 {
     double max_delta = 0.0;
@@ -6619,7 +6912,12 @@ static OspreyStatus bp_compute_next_beliefs(
             OspreyStatus status;
 
             if (local >= graph->vars->len) return OSPREY_INVALID_GRAPH;
-            status = bp_belief_from_next(graph, local, &beliefs[local]);
+            if (!osprey_budget_charge((OspreyContext *)ctx,
+                                      OSPREY_ANALYSIS_INFER,
+                                      OSPREY_BUDGET_INFERENCE_UPDATE, 1)) {
+                return OSPREY_LIMIT_EXCEEDED;
+            }
+            status = bp_belief_from_next(ctx, graph, local, &beliefs[local]);
             if (status != OSPREY_OK) return status;
             if (!isfinite(graph->beliefs[local]) ||
                 !isfinite(beliefs[local])) return OSPREY_INVALID_GRAPH;
@@ -6691,6 +6989,13 @@ static OspreyStatus bp_graph_support_check(const OspreyContext *ctx,
     }
     required = queue_offset + (size_t)variable_count * sizeof(uint32_t);
     if (required > scratch_bytes) return OSPREY_INVALID_GRAPH;
+    if (!osprey_budget_charge((OspreyContext *)ctx, OSPREY_ANALYSIS_INFER,
+                              OSPREY_BUDGET_INFERENCE_UPDATE,
+                              (uint64_t)factor_count +
+                              (uint64_t)graph->edges->len +
+                              variable_count)) {
+        return OSPREY_LIMIT_EXCEEDED;
+    }
 
     truth = (uint8_t *)graph->scratch_message;
     remaining = truth + variable_count;
@@ -7072,6 +7377,13 @@ OspreyStatus osprey_bp_solve_fixed(OspreyContext *ctx,
     memcpy(saved_beliefs, graph->beliefs, saved_belief_bytes);
     saved_message_state = graph->message_state;
     initial_state = saved_message_state == OSPREY_BP_MESSAGES_INITIAL;
+    if (initial_state &&
+        !osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                              OSPREY_BUDGET_INFERENCE_UPDATE,
+                              (uint64_t)variable_count * 2u)) {
+        status = OSPREY_LIMIT_EXCEEDED;
+        goto solve_fail;
+    }
     if (initial_state) {
         for (uint32_t local = 0; local < variable_count; local++) {
             const OspreyBpVarRef *variable = &g_array_index(
@@ -7085,6 +7397,11 @@ OspreyStatus osprey_bp_solve_fixed(OspreyContext *ctx,
     if (status != OSPREY_OK) goto solve_fail;
     for (uint32_t iteration = 1; iteration <= OSPREY_BP_MAX_ITERS;
          iteration++) {
+        if (!osprey_budget_charge(ctx, OSPREY_ANALYSIS_INFER,
+                                  OSPREY_BUDGET_INFERENCE_UPDATE, 1)) {
+            status = OSPREY_LIMIT_EXCEEDED;
+            goto solve_fail;
+        }
         double max_delta;
         messages.vf_current = graph->msg_vf_current;
         messages.vf_next = graph->msg_vf_next;
@@ -7098,7 +7415,7 @@ OspreyStatus osprey_bp_solve_fixed(OspreyContext *ctx,
             ctx, graph, &messages, NULL, OSPREY_BP_DAMPING);
         if (status != OSPREY_OK) goto solve_fail;
         status = bp_compute_next_beliefs(
-            graph, (double *)result->beliefs->data, &max_delta,
+            ctx, graph, (double *)result->beliefs->data, &max_delta,
             &unstable_component, &all_stable);
         if (status != OSPREY_OK) goto solve_fail;
         result->iterations = iteration;
