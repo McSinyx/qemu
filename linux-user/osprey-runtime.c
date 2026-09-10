@@ -20,6 +20,18 @@ struct OspreyRuntimeIndex {
     OspreyRuntimeResolveStatus failure;
 };
 
+static OspreyRuntimeCounters runtime_counters;
+
+void osprey_runtime_test_reset_counters(void)
+{
+    memset(&runtime_counters, 0, sizeof(runtime_counters));
+}
+
+void osprey_runtime_test_get_counters(OspreyRuntimeCounters *out)
+{
+    if (out != NULL) *out = runtime_counters;
+}
+
 static int runtime_cmp_u64(uint64_t a, uint64_t b)
 {
     return a < b ? -1 : a != b;
@@ -228,6 +240,13 @@ static OspreyRegionInstance runtime_probe_from_ref(
     return probe;
 }
 
+static int runtime_instance_search_compare(
+    const OspreyRegionInstance *a, const OspreyRegionInstance *b)
+{
+    runtime_counters.runtime_instance_comparisons++;
+    return runtime_instance_key_compare(a, b);
+}
+
 static OspreyRuntimeResolveStatus runtime_find_instance(
     const OspreyContext *ctx, const OspreyRuntimeAddressRef *ref,
     OspreyRegionInstance *out)
@@ -259,12 +278,12 @@ static OspreyRuntimeResolveStatus runtime_find_instance(
     hi = index->count;
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2;
-        int c = runtime_instance_key_compare(&index->entries[mid], &probe);
+        int c = runtime_instance_search_compare(&index->entries[mid], &probe);
         if (c < 0) lo = mid + 1;
         else hi = mid;
     }
     if (lo == index->count ||
-        runtime_instance_key_compare(&index->entries[lo], &probe) != 0) {
+        runtime_instance_search_compare(&index->entries[lo], &probe) != 0) {
         return OSPREY_RUNTIME_STALE_INSTANCE;
     }
     if (lo + 1 < index->count &&
@@ -284,24 +303,6 @@ static OspreyRuntimeResolveStatus runtime_find_instance(
     }
     *out = *entry;
     return OSPREY_RUNTIME_RESOLVED;
-}
-
-static int runtime_key_compare(const OspreyKey *a, const OspreyKey *b)
-{
-    int c = runtime_cmp_u64(a->tag, b->tag);
-    if (c != 0) return c;
-    for (size_t i = 0; i < G_N_ELEMENTS(a->w); i++) {
-        c = runtime_cmp_u64(a->w[i], b->w[i]);
-        if (c != 0) return c;
-    }
-    return 0;
-}
-
-static bool runtime_chunk_equal(const OspreyChunk *a, const OspreyChunk *b)
-{
-    return a != NULL && b != NULL &&
-           runtime_address_equal(&a->address, &b->address) &&
-           a->size == b->size;
 }
 
 static bool runtime_canonical_chunk_valid(const OspreyChunk *chunk)
@@ -325,38 +326,6 @@ static bool runtime_canonical_chunk_valid(const OspreyChunk *chunk)
     return delta < magnitude;
 }
 
-static bool runtime_model_shape_valid(const OspreyModel *model)
-{
-    if (model == NULL || model->version != OSPREY_MODEL_VERSION ||
-        model->chunk_index_count != model->object_count ||
-        (model->object_count != 0 &&
-         (model->objects == NULL || model->chunk_index == NULL))) {
-        return false;
-    }
-    for (uint32_t i = 0; i < model->chunk_index_count; i++) {
-        const OspreyModelIndexEntry *entry = &model->chunk_index[i];
-        OspreyKey expected;
-        if (entry->ordinal >= model->object_count) return false;
-        expected = osprey_chunk_key(&model->objects[entry->ordinal].chunk);
-        if (!osprey_key_equal(&entry->key, &expected)) return false;
-        if (i != 0 && runtime_key_compare(&model->chunk_index[i - 1].key,
-                                          &entry->key) >= 0) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static uint32_t runtime_model_object_index(const OspreyModel *model,
-                                           const OspreyDecodedObject *object)
-{
-    if (model == NULL || object == NULL) return UINT32_MAX;
-    for (uint32_t i = 0; i < model->object_count; i++) {
-        if (&model->objects[i] == object) return i;
-    }
-    return UINT32_MAX;
-}
-
 static bool runtime_ref_is_zero(const OspreyRuntimeAddressRef *ref)
 {
     OspreyRuntimeAddressRef zero;
@@ -365,39 +334,110 @@ static bool runtime_ref_is_zero(const OspreyRuntimeAddressRef *ref)
     return memcmp(ref, &zero, sizeof(zero)) == 0;
 }
 
+static bool runtime_mutation_model_shape_valid(
+    const OspreyMutationModel *model)
+{
+    if (model == NULL || !osprey_mutation_model_validate(model)) return false;
+    for (uint32_t i = 0; i < model->entry_count; i++) {
+        const OspreyMutationEntry *entry = &model->entries[i];
+        if (entry->target_base.region.kind > OSPREY_REGION_STACK_FUNCTION ||
+            entry->extent == 0 || entry->extent > OSPREY_MUTATION_MAX_EXTENT ||
+            (entry->kind != OSPREY_MUTATION_AGGREGATE_ARRAY &&
+             entry->kind != OSPREY_MUTATION_AGGREGATE_STRUCT)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool osprey_runtime_mutation_prepare(OspreyContext *ctx)
+{
+    if (ctx == NULL || ctx->config.analysis_mode !=
+            OSPREY_ANALYSIS_MODE_MUTATION || !ctx->mutation_model_ready ||
+        ctx->mutation_model == NULL || !osprey_tx_ok(ctx)) {
+        return false;
+    }
+    if (ctx->mutation_runtime_ready) return true;
+    runtime_counters.reception_validation_passes++;
+    if (!runtime_mutation_model_shape_valid(ctx->mutation_model)) {
+        ctx->mutation_model_ready = false;
+        ctx->mutation_runtime_ready = false;
+        return false;
+    }
+    ctx->mutation_runtime_ready = true;
+    return true;
+}
+
+const OspreyMutationModel *osprey_runtime_mutation_model(
+    const OspreyContext *ctx)
+{
+    return ctx != NULL && ctx->config.analysis_mode ==
+               OSPREY_ANALYSIS_MODE_MUTATION &&
+           ctx->mutation_model_ready && ctx->mutation_runtime_ready &&
+           osprey_tx_ok(ctx) && ctx->mutation_model != NULL
+        ? ctx->mutation_model : NULL;
+}
+
+static int runtime_compact_chunk_compare(const OspreyChunk *a,
+                                         const OspreyChunk *b)
+{
+    int c = runtime_address_compare(&a->address, &b->address);
+    if (c != 0) return c;
+    return runtime_cmp_u64(a->size, b->size);
+}
+
+static const OspreyMutationEntry *runtime_compact_entry_find(
+    const OspreyMutationModel *model, const OspreyChunk *chunk)
+{
+    uint32_t lo = 0;
+    uint32_t hi = model == NULL ? 0 : model->entry_count;
+
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        int c = runtime_compact_chunk_compare(&model->entries[mid].cell,
+                                               chunk);
+        runtime_counters.cell_key_comparisons++;
+        if (c < 0) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo >= model->entry_count) return NULL;
+    runtime_counters.cell_key_comparisons++;
+    if (runtime_compact_chunk_compare(&model->entries[lo].cell, chunk) != 0) {
+        return NULL;
+    }
+    return &model->entries[lo];
+}
+
 OspreyRuntimeResolveStatus osprey_runtime_resolve_cell(
-    const OspreyContext *ctx, const OspreyModel *model,
+    const OspreyContext *ctx, const OspreyMutationModel *model,
     const OspreyRuntimeChunkRef *locator,
     OspreyRuntimeCellResolution *out)
 {
     OspreyRegionInstance instance;
     OspreyChunk chunk;
-    const OspreyDecodedObject *object;
+    const OspreyMutationEntry *entry;
     OspreyRuntimeResolveStatus status;
     uint64_t raw_end;
 
     if (out == NULL) return OSPREY_RUNTIME_MALFORMED;
     memset(out, 0, sizeof(*out));
     out->status = OSPREY_RUNTIME_MALFORMED;
-    out->object_index = UINT32_MAX;
+    out->entry_ordinal = UINT32_MAX;
     if (locator == NULL || locator->start.valid == 0) {
         out->status = OSPREY_RUNTIME_NO_LOCATOR;
         return out->status;
     }
     if (locator->start.valid != 1 || locator->size == 0) {
-        out->status = OSPREY_RUNTIME_MALFORMED;
         return out->status;
     }
-    if (!runtime_model_shape_valid(model)) {
-        out->status = OSPREY_RUNTIME_MALFORMED;
+    if (model == NULL || ctx == NULL || !ctx->mutation_runtime_ready ||
+        !ctx->mutation_model_ready || model != ctx->mutation_model) {
+        out->status = OSPREY_RUNTIME_INDEX_UNAVAILABLE;
         return out->status;
     }
     chunk.address = locator->start.address;
     chunk.size = locator->size;
-    if (!runtime_canonical_chunk_valid(&chunk)) {
-        out->status = OSPREY_RUNTIME_MALFORMED;
-        return out->status;
-    }
+    if (!runtime_canonical_chunk_valid(&chunk)) return out->status;
     status = runtime_find_instance(ctx, &locator->start, &instance);
     if (status != OSPREY_RUNTIME_RESOLVED) {
         out->status = status;
@@ -412,37 +452,27 @@ OspreyRuntimeResolveStatus osprey_runtime_resolve_cell(
         out->status = OSPREY_RUNTIME_OUT_OF_BOUNDS;
         return out->status;
     }
-
-    out->cell = *locator;
-    out->instance_valid = 1;
-    object = osprey_lookup_chunk(model, &chunk);
-    if (object == NULL) {
+    entry = runtime_compact_entry_find(model, &chunk);
+    if (entry == NULL) {
         out->status = OSPREY_RUNTIME_NO_CELL_OBJECT;
         return out->status;
     }
-    if (!runtime_chunk_equal(&object->chunk, &chunk)) {
-        out->status = OSPREY_RUNTIME_MALFORMED;
-        return out->status;
-    }
-    out->object = object;
-    out->object_index = runtime_model_object_index(model, object);
-    if (out->object_index == UINT32_MAX) {
-        out->status = OSPREY_RUNTIME_MALFORMED;
-        return out->status;
-    }
+    out->cell = *locator;
+    out->instance_valid = 1;
+    out->entry_ordinal = entry->ordinal;
+    out->aggregate_kind = entry->kind;
+    out->target_base = entry->target_base;
+    out->target_extent = entry->extent;
     out->status = OSPREY_RUNTIME_RESOLVED;
     return out->status;
 }
 
 OspreyRuntimeResolveStatus osprey_runtime_resolve_pointer(
-    const OspreyContext *ctx, const OspreyModel *model,
+    const OspreyContext *ctx, const OspreyMutationModel *model,
     const OspreyRuntimeChunkRef *cell_locator, target_ulong concrete_value,
     const OspreyRuntimeAddressRef *target_locator,
     OspreyRuntimePointerResolution *out)
 {
-    const OspreyDecodedObject *object;
-    const OspreyDecodedType *pointer_type;
-    const OspreyDecodedType *target_type;
     OspreyRuntimeResolveStatus status;
     OspreyRegionInstance target_instance;
     uint64_t target_end;
@@ -450,65 +480,31 @@ OspreyRuntimeResolveStatus osprey_runtime_resolve_pointer(
     if (out == NULL) return OSPREY_RUNTIME_MALFORMED;
     memset(out, 0, sizeof(*out));
     out->status = OSPREY_RUNTIME_MALFORMED;
-    out->target_type_id = UINT32_MAX;
-
+    out->entry_ordinal = UINT32_MAX;
     status = osprey_runtime_resolve_cell(ctx, model, cell_locator,
                                          &out->cell);
     if (status != OSPREY_RUNTIME_RESOLVED) {
         out->status = status;
         return status;
     }
-    object = out->cell.object;
-    if (object == NULL || model == NULL || model->types == NULL) {
-        out->status = OSPREY_RUNTIME_MISSING_TYPE;
-        return out->status;
-    }
-    if (object->has_pointer_target > 1) {
-        out->status = OSPREY_RUNTIME_MALFORMED;
-        return out->status;
-    }
-    if (object->value_type_id >= model->type_count) {
-        out->status = OSPREY_RUNTIME_MISSING_TYPE;
-        return out->status;
-    }
-    pointer_type = &model->types[object->value_type_id];
-    if (pointer_type->kind != OSPREY_TYPE_POINTER ||
-        pointer_type->size != sizeof(target_ulong) ||
-        object->chunk.size != sizeof(target_ulong)) {
+    if (out->cell.cell.size != sizeof(target_ulong)) {
         out->status = OSPREY_RUNTIME_NON_POINTER;
         return out->status;
     }
-    if (pointer_type->target_is_void > 1) {
-        out->status = OSPREY_RUNTIME_MALFORMED;
-        return out->status;
-    }
-    if (object->has_pointer_target == 0) {
-        out->status = OSPREY_RUNTIME_NO_POINTER_TARGET;
-        return out->status;
-    }
-    if (pointer_type->target_is_void != 0) {
-        out->status = OSPREY_RUNTIME_VOID_TARGET;
-        return out->status;
-    }
-    if (pointer_type->target_type_id >= model->type_count) {
-        out->status = OSPREY_RUNTIME_MISSING_TYPE;
-        return out->status;
-    }
-    target_type = &model->types[pointer_type->target_type_id];
-    if (target_type->kind != OSPREY_TYPE_ARRAY &&
-        target_type->kind != OSPREY_TYPE_STRUCT) {
+    if (out->cell.aggregate_kind != OSPREY_MUTATION_AGGREGATE_ARRAY &&
+        out->cell.aggregate_kind != OSPREY_MUTATION_AGGREGATE_STRUCT) {
         out->status = OSPREY_RUNTIME_MISSING_AGGREGATE;
         return out->status;
     }
-    if (target_type->size == 0 ||
-        !runtime_address_equal(&target_type->canonical_base,
-                               &object->pointer_target)) {
-        out->status = OSPREY_RUNTIME_MALFORMED;
+    if (out->cell.target_extent == 0 ||
+        out->cell.target_extent > OSPREY_MUTATION_MAX_EXTENT) {
+        out->status = OSPREY_RUNTIME_OUT_OF_BOUNDS;
         return out->status;
     }
-    out->target_type_id = pointer_type->target_type_id;
-    out->target_extent = target_type->size;
-    out->target_base = object->pointer_target;
+    out->entry_ordinal = out->cell.entry_ordinal;
+    out->aggregate_kind = out->cell.aggregate_kind;
+    out->target_extent = out->cell.target_extent;
+    out->target_base = out->cell.target_base;
 
     if (concrete_value == 0) {
         if (target_locator != NULL && !runtime_ref_is_zero(target_locator)) {
@@ -530,7 +526,7 @@ OspreyRuntimeResolveStatus osprey_runtime_resolve_pointer(
         return out->status;
     }
     if (!runtime_address_equal(&target_locator->address,
-                               &object->pointer_target)) {
+                               &out->target_base)) {
         out->status = OSPREY_RUNTIME_STALE_INSTANCE;
         return out->status;
     }

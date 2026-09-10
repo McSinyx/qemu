@@ -3070,6 +3070,7 @@ void osprey_tx_begin(OspreyContext *ctx) {
      * complete replacement.  The previous allocation remains owned but
      * hidden so a rejected transaction cannot consume stale advice. */
     ctx->mutation_model_ready = false;
+    ctx->mutation_runtime_ready = false;
     ctx->last_status = OSPREY_OK;
     osprey_budget_begin(ctx);
 }

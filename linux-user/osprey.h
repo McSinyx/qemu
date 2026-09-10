@@ -200,34 +200,54 @@ typedef enum OspreyRuntimeResolveStatus {
 
 typedef struct OspreyRuntimeCellResolution {
     OspreyRuntimeResolveStatus status;
-    uint32_t object_index;       /* UINT32_MAX unless status is RESOLVED */
+    uint32_t entry_ordinal;      /* UINT32_MAX unless status is RESOLVED */
     uint8_t instance_valid;      /* copied exact cell locator is valid */
-    uint8_t reserved[3];
+    uint8_t aggregate_kind;      /* compact ARRAY or STRUCT evidence */
+    uint8_t reserved[2];
     OspreyRuntimeChunkRef cell;
-    const OspreyDecodedObject *object; /* borrowed from immutable model */
+    OspreyAddress target_base;    /* exact compact target identity */
+    uint64_t target_extent;       /* checked compact extent */
 } OspreyRuntimeCellResolution;
 
 typedef struct OspreyRuntimePointerResolution {
     OspreyRuntimeResolveStatus status;
-    uint32_t target_type_id;     /* UINT32_MAX when no selected type */
-    uint64_t target_extent;      /* decoded aggregate size */
+    uint32_t entry_ordinal;      /* compact cell-entry ordinal */
+    uint64_t target_extent;      /* compact checked aggregate extent */
+    uint8_t aggregate_kind;      /* OspreyMutationAggregateKind */
     uint8_t has_runtime_target;  /* false for NULL -> fresh */
     uint8_t target_valid;
-    uint8_t reserved[2];
+    uint8_t reserved;
     OspreyRuntimeCellResolution cell;
     OspreyAddress target_base;   /* selected canonical aggregate base */
     OspreyRuntimeAddressRef target;
 } OspreyRuntimePointerResolution;
 
-/* Read-only parent-side resolver.  The result is exact only when the
- * returned status is OSPREY_RUNTIME_RESOLVED; all other statuses are
- * typed-unavailable for the individual access. */
+/* Compact runtime reception is checked once after B1 publication.  A failed
+ * reception hides compact advice for the current transaction; resolvers do
+ * not repeat structural model validation per access. */
+bool osprey_runtime_mutation_prepare(OspreyContext *ctx);
+const OspreyMutationModel *osprey_runtime_mutation_model(
+    const OspreyContext *ctx);
+
+/* Test-only counters prove one-time reception validation and logarithmic
+ * cell/runtime searches without exposing production model internals. */
+typedef struct OspreyRuntimeCounters {
+    uint64_t reception_validation_passes;
+    uint64_t cell_key_comparisons;
+    uint64_t runtime_instance_comparisons;
+} OspreyRuntimeCounters;
+void osprey_runtime_test_reset_counters(void);
+void osprey_runtime_test_get_counters(OspreyRuntimeCounters *out);
+
+/* Read-only parent-side resolver over the immutable B1 compact model.  The
+ * result is exact only when the returned status is RESOLVED; all other
+ * statuses are typed-unavailable for the individual access. */
 OspreyRuntimeResolveStatus osprey_runtime_resolve_cell(
-    const OspreyContext *ctx, const OspreyModel *model,
+    const OspreyContext *ctx, const OspreyMutationModel *model,
     const OspreyRuntimeChunkRef *locator,
     OspreyRuntimeCellResolution *out);
 OspreyRuntimeResolveStatus osprey_runtime_resolve_pointer(
-    const OspreyContext *ctx, const OspreyModel *model,
+    const OspreyContext *ctx, const OspreyMutationModel *model,
     const OspreyRuntimeChunkRef *cell_locator, target_ulong concrete_value,
     const OspreyRuntimeAddressRef *target_locator,
     OspreyRuntimePointerResolution *out);

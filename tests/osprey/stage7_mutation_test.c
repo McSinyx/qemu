@@ -962,10 +962,8 @@ static void free_plan_queue(GQueue *queue)
 typedef struct MutationTypedFixture {
     OspreyContext *ctx;
     OspreyContext *previous_ctx;
-    OspreyModel model;
-    OspreyDecodedObject object;
-    OspreyDecodedType types[2];
-    OspreyModelIndexEntry chunk_index;
+    OspreyMutationModel model;
+    OspreyMutationEntry entry;
     OspreyRuntimeChunkRef cell;
     OspreyRuntimeAddressRef target;
     OspreyRegionId global_region;
@@ -1026,6 +1024,7 @@ static void mutation_typed_fixture_init(MutationTypedFixture *fixture,
     OspreyConfig config;
     memset(&config, 0, sizeof(config));
     config.enabled = true;
+    config.analysis_mode = OSPREY_ANALYSIS_MODE_MUTATION;
     config.shared_bytes = 1u << 20;
     config.max_facts = 1024;
     config.max_chunks_per_region = 128;
@@ -1051,57 +1050,50 @@ static void mutation_typed_fixture_init(MutationTypedFixture *fixture,
                              TEST_GUEST_BASE + 0x5000,
                              TEST_GUEST_BASE + 0x6000, 0xabc, 3);
 
-    fixture->object.chunk = mutation_chunk(fixture->global_region, 0xb000,
-                                           sizeof(target_ulong));
-    fixture->object.has_pointer_target = 1;
-    fixture->object.value_type_id = 0;
-    fixture->object.pointer_target = mutation_address(fixture->target_region,
-                                                      0);
-    fixture->types[0].id = 0;
-    fixture->types[0].kind = OSPREY_TYPE_POINTER;
-    fixture->types[0].size = sizeof(target_ulong);
-    fixture->types[0].target_type_id = 1;
-    fixture->types[0].canonical_base = fixture->object.pointer_target;
-    fixture->types[1].id = 1;
-    fixture->types[1].kind = OSPREY_TYPE_STRUCT;
-    fixture->types[1].size = extent;
-    fixture->types[1].canonical_base = fixture->object.pointer_target;
-    fixture->chunk_index.key = osprey_chunk_key(&fixture->object.chunk);
-    fixture->chunk_index.ordinal = 0;
+    fixture->entry.cell = mutation_chunk(fixture->global_region, 0xb000,
+                                          sizeof(target_ulong));
+    fixture->entry.target_base = mutation_address(fixture->target_region, 0);
+    fixture->entry.extent = extent;
+    fixture->entry.support = 1;
+    fixture->entry.ordinal = 0;
+    fixture->entry.kind = OSPREY_MUTATION_AGGREGATE_STRUCT;
 
-    fixture->model.version = OSPREY_MODEL_VERSION;
-    fixture->model.object_count = 1;
-    fixture->model.type_count = 2;
-    fixture->model.chunk_index_count = 1;
-    fixture->model.objects = &fixture->object;
-    fixture->model.types = fixture->types;
-    fixture->model.chunk_index = &fixture->chunk_index;
+    fixture->model.version = OSPREY_MUTATION_MODEL_VERSION;
+    fixture->model.entry_count = 1;
+    fixture->model.publication_valid = 1;
+    fixture->model.entries = &fixture->entry;
 
-    fixture->cell.start.address = fixture->object.chunk.address;
+    fixture->cell.start.address = fixture->entry.cell.address;
     fixture->cell.start.raw = TEST_GUEST_BASE + 0xb000;
     fixture->cell.start.instance_id = 0;
     fixture->cell.start.valid = 1;
     fixture->cell.size = sizeof(target_ulong);
 
-    fixture->target.address = fixture->object.pointer_target;
+    fixture->target.address = fixture->entry.target_base;
     fixture->target.raw = TEST_GUEST_BASE + 0x5000;
     fixture->target.instance_id = 7;
     fixture->target.prov_object_id = 0xabc;
     fixture->target.prov_generation = 3;
     fixture->target.valid = 1;
 
-    fixture->ctx->model = &fixture->model;
+    fixture->ctx->mutation_model = &fixture->model;
+    fixture->ctx->mutation_model_ready = true;
+    fixture->ctx->mutation_runtime_ready = false;
     fixture->ctx->tx_status = OSPREY_OK;
     fixture->ctx->tx_model_ready = true;
     g_osprey_ctx = fixture->ctx;
     CHECK(osprey_runtime_index_build(fixture->ctx),
           "typed mutation runtime index builds");
+    CHECK(osprey_runtime_mutation_prepare(fixture->ctx),
+          "typed mutation compact publication validates");
 }
 
 static void mutation_typed_fixture_free(MutationTypedFixture *fixture)
 {
     if (fixture->ctx == NULL) return;
-    fixture->ctx->model = NULL;
+    fixture->ctx->mutation_model = NULL;
+    fixture->ctx->mutation_model_ready = false;
+    fixture->ctx->mutation_runtime_ready = false;
     fixture->ctx->tx_model_ready = false;
     osprey_free(fixture->ctx);
     fixture->ctx = NULL;
@@ -1377,7 +1369,7 @@ static void test_typed_pointer_plans_and_fallback(void)
         1, sizeof(target_ulong), SNAPSHOT_PAGE_SIZE,
     };
     for (uint32_t i = 0; i < G_N_ELEMENTS(other_extents); i++) {
-        fixture.types[1].size = other_extents[i];
+        fixture.entry.extent = other_extents[i];
         GQueue *queue = g_queue_new();
         CHECK(add_pointer_typed_candidate(
                   queue, &source, &fixture.cell, NULL, true,
@@ -1394,7 +1386,7 @@ static void test_typed_pointer_plans_and_fallback(void)
         }
         free_plan_queue(queue);
     }
-    fixture.types[1].size = 13;
+    fixture.entry.extent = 13;
 
     target_ulong concrete = fixture.target.raw;
     memcpy(source.value, &concrete, sizeof(concrete));
@@ -1461,7 +1453,7 @@ static void test_typed_pointer_plans_and_fallback(void)
           "typed planning binds the locator to the mutation address");
     free_plan_queue(queue);
 
-    fixture.types[1].size = 0;
+    fixture.entry.extent = 0;
     queue = g_queue_new();
     CHECK(add_pointer_typed_candidate(
               queue, &source, &fixture.cell, NULL, true,
@@ -1473,7 +1465,7 @@ static void test_typed_pointer_plans_and_fallback(void)
           "zero-size target preserves one untyped pointer plan");
     free_plan_queue(queue);
 
-    fixture.types[1].size = SNAPSHOT_PAGE_SIZE + 1;
+    fixture.entry.extent = SNAPSHOT_PAGE_SIZE + 1;
     queue = g_queue_new();
     CHECK(add_pointer_typed_candidate(
               queue, &source, &fixture.cell, NULL, true,
@@ -1494,7 +1486,7 @@ static void test_typed_pointer_plans_and_fallback(void)
     fixture.target.instance_id = 8;
     fixture.target.prov_object_id = 0xdef;
     fixture.target.prov_generation = 4;
-    fixture.types[1].size = 16;
+    fixture.entry.extent = 16;
     concrete = (target_ulong)fixture.target.raw;
     memcpy(source.value, &concrete, sizeof(concrete));
     queue = g_queue_new();
@@ -1509,7 +1501,7 @@ static void test_typed_pointer_plans_and_fallback(void)
     free_plan_queue(queue);
 
     memset(source.value, 0, sizeof(source.value));
-    fixture.types[1].size = 13;
+    fixture.entry.extent = 13;
     bool saw_success = false;
     for (int64_t fail_after = 0; fail_after < 32; fail_after++) {
         queue = g_queue_new();
@@ -1658,16 +1650,16 @@ static void test_reference_plan_matrix(void)
     /* Fresh-target size boundaries are compared at the exact cap and one
      * byte above it; changing the model cannot alter the source candidate. */
     memset(source.value, 0, sizeof(source.value));
-    fixture.types[1].size = SNAPSHOT_PAGE_SIZE;
+    fixture.entry.extent = SNAPSHOT_PAGE_SIZE;
     CHECK_PLAN("fresh exact-cap", true, SNAPSHOT_POINTER_FROM_PRIMITIVE,
                NULL);
-    fixture.types[1].size = SNAPSHOT_PAGE_SIZE + 1;
+    fixture.entry.extent = SNAPSHOT_PAGE_SIZE + 1;
     CHECK_PLAN("fresh over-cap fallback", true,
                SNAPSHOT_POINTER_FROM_PRIMITIVE, NULL);
-    fixture.types[1].size = 0;
+    fixture.entry.extent = 0;
     CHECK_PLAN("fresh zero-size fallback", true,
                SNAPSHOT_POINTER_FROM_PRIMITIVE, NULL);
-    fixture.types[1].size = 13;
+    fixture.entry.extent = 13;
 
 #undef CHECK_PLAN
     mutation_typed_fixture_free(&fixture);

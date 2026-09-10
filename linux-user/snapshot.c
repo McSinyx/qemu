@@ -2700,15 +2700,13 @@ static bool snapshot_test_install_applied_model(void)
     PrimitiveAccess *selected_generic = NULL;
     OspreyRuntimeAddressRef *target_ref;
     OspreyRegionInstance *target_instance = NULL;
-    OspreyModel *model;
-    OspreyDecodedObject *objects;
-    OspreyDecodedType *types;
-    OspreyModelIndexEntry *chunk_index;
+    OspreyMutationModel *model;
+    OspreyMutationEntry *entries;
     uint64_t pointer_offset = 0;
     uint64_t null_offset = 0;
     uint64_t late_offset = 0;
     uint64_t generic_offset = 0;
-    uint32_t object_count;
+    uint32_t entry_count;
     uint32_t same_site_instances = 0;
     uint64_t target_extent = 13;
 
@@ -2798,81 +2796,52 @@ static bool snapshot_test_install_applied_model(void)
         return false;
     }
 
-    object_count = 3;
-    model = g_new0(OspreyModel, 1);
-    objects = g_new0(OspreyDecodedObject, object_count);
-    types = g_new0(OspreyDecodedType, 2);
-    chunk_index = g_new0(OspreyModelIndexEntry, object_count);
-    for (uint32_t i = 0; i < object_count; i++) {
-        OspreyDecodedObject *object = &objects[i];
-        const OspreyRuntimeChunkRef *cell = i == 0 ? &selected->cell :
-            (i == 1 ? &selected_late->cell : &selected_null->cell);
-        object->chunk.address = cell->start.address;
-        object->chunk.size = sizeof(target_ulong);
-        object->storage_role = OSPREY_STORAGE_FIELD;
-        object->has_pointer_target = 1;
-        object->value_type_id = 0;
-        object->pointer_target = target_ref->address;
-        object->storage_posterior = 1.0;
-        object->pointer_posterior = 1.0;
+    entry_count = 3;
+    model = g_new0(OspreyMutationModel, 1);
+    entries = g_new0(OspreyMutationEntry, entry_count);
+    if (model == NULL || entries == NULL) {
+        g_free(entries);
+        g_free(model);
+        return false;
     }
-    for (uint32_t i = 1; i < object_count; i++) {
-        OspreyDecodedObject value = objects[i];
+    const OspreyRuntimeChunkRef *cells[3] = {
+        &selected->cell, &selected_late->cell, &selected_null->cell,
+    };
+    for (uint32_t i = 0; i < entry_count; i++) {
+        entries[i].cell.address = cells[i]->start.address;
+        entries[i].cell.size = sizeof(target_ulong);
+        entries[i].target_base = target_ref->address;
+        entries[i].extent = target_extent;
+        entries[i].support = 1;
+        entries[i].kind = OSPREY_MUTATION_AGGREGATE_STRUCT;
+    }
+    for (uint32_t i = 1; i < entry_count; i++) {
+        OspreyMutationEntry value = entries[i];
         uint32_t j = i;
-        while (j > 0 && value.chunk.address.offset <
-                          objects[j - 1].chunk.address.offset) {
-            objects[j] = objects[j - 1];
+        while (j > 0 && value.cell.address.offset <
+                          entries[j - 1].cell.address.offset) {
+            entries[j] = entries[j - 1];
             j--;
         }
-        objects[j] = value;
+        entries[j] = value;
     }
-    types[0].id = 0;
-    types[0].kind = OSPREY_TYPE_POINTER;
-    types[0].size = sizeof(target_ulong);
-    types[0].target_type_id = 1;
-    types[0].canonical_base = target_ref->address;
-    types[1].id = 1;
-    types[1].kind = OSPREY_TYPE_STRUCT;
-    types[1].size = target_extent;
-    types[1].canonical_base = target_ref->address;
-    for (uint32_t i = 0; i < object_count; i++) {
-        chunk_index[i].key = osprey_chunk_key(&objects[i].chunk);
-        chunk_index[i].ordinal = i;
-    }
-    model->version = OSPREY_MODEL_VERSION;
-    model->object_count = object_count;
-    model->type_count = 2;
-    model->chunk_index_count = object_count;
-    model->objects = objects;
-    model->types = types;
-    model->chunk_index = chunk_index;
-    model->ledger[OSPREY_MODEL_LEDGER_OBJECTS] = (OspreyModelAllocation){
-        .base = objects, .capacity = object_count, .used = object_count,
-        .bytes = object_count * sizeof(*objects),
-        .element_size = sizeof(*objects),
-        .destructor_kind = OSPREY_MODEL_DESTRUCTOR_FREE,
-    };
-    model->ledger[OSPREY_MODEL_LEDGER_TYPES] = (OspreyModelAllocation){
-        .base = types, .capacity = 2, .used = 2,
-        .bytes = 2 * sizeof(*types), .element_size = sizeof(*types),
-        .destructor_kind = OSPREY_MODEL_DESTRUCTOR_FREE,
-    };
-    model->ledger[OSPREY_MODEL_LEDGER_CHUNK_INDEX] =
-        (OspreyModelAllocation){
-            .base = chunk_index, .capacity = object_count,
-            .used = object_count,
-            .bytes = object_count * sizeof(*chunk_index),
-            .element_size = sizeof(*chunk_index),
-            .destructor_kind = OSPREY_MODEL_DESTRUCTOR_FREE,
-        };
+    for (uint32_t i = 0; i < entry_count; i++) entries[i].ordinal = i;
+    model->version = OSPREY_MUTATION_MODEL_VERSION;
+    model->entry_count = entry_count;
+    model->publication_valid = 1;
+    model->entries = entries;
     if (g_osprey_ctx->model != NULL) {
         osprey_model_free(g_osprey_ctx->model);
+        g_osprey_ctx->model = NULL;
     }
     if (g_osprey_ctx->staged_model != NULL) {
         osprey_model_free(g_osprey_ctx->staged_model);
         g_osprey_ctx->staged_model = NULL;
     }
-    g_osprey_ctx->model = model;
+    osprey_mutation_model_clear(g_osprey_ctx);
+    g_osprey_ctx->mutation_model = model;
+    g_osprey_ctx->mutation_model_ready = true;
+    g_osprey_ctx->mutation_runtime_ready = false;
     g_osprey_ctx->tx_status = OSPREY_OK;
     g_osprey_ctx->tx_stage = NULL;
     g_osprey_ctx->tx_reason = NULL;
@@ -3862,8 +3831,8 @@ typedef enum SnapshotPointerSource {
     SNAPSHOT_POINTER_FROM_ACCESS = 1,
 } SnapshotPointerSource;
 /* Resolve one baseline pointer access and enqueue its complete typed batch.
- * This remains a focused Stage 7 compatibility adapter; production analysis
- * now emits the same descriptors through the coordinator sink below. */
+ * This focused Stage 7 source lane uses the same compact resolver as the
+ * production coordinator sink below; it does not adapt a decoded full model. */
 static bool add_pointer_typed_candidate(
     GQueue *modifications, const MutationCandidate *source,
     const OspreyRuntimeChunkRef *cell,
@@ -3876,7 +3845,7 @@ static bool add_pointer_typed_candidate(
     const OspreyRuntimeAddressRef *target_ref, bool typed_allowed,
     SnapshotPointerSource source_kind)
 {
-    const OspreyModel *model = NULL;
+    const OspreyMutationModel *model = NULL;
     OspreyRuntimePointerResolution resolution;
     OspreyRuntimeResolveStatus status;
     uint8_t zero_value[sizeof(target_ulong)] = {0};
@@ -3888,10 +3857,11 @@ static bool add_pointer_typed_candidate(
         source->size != sizeof(target_ulong) || cell == NULL ||
         cell->start.valid != 1 || cell->size != source->size ||
         cell->start.raw != (uint64_t)source->addr || g_osprey_ctx == NULL ||
-        !g_osprey_ctx->config.enabled || !osprey_collect_enabled) {
+        !g_osprey_ctx->config.enabled || !osprey_collect_enabled ||
+        !osprey_runtime_mutation_prepare(g_osprey_ctx)) {
         goto generic;
     }
-    model = osprey_model(g_osprey_ctx);
+    model = osprey_runtime_mutation_model(g_osprey_ctx);
     if (model == NULL) goto generic;
     memcpy(&concrete_value, source->value, sizeof(concrete_value));
     status = osprey_runtime_resolve_pointer(
@@ -3983,7 +3953,7 @@ static bool snapshot_mutation_legacy_emit_family(
     const SnapshotMutationBaselineEntry *entry,
     SnapshotMutationProposalSink *sink)
 {
-    const OspreyModel *model;
+    const OspreyMutationModel *model;
     OspreyRuntimePointerResolution resolution;
     OspreyRuntimeResolveStatus status;
     SnapshotMutationProposalFamily family;
@@ -4000,10 +3970,11 @@ static bool snapshot_mutation_legacy_emit_family(
         entry->cell.size != entry->size ||
         entry->cell.start.raw != (uint64_t)entry->addr ||
         g_osprey_ctx == NULL || !g_osprey_ctx->config.enabled ||
-        !osprey_collect_enabled) {
+        !osprey_collect_enabled ||
+        !osprey_runtime_mutation_prepare(g_osprey_ctx)) {
         return false;
     }
-    model = osprey_model(g_osprey_ctx);
+    model = osprey_runtime_mutation_model(g_osprey_ctx);
     if (model == NULL) return false;
     memcpy(&concrete_value, entry->planner_bytes, sizeof(concrete_value));
     status = osprey_runtime_resolve_pointer(
@@ -4472,6 +4443,10 @@ static bool snapshot_mutation_coordinator_build(
     sink.coordinator = &coordinator;
     sink.advisor_id = 1;
     sink.advisor_priority = 0;
+    if (g_osprey_ctx != NULL && g_osprey_ctx->config.analysis_mode ==
+            OSPREY_ANALYSIS_MODE_MUTATION) {
+        (void)osprey_runtime_mutation_prepare(g_osprey_ctx);
+    }
     snapshot_mutation_legacy_advisor(baseline, &sink);
 
     g_ptr_array_sort_with_data(coordinator.families,

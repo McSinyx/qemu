@@ -919,7 +919,8 @@ TESTS = [
         name="t14_typed_mutation",
         mode="binradar",
         memcheck=0,
-        env={"BINRADAR_OSPREY_TEST_APPLIED_STATE": "1"},
+        env={"BINRADAR_OSPREY_TEST_APPLIED_STATE": "1",
+             "BINRADAR_OSPREY_ANALYSIS_MODE": "mutation"},
         test_symbol_offsets={
             "BINRADAR_OSPREY_TEST_POINTER_GLOBAL_OFFSET":
                 "t14_pointer_cell",

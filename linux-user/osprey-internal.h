@@ -805,6 +805,7 @@ struct OspreyContext {
      * but it is hidden until a later successful publication. */
     OspreyMutationModel *mutation_model;
     bool mutation_model_ready;
+    bool mutation_runtime_ready;
 
     /* Origin shadows, keyed by CPUArchState* (per-thread). */
     GHashTable *cpu_origins;   /* env* -> OspreyCpuOriginState* */

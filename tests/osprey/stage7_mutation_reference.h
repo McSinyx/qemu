@@ -7,11 +7,11 @@
  * Stage 7.2 tests.  They scan the immutable source records directly and
  * never call the production runtime index or resolvers. */
 OspreyRuntimeResolveStatus stage7_reference_resolve_cell(
-    const OspreyContext *ctx, const OspreyModel *model,
+    const OspreyContext *ctx, const OspreyMutationModel *model,
     const OspreyRuntimeChunkRef *locator,
     OspreyRuntimeCellResolution *out);
 OspreyRuntimeResolveStatus stage7_reference_resolve_pointer(
-    const OspreyContext *ctx, const OspreyModel *model,
+    const OspreyContext *ctx, const OspreyMutationModel *model,
     const OspreyRuntimeChunkRef *cell_locator, target_ulong concrete_value,
     const OspreyRuntimeAddressRef *target_locator,
     OspreyRuntimePointerResolution *out);
@@ -59,7 +59,7 @@ typedef struct Stage7ReferencePlan {
 
 void stage7_reference_plan_clear(Stage7ReferencePlan *plan);
 bool stage7_reference_plan_build(
-    const OspreyContext *ctx, const OspreyModel *model,
+    const OspreyContext *ctx, const OspreyMutationModel *model,
     const Stage7ReferenceCandidate *candidate,
     const OspreyRuntimeChunkRef *cell_locator,
     const OspreyRuntimeAddressRef *target_locator,

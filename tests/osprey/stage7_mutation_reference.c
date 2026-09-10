@@ -53,6 +53,22 @@ static bool reference_ref_is_zero(const OspreyRuntimeAddressRef *ref)
     return memcmp(ref, &zero, sizeof(zero)) == 0;
 }
 
+static bool reference_chunk_valid(const OspreyChunk *chunk)
+{
+    uint64_t delta;
+    if (chunk == NULL || chunk->size == 0 ||
+        chunk->address.region.kind > OSPREY_REGION_STACK_FUNCTION) {
+        return false;
+    }
+    delta = chunk->size - 1;
+    if (delta > INT64_MAX) return false;
+    if (chunk->address.offset >= 0) {
+        return (uint64_t)chunk->address.offset <=
+               (uint64_t)INT64_MAX - delta;
+    }
+    return delta < (uint64_t)(-(chunk->address.offset + 1)) + 1;
+}
+
 static OspreyRuntimeResolveStatus reference_find_instance(
     const OspreyContext *ctx, const OspreyRuntimeAddressRef *ref,
     OspreyRegionInstance *out)
@@ -62,18 +78,15 @@ static OspreyRuntimeResolveStatus reference_find_instance(
     unsigned matches = 0;
 
     if (ctx == NULL || ctx->region_instances == NULL || ref == NULL ||
-        out == NULL) {
-        return OSPREY_RUNTIME_MALFORMED;
-    }
+        out == NULL) return OSPREY_RUNTIME_MALFORMED;
     if (ref->valid == 0) return OSPREY_RUNTIME_NO_LOCATOR;
     if (ref->valid != 1 || ref->reserved[0] != 0 ||
         ref->reserved[1] != 0 || ref->reserved[2] != 0 ||
         ref->address.region.kind > OSPREY_REGION_STACK_FUNCTION) {
         return OSPREY_RUNTIME_MALFORMED;
     }
-    if (!reference_derive_base(ref, &raw_base)) {
+    if (!reference_derive_base(ref, &raw_base))
         return OSPREY_RUNTIME_STALE_INSTANCE;
-    }
     for (guint i = 0; i < ctx->region_instances->len; i++) {
         const OspreyRegionInstance *candidate = &g_array_index(
             ctx->region_instances, OspreyRegionInstance, i);
@@ -82,9 +95,7 @@ static OspreyRuntimeResolveStatus reference_find_instance(
             candidate->instance_id != ref->instance_id ||
             candidate->raw_base != raw_base ||
             candidate->prov_object_id != ref->prov_object_id ||
-            candidate->prov_generation != ref->prov_generation) {
-            continue;
-        }
+            candidate->prov_generation != ref->prov_generation) continue;
         instance = candidate;
         matches++;
     }
@@ -99,7 +110,7 @@ static OspreyRuntimeResolveStatus reference_find_instance(
 }
 
 OspreyRuntimeResolveStatus stage7_reference_resolve_cell(
-    const OspreyContext *ctx, const OspreyModel *model,
+    const OspreyContext *ctx, const OspreyMutationModel *model,
     const OspreyRuntimeChunkRef *locator,
     OspreyRuntimeCellResolution *out)
 {
@@ -111,33 +122,18 @@ OspreyRuntimeResolveStatus stage7_reference_resolve_cell(
     if (out == NULL) return OSPREY_RUNTIME_MALFORMED;
     memset(out, 0, sizeof(*out));
     out->status = OSPREY_RUNTIME_MALFORMED;
-    out->object_index = UINT32_MAX;
+    out->entry_ordinal = UINT32_MAX;
     if (locator == NULL || locator->start.valid == 0) {
         out->status = OSPREY_RUNTIME_NO_LOCATOR;
         return out->status;
     }
     if (locator->start.valid != 1 || locator->size == 0 || model == NULL ||
-        model->version != OSPREY_MODEL_VERSION ||
-        (model->object_count != 0 && model->objects == NULL)) {
-        return out->status;
-    }
+        model->version != OSPREY_MUTATION_MODEL_VERSION ||
+        model->publication_valid != 1 ||
+        (model->entry_count != 0 && model->entries == NULL)) return out->status;
     chunk.address = locator->start.address;
     chunk.size = locator->size;
-    if (chunk.address.region.kind > OSPREY_REGION_STACK_FUNCTION ||
-        chunk.size - 1 > INT64_MAX) {
-        return out->status;
-    }
-    if (chunk.address.offset >= 0) {
-        if ((uint64_t)chunk.address.offset >
-            (uint64_t)INT64_MAX - (chunk.size - 1)) {
-            return out->status;
-        }
-    } else {
-        uint64_t magnitude =
-            (uint64_t)(-(chunk.address.offset + 1)) + 1;
-        if (chunk.size - 1 >= magnitude) return out->status;
-    }
-
+    if (!reference_chunk_valid(&chunk)) return out->status;
     status = reference_find_instance(ctx, &locator->start, &instance);
     if (status != OSPREY_RUNTIME_RESOLVED) {
         out->status = status;
@@ -152,13 +148,15 @@ OspreyRuntimeResolveStatus stage7_reference_resolve_cell(
         out->status = OSPREY_RUNTIME_OUT_OF_BOUNDS;
         return out->status;
     }
-
-    out->cell = *locator;
-    out->instance_valid = 1;
-    for (uint32_t i = 0; i < model->object_count; i++) {
-        if (!reference_chunk_equal(&model->objects[i].chunk, &chunk)) continue;
-        out->object = &model->objects[i];
-        out->object_index = i;
+    for (uint32_t i = 0; i < model->entry_count; i++) {
+        const OspreyMutationEntry *entry = &model->entries[i];
+        if (!reference_chunk_equal(&entry->cell, &chunk)) continue;
+        out->cell = *locator;
+        out->instance_valid = 1;
+        out->entry_ordinal = entry->ordinal;
+        out->aggregate_kind = entry->kind;
+        out->target_base = entry->target_base;
+        out->target_extent = entry->extent;
         out->status = OSPREY_RUNTIME_RESOLVED;
         return out->status;
     }
@@ -167,14 +165,11 @@ OspreyRuntimeResolveStatus stage7_reference_resolve_cell(
 }
 
 OspreyRuntimeResolveStatus stage7_reference_resolve_pointer(
-    const OspreyContext *ctx, const OspreyModel *model,
+    const OspreyContext *ctx, const OspreyMutationModel *model,
     const OspreyRuntimeChunkRef *cell_locator, target_ulong concrete_value,
     const OspreyRuntimeAddressRef *target_locator,
     OspreyRuntimePointerResolution *out)
 {
-    const OspreyDecodedObject *object;
-    const OspreyDecodedType *pointer_type;
-    const OspreyDecodedType *target_type;
     OspreyRegionInstance target_instance;
     OspreyRuntimeResolveStatus status;
     uint64_t target_end;
@@ -182,63 +177,34 @@ OspreyRuntimeResolveStatus stage7_reference_resolve_pointer(
     if (out == NULL) return OSPREY_RUNTIME_MALFORMED;
     memset(out, 0, sizeof(*out));
     out->status = OSPREY_RUNTIME_MALFORMED;
-    out->target_type_id = UINT32_MAX;
+    out->entry_ordinal = UINT32_MAX;
     status = stage7_reference_resolve_cell(ctx, model, cell_locator,
                                            &out->cell);
     if (status != OSPREY_RUNTIME_RESOLVED) {
         out->status = status;
         return status;
     }
-    object = out->cell.object;
-    if (object == NULL || model == NULL || model->types == NULL ||
-        object->value_type_id >= model->type_count) {
-        out->status = OSPREY_RUNTIME_MISSING_TYPE;
-        return out->status;
-    }
-    if (object->has_pointer_target > 1) {
-        out->status = OSPREY_RUNTIME_MALFORMED;
-        return out->status;
-    }
-    pointer_type = &model->types[object->value_type_id];
-    if (pointer_type->kind != OSPREY_TYPE_POINTER ||
-        pointer_type->size != sizeof(target_ulong) ||
-        object->chunk.size != sizeof(target_ulong)) {
+    if (out->cell.cell.size != sizeof(target_ulong)) {
         out->status = OSPREY_RUNTIME_NON_POINTER;
         return out->status;
     }
-    if (pointer_type->target_is_void > 1) {
-        out->status = OSPREY_RUNTIME_MALFORMED;
-        return out->status;
-    }
-    if (object->has_pointer_target == 0) {
-        out->status = OSPREY_RUNTIME_NO_POINTER_TARGET;
-        return out->status;
-    }
-    if (pointer_type->target_is_void != 0) {
-        out->status = OSPREY_RUNTIME_VOID_TARGET;
-        return out->status;
-    }
-    if (pointer_type->target_type_id >= model->type_count) {
-        out->status = OSPREY_RUNTIME_MISSING_TYPE;
-        return out->status;
-    }
-    target_type = &model->types[pointer_type->target_type_id];
-    if (target_type->kind != OSPREY_TYPE_ARRAY &&
-        target_type->kind != OSPREY_TYPE_STRUCT) {
+    if (out->cell.aggregate_kind != OSPREY_MUTATION_AGGREGATE_ARRAY &&
+        out->cell.aggregate_kind != OSPREY_MUTATION_AGGREGATE_STRUCT) {
         out->status = OSPREY_RUNTIME_MISSING_AGGREGATE;
         return out->status;
     }
-    if (target_type->size == 0 ||
-        !reference_address_equal(&target_type->canonical_base,
-                                 &object->pointer_target)) {
+    if (out->cell.target_extent == 0 ||
+        out->cell.target_extent > OSPREY_MUTATION_MAX_EXTENT) {
+        out->status = OSPREY_RUNTIME_OUT_OF_BOUNDS;
         return out->status;
     }
-    out->target_type_id = pointer_type->target_type_id;
-    out->target_extent = target_type->size;
-    out->target_base = object->pointer_target;
-
+    out->entry_ordinal = out->cell.entry_ordinal;
+    out->aggregate_kind = out->cell.aggregate_kind;
+    out->target_extent = out->cell.target_extent;
+    out->target_base = out->cell.target_base;
     if (concrete_value == 0) {
         if (target_locator != NULL && !reference_ref_is_zero(target_locator)) {
+            out->status = OSPREY_RUNTIME_MALFORMED;
             return out->status;
         }
         out->status = OSPREY_RUNTIME_RESOLVED;
@@ -256,7 +222,7 @@ OspreyRuntimeResolveStatus stage7_reference_resolve_pointer(
         return out->status;
     }
     if (!reference_address_equal(&target_locator->address,
-                                 &object->pointer_target)) {
+                                 &out->target_base)) {
         out->status = OSPREY_RUNTIME_STALE_INSTANCE;
         return out->status;
     }
@@ -427,7 +393,7 @@ static bool reference_generic_plan(
 }
 
 bool stage7_reference_plan_build(
-    const OspreyContext *ctx, const OspreyModel *model,
+    const OspreyContext *ctx, const OspreyMutationModel *model,
     const Stage7ReferenceCandidate *candidate,
     const OspreyRuntimeChunkRef *cell_locator,
     const OspreyRuntimeAddressRef *target_locator,

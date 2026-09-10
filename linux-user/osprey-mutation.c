@@ -575,12 +575,14 @@ void osprey_mutation_model_clear(OspreyContext *ctx)
         ctx->mutation_model = NULL;
     }
     ctx->mutation_model_ready = false;
+    ctx->mutation_runtime_ready = false;
 }
 
 static OspreyStatus mutation_reject(OspreyContext *ctx, const char *reason)
 {
     if (ctx != NULL) {
         ctx->mutation_model_ready = false;
+        ctx->mutation_runtime_ready = false;
         if (osprey_tx_ok(ctx)) osprey_tx_reject(ctx, OSPREY_LIMIT_EXCEEDED,
                                                 "mutation", reason);
     }
@@ -594,6 +596,7 @@ OspreyStatus osprey_mutation_model_build(OspreyContext *ctx)
     memset(&w, 0, sizeof(w)); memset(&stats, 0, sizeof(stats));
     if (ctx == NULL || !ctx->config.enabled) return OSPREY_DISABLED;
     ctx->mutation_model_ready = false;
+    ctx->mutation_runtime_ready = false;
     if (!input_count(ctx, &input)) return mutation_reject(ctx, "mutation-input-cap");
     stats.input_facts = input;
     if (ctx->config.max_mutation_input != 0 &&
