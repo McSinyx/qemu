@@ -342,8 +342,11 @@ E9_RANGES_HDR := ../../linux-user/e9-ranges.h
 MUTATION_INCLUDED_SRCS := ../../linux-user/snapshot.c \
                           ../../linux-user/snapshot.h
 
+# GQueue frees links through GLib's slice allocator. Debug blocks makes an
+# allocator-family mismatch fail at the first queue pop instead of corrupting
+# the forkserver parent's heap after hundreds of mutation epochs.
 unit-stage7-mutation: $(MUTATION_UNIT_BIN)
-	@$(MUTATION_UNIT_BIN)
+	@G_SLICE=debug-blocks $(MUTATION_UNIT_BIN)
 
 $(MUTATION_UNIT_BIN): stage7_mutation_test.c stage7_mutation_reference.c \
 		stage7_mutation_reference.h $(MUTATION_INCLUDED_SRCS) \

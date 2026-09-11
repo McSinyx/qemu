@@ -311,6 +311,20 @@ static void *snapshot_mutation_try_malloc0(size_t size)
     return g_try_malloc0(size);
 }
 
+/* g_queue_pop_head() and g_queue_free_full() release links through GLib's
+ * list allocator.  Links passed to g_queue_push_tail_link() must therefore
+ * come from g_list_alloc(), never g_malloc(). */
+static GList *snapshot_mutation_try_list_alloc(void)
+{
+    if (snapshot_mutation_alloc_fail_after == 0) {
+        return NULL;
+    }
+    if (snapshot_mutation_alloc_fail_after > 0) {
+        snapshot_mutation_alloc_fail_after--;
+    }
+    return g_list_alloc();
+}
+
 static void snapshot_mutation_free(SnapshotMutationPlan *mod)
 {
     if (mod == NULL) {
@@ -3065,14 +3079,14 @@ static bool snapshot_mutation_enqueue_plan_array(
     }
     for (size_t i = 0; i < count; i++) {
         if (plans[i] == NULL) {
-            for (size_t j = 0; j < i; j++) g_free(links[j]);
+            for (size_t j = 0; j < i; j++) g_list_free_1(links[j]);
             g_free(links);
             snapshot_mutation_free_batch(plans, count);
             return false;
         }
-        links[i] = snapshot_mutation_try_malloc0(sizeof(GList));
+        links[i] = snapshot_mutation_try_list_alloc();
         if (links[i] == NULL) {
-            for (size_t j = 0; j < i; j++) g_free(links[j]);
+            for (size_t j = 0; j < i; j++) g_list_free_1(links[j]);
             g_free(links);
             snapshot_mutation_free_batch(plans, count);
             return false;

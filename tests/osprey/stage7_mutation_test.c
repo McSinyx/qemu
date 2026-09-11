@@ -31,8 +31,8 @@
  *  - Owned-plan groups: exact legacy generic descriptors, resolver-backed
  *    NULL/fresh and non-NULL/NULL/OOB batches, typed-unavailable fallback,
  *    independent exact-size payloads, checked OOB arithmetic, allocation
- *    rollback, target-first child application, FIFO transitions, and total
- *    manager teardown.
+ *    rollback, target-first child application, FIFO transitions, GLib queue-
+ *    link allocator pairing, and total manager teardown.
  *
  * Build: see tests/osprey/Makefile (targets unit-stage7-mutation and
  * unit-stage7-mutation-asan).
