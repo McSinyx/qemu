@@ -426,6 +426,24 @@ PHASE5_TESTS: list[dict[str, Any]] = [
 TESTS += PHASE5_TESTS
 
 # ---------------------------------------------------------------------------
+# t80: pre-entry XMM memory access under semantic-event instrumentation
+# ---------------------------------------------------------------------------
+# The guest's constructor runs before main (the forkserver entrypoint) and
+# performs `movss mem -> xmm0 -> mem` plus an XMM register copy.  With
+# semantic events active (memcheck or OSPREY) the translator inserts a
+# helper call between the guest load and its XMM store; the symbolic engine
+# used to match that pair by physical adjacency and aborted during
+# translation, so the forkserver banner was never written and the driver
+# saw a banner EOF.  This must now handshake, run the child to a normal
+# exit, and report no finding.
+PHASE6_TESTS: list[dict[str, Any]] = [
+    dict(name="t80_xmm_preentry_forkserver", mode="fors", rc=(2,), fs_status=0,
+         verdict="normal", finding=None,
+         note="pre-entry movss under sem-events: banner instead of abort"),
+]
+TESTS += PHASE6_TESTS
+
+# ---------------------------------------------------------------------------
 # Log parsing
 # ---------------------------------------------------------------------------
 

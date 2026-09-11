@@ -6671,6 +6671,168 @@ void memcheck_instrument_tb(TranslationBlock *tb, TCGContext *tcg_ctx,
     }
 }
 
+/* ------------------------------------------------------------------------
+ * XMM load/store pairing by dataflow, not physical adjacency.
+ *
+ * The symbolic engine models XMM register traffic by matching a guest
+ * memory op with the XMM register access that carries its value:
+ *
+ *     qemu_ld_i64  tmp0, addr, ...   <- guest load
+ *     st32_i64     tmp0, env, xmm    <- XMM write   (movss xmm, ea)
+ *     ld_i64       tmp1, env, xmm    <- XMM read
+ *     qemu_st_i64  tmp1, addr, ...   <- guest store  (movss ea, xmm)
+ *
+ * Historically these were matched with `QTAILQ_NEXT(op)`/`prev_op`, i.e.
+ * assuming the pair is physically adjacent in the TCG stream.  The
+ * semantic-event instrumentation (OSPREY `BINRADAR_OSPREY_ENABLE=1` or
+ * memcheck `BINRADAR_MEMCHECK_ENABLE=1`, both via `sem_events_active()`)
+ * emits helper calls after every guest memory op, so the stream becomes
+ *
+ *     qemu_ld_i64  tmp0, addr, ...
+ *     call         sem_mem_access    <- inserted event helper
+ *     st32_i64     tmp0, env, xmm
+ *
+ * and the adjacency test no longer sees the load.  The store then hits the
+ * "unmodeled XMM store" abort path and the tracer dies during translation,
+ * before the forkserver handshake (symptom: `EOF while reading from
+ * forkserver`).  See problem/TRACER_XMM_STORE_ABORT_OSPREY_SEM_EVENTS.md.
+ *
+ * The matcher below finds the pair by *dataflow* within the current guest
+ * instruction: it searches the TCG stream for the op that produces (or
+ * consumes) the same TCG value temp, skipping helper calls that do not
+ * redefine that temp, and never crossing an `INDEX_op_insn_start`
+ * boundary.  It is translation-time only (bounded TB traversal, no guest
+ * work, no runtime allocation).
+ * ------------------------------------------------------------------------ */
+
+/* Number of input args of `opc` in the *current* stream: `call` carries a
+ * variable count in TCGOP_CALLI, everything else in its op def. */
+static inline size_t tcg_op_nb_iargs(const TCGOp* op)
+{
+    if (op->opc == INDEX_op_call) {
+        return TCGOP_CALLI(op);
+    }
+    return tcg_op_defs[op->opc].nb_iargs;
+}
+
+/* First input arg index of `opc` (outputs come first). */
+static inline size_t tcg_op_first_iarg(const TCGOp* op)
+{
+    if (op->opc == INDEX_op_call) {
+        return TCGOP_CALLO(op);
+    }
+    return tcg_op_defs[op->opc].nb_oargs;
+}
+
+/* Does `op` define `t` (write it as an output)?  Calls count: any call
+ * output redefines its temp. */
+static inline bool tcg_op_defines_temp(const TCGOp* op, const TCGTemp* t)
+{
+    if (op->opc == INDEX_op_call) {
+        for (size_t i = 0; i < TCGOP_CALLO(op); i++) {
+            if (arg_temp(op->args[i]) == t) {
+                return true;
+            }
+        }
+        return false;
+    }
+    const TCGOpDef* def = &tcg_op_defs[op->opc];
+    for (size_t i = 0; i < def->nb_oargs; i++) {
+        if (arg_temp(op->args[i]) == t) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Does `op` read `t` (use it as an input)? */
+static inline bool tcg_op_uses_temp(const TCGOp* op, const TCGTemp* t)
+{
+    size_t first = tcg_op_first_iarg(op);
+    size_t count = tcg_op_nb_iargs(op);
+    for (size_t i = 0; i < count; i++) {
+        TCGArg a = op->args[first + i];
+        if (a != TCG_CALL_DUMMY_ARG && arg_temp(a) == t) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Walk forward from `from` (exclusive) and return the first op that uses
+ * `t` as an input, or NULL.  Stops at the first redefinition of `t` (the
+ * value we are tracking is gone) and never crosses an instruction
+ * boundary. */
+static TCGOp* find_next_temp_use(TCGOp* from, TCGTemp* t)
+{
+    for (TCGOp* op = QTAILQ_NEXT(from, link); op != NULL;
+         op = QTAILQ_NEXT(op, link)) {
+        if (op->opc == INDEX_op_insn_start) {
+            return NULL;
+        }
+        if (tcg_op_defines_temp(op, t)) {
+            return NULL;
+        }
+        if (tcg_op_uses_temp(op, t)) {
+            return op;
+        }
+    }
+    return NULL;
+}
+
+/* Walk backward from `from` (exclusive) and return the first op that
+ * defines `t` as an output, or NULL.  Ops that merely read `t` are
+ * traversed.  Stops at the instruction boundary. */
+static TCGOp* find_prev_temp_def(TCGOp* from, TCGTemp* t)
+{
+    for (TCGOp* op = QTAILQ_PREV(from, link); op != NULL;
+         op = QTAILQ_PREV(op, link)) {
+        if (op->opc == INDEX_op_insn_start) {
+            return NULL;
+        }
+        if (tcg_op_defines_temp(op, t)) {
+            return op;
+        }
+    }
+    return NULL;
+}
+
+/* Is `op` the XMM register write paired with the memory load `load`?
+ * Requires the same value temp and a store into an XMM offset. */
+static inline bool is_paired_xmm_store_of(TCGOp* op, TCGOp* load)
+{
+    return op != NULL && op->opc == INDEX_op_st_i64 &&
+           arg_temp(op->args[0]) == arg_temp(load->args[0]) &&
+           is_xmm_offset(op->args[2]);
+}
+
+/* Is `op` the XMM register read paired with the memory store `store`?
+ * Requires the same value temp and a load from an XMM offset. */
+static inline bool is_paired_xmm_load_of(TCGOp* op, TCGOp* store)
+{
+    return op != NULL && op->opc == INDEX_op_ld_i64 &&
+           arg_temp(op->args[0]) == arg_temp(store->args[0]) &&
+           is_xmm_offset(op->args[2]);
+}
+
+/* Was the XMM register write `store` already modelled by one of the load
+ * handlers above?  Its value temp must be produced within the same guest
+ * instruction by either
+ *   - a guest memory load  (`qemu_ld_i64`: `movss/movsd xmm, ea`), whose
+ *     `qemu_ld_i64` handler emitted the shadow copy, or
+ *   - an XMM register load  (`ld_i64`: `movaps/movss` reg,reg), whose
+ *     `ld_i64` handler emitted the register-to-register shadow copy.
+ * Those stores are the second half of an already-handled pair and need no
+ * further symbolic action; anything else is genuinely unmodelled. */
+static inline bool is_modelled_xmm_store(TCGOp* store)
+{
+    TCGOp* producer =
+        find_prev_temp_def(store, arg_temp(store->args[0]));
+    return producer != NULL &&
+           (producer->opc == INDEX_op_qemu_ld_i64 ||
+            producer->opc == INDEX_op_ld_i64);
+}
+
 static int instrument = 0;
 int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                                    uint8_t* tb_code, TCGContext* tcg_ctx, CPUArchState *cpu_env)
@@ -6784,8 +6946,6 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
 #endif
 
     TCGOp* op;
-    TCGOp* next_op;
-    TCGOp* prev_op         = NULL;
     int    hit_first_instr = 0;
 
     uintptr_t pc = 0;
@@ -6799,7 +6959,6 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
         op_to_add_size = 0;
 #endif
 
-        next_op = QTAILQ_NEXT(op, link);
 
 #if 0
         if (ops_to_skip > 0) {
@@ -7177,9 +7336,10 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                 mark_temp_as_in_use(arg_temp(op->args[1]));
                 if (instrument) {
 
-                    if (next_op->opc == INDEX_op_st_i64 &&
-                        get_mem_op_size(get_memop(op->args[2])) == 8 &&
-                        is_xmm_offset(next_op->args[2])) {
+                    TCGOp* xmm_store =
+                        find_next_temp_use(op, arg_temp(op->args[0]));
+                    if (get_mem_op_size(get_memop(op->args[2])) == 8 &&
+                        is_paired_xmm_store_of(xmm_store, op)) {
 
                         TCGTemp* t_src = arg_temp(op->args[1]);
 
@@ -7188,10 +7348,10 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                         tcg_movi(t_size, (uintptr_t)8, 0, op, NULL, tcg_ctx);
 
                         TCGTemp* t_dst = new_non_conflicting_temp(TCG_TYPE_PTR);
-                        tcg_movi(t_dst, (uintptr_t)next_op->args[2], 0, op,
+                        tcg_movi(t_dst, (uintptr_t)xmm_store->args[2], 0, op,
                                  NULL, tcg_ctx);
 
-                        TCGTemp* t_env = arg_temp(next_op->args[1]);
+                        TCGTemp* t_env = arg_temp(xmm_store->args[1]);
                         MARK_TEMP_AS_ALLOCATED(t_env);
                         tcg_binop(t_dst, t_dst, t_env, 0, 0, 0, ADD, op, NULL,
                                   tcg_ctx);
@@ -7296,9 +7456,10 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                 mark_temp_as_in_use(arg_temp(op->args[1]));
                 if (instrument) {
 
-                    if (prev_op && prev_op->opc == INDEX_op_ld_i64 &&
-                        get_mem_op_size(get_memop(op->args[2])) == 8 &&
-                        is_xmm_offset(prev_op->args[2])) {
+                    TCGOp* xmm_load =
+                        find_prev_temp_def(op, arg_temp(op->args[0]));
+                    if (get_mem_op_size(get_memop(op->args[2])) == 8 &&
+                        is_paired_xmm_load_of(xmm_load, op)) {
 
                         TCGTemp* t_dst = arg_temp(op->args[1]);
 
@@ -7307,10 +7468,10 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                         tcg_movi(t_size, (uintptr_t)8, 0, op, NULL, tcg_ctx);
 
                         TCGTemp* t_src = new_non_conflicting_temp(TCG_TYPE_PTR);
-                        tcg_movi(t_src, (uintptr_t)prev_op->args[2], 0, op,
+                        tcg_movi(t_src, (uintptr_t)xmm_load->args[2], 0, op,
                                  NULL, tcg_ctx);
 
-                        TCGTemp* t_env = arg_temp(prev_op->args[1]);
+                        TCGTemp* t_env = arg_temp(xmm_load->args[1]);
                         MARK_TEMP_AS_ALLOCATED(t_env);
                         tcg_binop(t_src, t_src, t_env, 0, 0, 0, ADD, op, NULL,
                                   tcg_ctx);
@@ -7398,8 +7559,10 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
 
                     if (is_xmm_offset(offset)) {
 
+                        TCGOp* xmm_store =
+                            find_next_temp_use(op, arg_temp(op->args[0]));
                         if (op->opc == INDEX_op_ld_i64 &&
-                            next_op->opc == INDEX_op_st_i64) {
+                            is_paired_xmm_store_of(xmm_store, op)) {
 
                             // move between two xmm registers
 
@@ -7415,10 +7578,10 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
 
                             TCGTemp* t_dst =
                                 new_non_conflicting_temp(TCG_TYPE_PTR);
-                            tcg_movi(t_dst, (uintptr_t)next_op->args[2], 0, op,
+                            tcg_movi(t_dst, (uintptr_t)xmm_store->args[2], 0, op,
                                      NULL, tcg_ctx);
 
-                            TCGTemp* t_env = arg_temp(next_op->args[1]);
+                            TCGTemp* t_env = arg_temp(xmm_store->args[1]);
 
                             MARK_TEMP_AS_ALLOCATED(t_env);
                             tcg_binop(t_src, t_src, t_env, 0, 0, 0, ADD, op,
@@ -7487,10 +7650,21 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                             printf("load from xmm data (offset=%lu) at %lx\n",
                                    offset, pc);
                             tcg_abort();
-                        } else if (next_op->opc != INDEX_op_qemu_st_i64) {
-                            printf("load from xmm data (offset=%lu) at %lx\n",
-                                   offset, pc);
-                            tcg_abort();
+                        } else {
+                            /* Unmodelled XMM read: the only pairing this
+                             * engine supports is a guest memory store
+                             * consuming the loaded value.  Keep aborting
+                             * for anything else rather than dropping the
+                             * access silently. */
+                            TCGOp* xmm_store_use = find_next_temp_use(
+                                op, arg_temp(op->args[0]));
+                            if (xmm_store_use == NULL ||
+                                xmm_store_use->opc != INDEX_op_qemu_st_i64) {
+                                printf(
+                                    "load from xmm data (offset=%lu) at %lx\n",
+                                    offset, pc);
+                                tcg_abort();
+                            }
                         }
                     } else {
                         // this is need, e.g., when the DF
@@ -7583,8 +7757,7 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                         }
 #endif
                     } else if (is_xmm_offset(offset)) {
-                        if (prev_op->opc != INDEX_op_qemu_ld_i64 &&
-                            prev_op->opc != INDEX_op_ld_i64) {
+                        if (!is_modelled_xmm_store(op)) {
 
                             TCGTemp* t_value = arg_temp(op->args[0]);
                             bool subword_store =
@@ -9114,7 +9287,6 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
             instrument_memmove_xmm(op, tcg_ctx);
         }
 #endif
-        prev_op = op;
     }
 
     return force_flush_cache;
